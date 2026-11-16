@@ -1,0 +1,167 @@
+#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join, relative, resolve } from "node:path";
+import { parseArgs } from "node:util";
+import { adapters } from "./adapters/index.js";
+import { detectStacks, scanProject, writeHtml, DEFAULT_CONFIG, loadConfig } from "./core/scan.js";
+import type { BuiltMap } from "./core/types.js";
+import { VERSION } from "./core/version.js";
+
+const HELP = `builtlore ${VERSION}
+See how your app is actually built: business flows on one canvas, generated from code.
+
+Usage
+  builtlore init [path]                 Detect stacks and write builtlore.config.yaml
+  builtlore scan [paths...] [options]   Scan one or more projects (default: current folder)
+  builtlore view [path] [--no-open]     Open the canvas for a scanned project
+
+Scan options
+  --mode <auto|static|artisan>         Laravel: artisan (exact, needs PHP + vendor/), static (no PHP), auto (default)
+  --out <file>                         Output JSON path relative to the project (default: builtlore.json)
+  --open                               Open the canvas after scanning (single project only)
+
+Examples
+  builtlore scan
+  builtlore scan ~/work/project-1 ~/work/project-2
+  builtlore view ~/work/project-1
+
+Supported stacks: ${adapters.map((a) => a.name).join(", ")} (Go, Next.js and Flutter are planned)
+`;
+
+async function main(argv: string[]): Promise<number> {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: {
+      mode: { type: "string" },
+      out: { type: "string" },
+      open: { type: "boolean", default: false },
+      "no-open": { type: "boolean", default: false },
+      help: { type: "boolean", short: "h", default: false },
+      version: { type: "boolean", short: "v", default: false },
+    },
+  });
+
+  if (values.version) {
+    console.log(VERSION);
+    return 0;
+  }
+  const [command, ...paths] = positionals;
+  if (values.help || !command) {
+    console.log(HELP);
+    return values.help ? 0 : 1;
+  }
+
+  switch (command) {
+    case "init":
+      return init(paths[0] ?? ".");
+    case "scan":
+      return scan(paths.length ? paths : ["."], {
+        mode: values.mode as "auto" | "static" | "artisan" | undefined,
+        out: values.out,
+        open: values.open,
+      });
+    case "view":
+      return view(paths[0] ?? ".", !values["no-open"]);
+    default:
+      console.error(`Unknown command: ${command}\n`);
+      console.log(HELP);
+      return 1;
+  }
+}
+
+async function init(pathArg: string): Promise<number> {
+  const root = resolve(pathArg);
+  const stacks = await detectStacks(root);
+  if (!stacks.length) {
+    console.error(`No supported stack detected in ${root}.`);
+    return 1;
+  }
+  const cfgPath = join(root, "builtlore.config.yaml");
+  if (!existsSync(cfgPath)) {
+    writeFileSync(
+      cfgPath,
+      `# builtlore configuration
+# mode: auto | static | artisan   (Laravel: artisan needs PHP + vendor/, static works anywhere)
+mode: ${DEFAULT_CONFIG.mode}
+# Where the as-built model is written (commit this file to track changes over time)
+output: ${DEFAULT_CONFIG.output}
+`,
+    );
+    console.log(`Created ${rel(cfgPath)}`);
+  } else {
+    console.log("builtlore.config.yaml already exists");
+  }
+  const gi = join(root, ".gitignore");
+  const line = ".builtlore/";
+  if (!existsSync(gi) || !readFileSync(gi, "utf8").split(/\r?\n/).includes(line)) {
+    appendFileSync(gi, `${existsSync(gi) ? "\n" : ""}${line}\n`);
+    console.log("Added .builtlore/ to .gitignore");
+  }
+  console.log(`Detected: ${stacks.join(", ")}. Next: builtlore scan`);
+  return 0;
+}
+
+async function scan(paths: string[], opts: { mode?: "auto" | "static" | "artisan"; out?: string; open: boolean }): Promise<number> {
+  let failures = 0;
+  const done: string[] = [];
+  for (const p of paths) {
+    const started = Date.now();
+    try {
+      const res = await scanProject(p, { mode: opts.mode, output: opts.out });
+      const m = res.map;
+      const secs = ((Date.now() - started) / 1000).toFixed(1);
+      console.log(`\n✔ ${m.project.name}  (${m.stacks.join(", ")}, ${secs}s)`);
+      console.log(`  ${m.features.length} features · ${m.nodes.length} steps · ${m.edges.length} transitions · ${m.skipped.length} skipped`);
+      for (const n of m.notes) console.log(`  · ${n}`);
+      console.log(`  map:    ${rel(res.jsonPath)}`);
+      console.log(`  canvas: ${rel(res.htmlPath)}`);
+      done.push(res.htmlPath);
+    } catch (err) {
+      failures++;
+      console.error(`\n✖ ${p}: ${(err as Error).message}`);
+    }
+  }
+  if (opts.open && done.length === 1) openFile(done[0]);
+  if (paths.length > 1) console.log(`\nScanned ${paths.length - failures}/${paths.length} projects.`);
+  return failures ? 1 : 0;
+}
+
+async function view(pathArg: string, open: boolean): Promise<number> {
+  const root = resolve(pathArg);
+  const cfg = loadConfig(root);
+  const jsonPath = join(root, cfg.output);
+  if (!existsSync(jsonPath)) {
+    console.error(`No ${cfg.output} in ${root}. Run: builtlore scan ${pathArg}`);
+    return 1;
+  }
+  const map = JSON.parse(readFileSync(jsonPath, "utf8")) as BuiltMap;
+  const html = writeHtml(root, map);
+  console.log(`Canvas: ${rel(html)}`);
+  if (open) openFile(html);
+  return 0;
+}
+
+function openFile(path: string): void {
+  const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", path] : [path];
+  try {
+    spawn(cmd, args, { detached: true, stdio: "ignore" }).on("error", () => console.log(`Open in your browser: ${path}`)).unref();
+  } catch {
+    console.log(`Open in your browser: ${path}`);
+  }
+}
+
+function rel(p: string): string {
+  const r = relative(process.cwd(), p);
+  return r && !r.startsWith("..") ? r : p;
+}
+
+main(process.argv.slice(2)).then(
+  (code) => process.exit(code),
+  (err) => {
+    console.error(err);
+    process.exit(1);
+  },
+);

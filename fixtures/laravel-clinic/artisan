@@ -1,0 +1,3 @@
+#!/usr/bin/env php
+<?php
+// Fixture marker. This is not a runnable Laravel app.

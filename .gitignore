@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.builtlore/
+fixtures/**/builtlore.json
+*.log
+.DS_Store

@@ -1,0 +1,179 @@
+/**
+ * Read Blade views and find where the user can go next: links (<a href>) and
+ * forms (<form action>) that point at routes. Partials pulled in with
+ * @include are part of the page; layouts pulled in with @extends are shared
+ * navigation and are counted separately so they do not flood every flow.
+ */
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
+export type BladeTarget =
+  | { kind: "name"; name: string }
+  | { kind: "uri"; uri: string }
+  | { kind: "action"; raw: string };
+
+export interface BladeLink {
+  target: BladeTarget;
+  trigger: "link" | "submit";
+  /** HTTP method for forms, after @method()/_method spoofing. */
+  method?: string;
+  file: string;
+  line: number;
+}
+
+export interface BladeAnalysis {
+  file: string | null;
+  links: BladeLink[];
+  layouts: string[];
+}
+
+const VIEW_ROOT = "resources/views";
+
+export function viewFile(root: string, name: string): string | null {
+  if (name.includes("::")) return null; // package / namespaced views
+  const base = name.split(".").join("/");
+  for (const ext of [".blade.php", ".php"]) {
+    const rel = `${VIEW_ROOT}/${base}${ext}`;
+    if (existsSync(join(root, rel))) return rel;
+  }
+  return null;
+}
+
+export class BladeReader {
+  private cache = new Map<string, { links: BladeLink[]; includes: string[]; extends: string[] }>();
+
+  constructor(private root: string) {}
+
+  analyze(name: string): BladeAnalysis {
+    const file = viewFile(this.root, name);
+    if (!file) return { file: null, links: [], layouts: [] };
+    const links: BladeLink[] = [];
+    const layouts: string[] = [];
+
+    // The page itself + its @include partials (depth-limited, cycle-safe)
+    const seen = new Set<string>();
+    const visit = (viewName: string, depth: number) => {
+      if (seen.has(viewName) || depth > 5) return;
+      seen.add(viewName);
+      const parsed = this.parse(viewName);
+      if (!parsed) return;
+      links.push(...parsed.links);
+      for (const inc of parsed.includes) visit(inc, depth + 1);
+      for (const ext of parsed.extends) {
+        if (!layouts.includes(ext)) layouts.push(ext);
+      }
+    };
+    visit(name, 0);
+
+    return { file, links, layouts };
+  }
+
+  /** Links in a layout and everything it extends/includes (counted, not drawn). */
+  layoutLinkCount(name: string): number {
+    let count = 0;
+    const seen = new Set<string>();
+    const visit = (viewName: string, depth: number) => {
+      if (seen.has(viewName) || depth > 5) return;
+      seen.add(viewName);
+      const parsed = this.parse(viewName);
+      if (!parsed) return;
+      count += parsed.links.length;
+      for (const inc of parsed.includes) visit(inc, depth + 1);
+      for (const ext of parsed.extends) visit(ext, depth + 1);
+    };
+    visit(name, 0);
+    return count;
+  }
+
+  private parse(name: string): { links: BladeLink[]; includes: string[]; extends: string[] } | null {
+    if (this.cache.has(name)) return this.cache.get(name)!;
+    const file = viewFile(this.root, name);
+    if (!file) return null;
+    const src = readFileSync(join(this.root, file), "utf8");
+    const result = { links: parseLinks(src, file), includes: parseIncludes(src), extends: parseExtends(src) };
+    this.cache.set(name, result);
+    return result;
+  }
+}
+
+function lineAt(src: string, index: number): number {
+  let line = 1;
+  for (let i = 0; i < index && i < src.length; i++) if (src.charCodeAt(i) === 10) line++;
+  return line;
+}
+
+function parseIncludes(src: string): string[] {
+  const out: string[] = [];
+  const re = /@(include|includeIf|includeFirst|each)\s*\(\s*(?:\[\s*)?['"]([^'"]+)['"]/g;
+  const reWhen = /@(includeWhen|includeUnless)\s*\([^,]+,\s*['"]([^'"]+)['"]/g;
+  for (const m of src.matchAll(re)) out.push(m[2]);
+  for (const m of src.matchAll(reWhen)) out.push(m[2]);
+  // <x-...> anonymous components living in resources/views/components
+  for (const m of src.matchAll(/<x-([a-z0-9\-.]+)[\s/>]/gi)) {
+    if (!m[1].includes("::") && !m[1].endsWith("-layout")) out.push(`components.${m[1]}`);
+  }
+  return out;
+}
+
+function parseExtends(src: string): string[] {
+  const out: string[] = [];
+  for (const m of src.matchAll(/@extends\s*\(\s*['"]([^'"]+)['"]/g)) out.push(m[1]);
+  // Component layouts: <x-app-layout> -> components.app-layout or layouts.app
+  for (const m of src.matchAll(/<x-([a-z0-9\-]+)-layout[\s>]/gi)) {
+    out.push(`components.${m[1]}-layout`, `layouts.${m[1]}`);
+  }
+  return out;
+}
+
+/** Extract target from an attribute value: {{ route('x') }}, {{ url('/x') }}, {{ action(...) }}, /literal */
+export function parseTarget(value: string): BladeTarget | null {
+  const route = value.match(/route\(\s*['"]([^'"]+)['"]/);
+  if (route) return { kind: "name", name: route[1] };
+  const url = value.match(/url\(\s*['"]([^'"]*)['"]/);
+  if (url) return { kind: "uri", uri: url[1] || "/" };
+  const action = value.match(/action\(\s*([^)]*)\)/);
+  if (action) return { kind: "action", raw: action[1] };
+  const literal = value.trim();
+  if (literal.startsWith("/") && !literal.startsWith("//") && !literal.includes("{{")) {
+    return { kind: "uri", uri: literal.split(/[?#]/)[0] };
+  }
+  return null;
+}
+
+function attr(tag: string, name: string): string | null {
+  // Values may contain quotes inside {{ }} so match quote-aware.
+  const re = new RegExp(`\\s${name}\\s*=\\s*("([^"]*)"|'([^']*)')`, "i");
+  const m = tag.match(re);
+  if (!m) return null;
+  return m[2] ?? m[3] ?? null;
+}
+
+function parseLinks(src: string, file: string): BladeLink[] {
+  const out: BladeLink[] = [];
+
+  // <a ... href="...">
+  for (const m of src.matchAll(/<a\b(?:"[^"]*"|'[^']*'|[^'">])*>/gi)) {
+    const href = attr(m[0], "href");
+    if (!href) continue;
+    const target = parseTarget(href);
+    if (target) out.push({ target, trigger: "link", file, line: lineAt(src, m.index ?? 0) });
+  }
+
+  // <form ... action="..." method="..."> ... </form>
+  for (const m of src.matchAll(/<form\b((?:"[^"]*"|'[^']*'|[^'">])*)>([\s\S]*?)<\/form>/gi)) {
+    const open = `<form${m[1]}>`;
+    const action = attr(open, "action");
+    if (!action) continue;
+    const target = parseTarget(action);
+    if (!target) continue;
+    let method = (attr(open, "method") ?? "GET").toUpperCase();
+    const body = m[2];
+    const spoof =
+      body.match(/@method\s*\(\s*['"](\w+)['"]\s*\)/) ??
+      body.match(/name=["']_method["'][^>]*value=["'](\w+)["']/i) ??
+      body.match(/value=["'](\w+)["'][^>]*name=["']_method["']/i);
+    if (spoof) method = spoof[1].toUpperCase();
+    out.push({ target, trigger: "submit", method, file, line: lineAt(src, m.index ?? 0) });
+  }
+  return out;
+}
