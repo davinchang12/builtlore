@@ -113,6 +113,12 @@ export interface MapNode {
   view?: ViewRef;
   source: SourceRef;
   provenance: Provenance;
+  /** Written by a person (builtlore.edits.yaml). */
+  description?: string;
+  /** Hidden by a person; kept in the model, not drawn by default. */
+  hidden?: boolean;
+  /** Set when the code changed after a person described this step. */
+  review?: string;
 }
 
 export interface MapEdge {
@@ -132,6 +138,7 @@ export interface Feature {
   nodes: string[];
   files: string[];
   provenance: Provenance;
+  description?: string;
 }
 
 export interface BuiltMap {
@@ -145,4 +152,6 @@ export interface BuiltMap {
   edges: MapEdge[];
   skipped: SkippedFact[];
   notes: string[];
+  /** Project terms and their meaning, written by people. */
+  glossary?: Record<string, string>;
 }

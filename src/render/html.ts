@@ -11,7 +11,12 @@ import type { BuiltMap } from "../core/types.js";
 
 const require = createRequire(import.meta.url);
 
-export function renderHtml(map: BuiltMap): string {
+export interface RenderOptions {
+  /** Set by builtlore serve: enables editing and saving back to builtlore.edits.yaml. */
+  edit?: { token: string };
+}
+
+export function renderHtml(map: BuiltMap, options: RenderOptions = {}): string {
   const root = packageRoot();
   const css = readFileSync(join(root, "assets", "viewer.css"), "utf8");
   const js = readFileSync(join(root, "assets", "viewer.js"), "utf8");
@@ -44,8 +49,12 @@ export function renderHtml(map: BuiltMap): string {
       <div class="stat"><b id="stat-nodes"></b><span>steps</span></div>
       <div class="stat"><b id="stat-edges"></b><span>transitions</span></div>
     </div>
+    <div class="edit-banner" id="edit-banner" style="display:none">Editing on. Changes save to <code>builtlore.edits.yaml</code>.</div>
     <label class="toggle-row" id="data-toggle-row" title="Endpoints that return JSON (AJAX, DataTables) or files (exports, downloads)">
       <input type="checkbox" id="show-data"> Show data &amp; file endpoints <span class="count" id="data-count"></span>
+    </label>
+    <label class="toggle-row" id="hidden-toggle-row" style="display:none">
+      <input type="checkbox" id="show-hidden"> Show hidden steps <span class="count" id="hidden-count"></span>
     </label>
     <section>
       <h3>Features</h3>
@@ -84,6 +93,7 @@ export function renderHtml(map: BuiltMap): string {
   </main>
 </div>
 <script id="builtlore-data" type="application/json">${json}</script>
+${options.edit ? `<script>window.BUILTLORE_EDIT = ${JSON.stringify(options.edit)};</script>` : ""}
 <script>${elk}</script>
 <script>${js}</script>
 </body>

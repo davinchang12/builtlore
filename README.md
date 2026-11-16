@@ -52,6 +52,7 @@ Once published, this becomes `npx builtlore scan --open`.
 builtlore scan                              # scan the current folder
 builtlore scan ~/work/project-1 ~/work/project-2   # scan several projects, each gets its own map
 builtlore view ~/work/project-1             # re-open the canvas for a scanned project
+builtlore serve                             # open the canvas with editing on (see below)
 builtlore init                              # write builtlore.config.yaml and ignore .builtlore/
 ```
 
@@ -88,6 +89,39 @@ Shortcuts: `/` search, `f` fit to screen, `Esc` clear selection. Scroll to zoom,
 
 Large apps: route name prefixes that act as menus or areas (`menu.*`, `master.*`, `admin.*`) are split into one feature per controller domain, so `MTDIController` and `StatusMTDIController` end up in the same feature.
 
+### Editing: names, descriptions, grouping
+
+Code tells builtlore *what* exists; only people know *why*. Run:
+
+```bash
+builtlore serve            # scans, then opens http://127.0.0.1:4321 with editing on
+```
+
+![Editing a feature in builtlore serve](docs/images/editing.png)
+
+Click a step or a feature title and edit it: give it a business name, write what happens there, move it to another feature (or type a new feature name), or hide it. Every save goes to **`builtlore.edits.yaml`** in your project:
+
+```yaml
+features:
+  menu.mtdi:
+    name: Monthly target input (MTDI)
+    description: Area managers enter monthly targets; the regional head approves them.
+steps:
+  route:menu.mtdi.status.approve:
+    label: Regional head approves
+    description: Locks the targets for the month. Rejected targets go back to the area manager.
+    code: 4f1c2a9be0
+glossary:
+  MTDI: Month-to-date input
+```
+
+- **Commit this file.** Rescans start from the code and apply the edits on top, so nothing you write is overwritten.
+- You can edit the file by hand too; comments are kept.
+- When the code behind a described step changes, the step gets an **amber dot** and a "check the description" note, rather than silently showing something outdated. Saving it again clears the flag.
+- Edits for steps that no longer exist are kept and listed in the scan notes, so you can decide what to do with them.
+
+`serve` only listens on `127.0.0.1`, and writes need a per-session token, so other websites open in your browser cannot change your files.
+
 ## What builtlore reads in a Laravel app
 
 | Source | What it extracts |
@@ -104,7 +138,7 @@ Inertia and Livewire pages are detected; following their navigation is planned.
 
 ## Privacy
 
-builtlore v0.1 runs entirely on your machine. It does not use AI and makes no network calls. It reads code only: it never reads `.env` values or connects to your database. (Optional AI naming and a read-only database layer are planned, and will be opt-in; see the design document.)
+builtlore v0.1 runs entirely on your machine. It does not use AI and makes no network calls (`builtlore serve` listens on `127.0.0.1` only). It reads code only: it never reads `.env` values or connects to your database. (Optional AI naming and a read-only database layer are planned, and will be opt-in; see the design document.)
 
 ## Roadmap
 
@@ -112,8 +146,8 @@ builtlore v0.1 runs entirely on your machine. It does not use AI and makes no ne
 |---|---|
 | **v0.1** | Laravel flows · canvas · JSON model |
 | v0.2 | **Process view:** business processes as swimlanes: who does each step (roles from middleware, policies, role checks) and how the status changes (strings, numbers, constants, enums) |
-| v0.2.x | History: when each feature appeared and how it changed (git) · timeline slider |
-| v0.3 | Human notes and corrections that survive re-scans · Markdown docs · CI check |
+| v0.3 | **Project documentation:** a full docs site generated from code + your edits: system overview, roles and permissions, processes, screens, business rules (validation), data dictionary, integrations, jobs, API reference, glossary, change history. Export to Markdown, HTML, Word/PDF |
+| v0.3.x | History: when each feature appeared and how it changed (git) · timeline slider · CI check |
 | v0.4 | Data layer: tables, relationships, stored procedures, step ↔ table links |
 | v0.5 | Automation layer: schedulers, cron, queues, webhooks |
 | v0.6 | Go, Next.js and Flutter adapters |

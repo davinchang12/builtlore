@@ -121,3 +121,27 @@ main svg.panning { cursor: grabbing; }
 .details ul.nav .how { color: var(--muted); font-size: 12px; }
 .details ul.nav .how.error { color: var(--error); }
 .chip { display: inline-block; font-size: 11px; padding: 1px 6px; margin: 0 4px 4px 0; border-radius: 4px; background: var(--bg); }
+
+/* descriptions, review flags and editing */
+.description { font-size: 13.5px; line-height: 1.55; margin: 0 0 14px; white-space: pre-wrap; }
+.description.empty { color: var(--muted); font-style: italic; }
+.review { font-size: 12.5px; background: #fffbeb; border: 1px solid #fde68a; color: #92400e; border-radius: 8px; padding: 8px 10px; margin: 0 0 12px; }
+.badge.human { background: #ecfdf5; border-color: #a7f3d0; color: #047857; }
+.node .note-dot { fill: #10b981; }
+.node .review-dot { fill: #f59e0b; stroke: #fff; stroke-width: 1.5; }
+.node.is-hidden { opacity: .45; }
+.node.is-hidden .card { stroke-dasharray: 4 3; }
+.feature-title { cursor: pointer; }
+.feature-title:hover { text-decoration: underline; }
+.edit-banner { font-size: 12px; background: #ecfdf5; border: 1px solid #a7f3d0; color: #065f46; border-radius: 8px; padding: 7px 10px; }
+.edit-banner code { font-size: 11px; }
+.edit-form { display: grid; gap: 10px; margin: 4px 0 6px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); }
+.edit-form .field { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+.edit-form input:not([type=checkbox]), .edit-form textarea { font: inherit; font-size: 13.5px; color: var(--ink); padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; background: #fff; resize: vertical; }
+.edit-form input:focus, .edit-form textarea:focus { outline: 2px solid #bfdbfe; border-color: var(--accent); }
+.edit-form .hint { font-size: 11.5px; color: var(--muted); margin-top: -4px; }
+.form-buttons { display: flex; align-items: center; gap: 10px; }
+.form-buttons .primary { background: var(--accent); color: #fff; border: none; border-radius: 7px; padding: 7px 16px; font-weight: 600; cursor: pointer; }
+.form-buttons .primary:disabled { opacity: .6; cursor: default; }
+.form-buttons .status { font-size: 12px; color: var(--muted); }
+.details ul.files { list-style: none; padding: 0; margin: 0; font-size: 12px; color: var(--muted); display: grid; gap: 3px; }

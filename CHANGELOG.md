@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here.
 
+## 0.1.0-alpha.3 — 2026-11-16
+
+### Added
+- **Edits that survive rescans.** `builtlore serve` opens the canvas with editing on: rename a step or feature, describe what it is for, move a step to another feature (or a new one), hide internal steps. Edits are saved to `builtlore.edits.yaml` in the project (commit it) and applied on top of every scan, so a rescan never overwrites them. The file is plain YAML, can also be edited by hand, and keeps its comments when the canvas writes to it.
+- **Needs-review flag.** When the code behind a described step changes (URL, methods, handler, view), the step gets an amber dot and a note to check the description. Saving the step again clears it.
+- **Orphaned edits are kept**, not deleted, when a step disappears from the code (renamed or removed route), and are listed in the scan notes.
+- Feature details: click a feature title on the canvas to see its description, steps and files.
+- Descriptions show in the details panel and tooltips; steps with a description get a green dot.
+- A project glossary (`glossary:` in `builtlore.edits.yaml`) is carried into `builtlore.json` for the upcoming docs output.
+
 ## 0.1.0-alpha.2 — 2026-11-16
 
 ### Changed

@@ -18,9 +18,11 @@
   var featureColor = {};
   data.features.forEach(function (f, i) { featureColor[f.id] = PALETTE[i % PALETTE.length]; });
 
+  var EDIT = window.BUILTLORE_EDIT || null;
   var state = {
     hidden: {},
     showData: false,
+    showHidden: false,
     selected: null,
     query: "",
     direction: "RIGHT",
@@ -47,12 +49,22 @@
   $("#stat-nodes").textContent = data.nodes.length;
   $("#stat-edges").textContent = data.edges.length;
 
+  var restored = restoreState();
+  if (EDIT) $("#edit-banner").style.display = "block";
+
   renderFeatureList();
   renderNotes();
+
+  var hiddenCount = data.nodes.filter(function (n) { return n.hidden; }).length;
+  $("#hidden-count").textContent = String(hiddenCount);
+  if (hiddenCount) $("#hidden-toggle-row").style.display = "flex";
+  $("#show-hidden").checked = state.showHidden;
+  $("#show-hidden").onchange = function (e) { state.showHidden = e.target.checked; layout(true); };
 
   var dataCount = data.nodes.filter(function (n) { return HIDDEN_BY_DEFAULT[n.type]; }).length;
   $("#data-count").textContent = String(dataCount);
   if (!dataCount) $("#data-toggle-row").style.display = "none";
+  $("#show-data").checked = state.showData;
   $("#show-data").onchange = function (e) { state.showData = e.target.checked; layout(true); };
 
   $("#search").addEventListener("input", function (e) {
@@ -66,7 +78,7 @@
     }
   });
   document.addEventListener("keydown", function (e) {
-    if (e.target.tagName === "INPUT") { if (e.key === "Escape") e.target.blur(); return; }
+    if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") { if (e.key === "Escape") e.target.blur(); return; }
     if (e.key === "/") { e.preventDefault(); $("#search").focus(); }
     if (e.key === "f") fit();
     if (e.key === "Escape") select(null);
@@ -88,12 +100,12 @@
   };
 
   setupPanZoom();
-  layout(true);
+  layout(!restored);
 
   // --------------------------------------------------------------- layout
   function visibleNodes() {
     return data.nodes.filter(function (n) {
-      return !state.hidden[n.feature] && (state.showData || !HIDDEN_BY_DEFAULT[n.type]);
+      return !state.hidden[n.feature] && (state.showData || !HIDDEN_BY_DEFAULT[n.type]) && (state.showHidden || !n.hidden);
     });
   }
 
@@ -260,6 +272,13 @@
       });
       draw({ children: children, edges: edgesOut, width: rowWidth, height: y + rowH });
       if (refit) fit();
+      else applyTransform();
+      if (state.pending) {
+        var p = state.pending;
+        state.pending = null;
+        if (p.selected) select(p.selected);
+        else if (p.feature) selectFeature(p.feature);
+      }
     }).catch(function (err) {
       console.error(err);
       $("#empty").textContent = "Layout failed: " + err;
@@ -294,14 +313,18 @@
         x: g.x, y: g.y, width: g.width, height: g.height, rx: 14,
         fill: tint(color, 0.06), stroke: tint(color, 0.35), "class": "feature-box",
       }));
-      var title = el("text", { x: g.x + 16, y: g.y + 26, fill: color, "class": "feature-title" });
+        var title = el("text", { x: g.x + 16, y: g.y + 26, fill: color, "class": "feature-title" });
       title.textContent = g.labels && g.labels[0] ? g.labels[0].text : fid;
+      title.addEventListener("click", function (ev) { ev.stopPropagation(); selectFeature(fid); });
+      var ftip = el("title", {});
+      ftip.textContent = (featureById(fid).description || "") + (EDIT ? "\nClick to edit this feature" : "");
+      title.appendChild(ftip);
       groupLayer.appendChild(title);
 
       (g.children || []).forEach(function (c) {
         var n = nodesById[c.id];
         var x = g.x + c.x, y = g.y + c.y;
-        var node = el("g", { "class": "node", transform: "translate(" + x + "," + y + ")" });
+        var node = el("g", { "class": "node" + (n.hidden ? " is-hidden" : "") + (n.review ? " needs-review" : ""), transform: "translate(" + x + "," + y + ")" });
         node.appendChild(el("rect", { "class": "card", width: c.width, height: c.height, rx: 9 }));
         node.appendChild(el("rect", { width: 5, height: c.height - 12, x: 6, y: 6, rx: 2.5, fill: TYPE_COLOR[n.type] || "#94a3b8" }));
         var label = el("text", { x: 20, y: 22, "class": "label" });
@@ -310,8 +333,10 @@
         var sub = el("text", { x: 20, y: 39, "class": "sub mono" });
         sub.textContent = truncate(subtitle(n), Math.floor((c.width - 30) / 6.3));
         node.appendChild(sub);
+        if (n.review) node.appendChild(el("circle", { cx: c.width - 10, cy: 10, r: 4.5, "class": "review-dot" }));
+        else if (n.description) node.appendChild(el("circle", { cx: c.width - 10, cy: 10, r: 3.5, "class": "note-dot" }));
         var tip = el("title", {});
-        tip.textContent = n.label + "\n" + subtitle(n);
+        tip.textContent = n.label + "\n" + subtitle(n) + (n.description ? "\n\n" + n.description : "");
         node.appendChild(tip);
         node.addEventListener("click", function (ev) { ev.stopPropagation(); select(n.id); });
         nodeLayer.appendChild(node);
@@ -374,11 +399,20 @@
   // ------------------------------------------------------------ selection
   function select(id) {
     state.selected = id;
+    state.selectedFeature = null;
     applyHighlight();
     var panel = $("#details");
-    if (!id) { panel.classList.remove("open"); return; }
+    if (!id || !nodesById[id]) { state.selected = null; panel.classList.remove("open"); return; }
     renderDetails(nodesById[id]);
     panel.classList.add("open");
+  }
+
+  function selectFeature(fid) {
+    state.selected = null;
+    state.selectedFeature = fid;
+    applyHighlight();
+    renderFeatureDetails(featureById(fid));
+    $("#details").classList.add("open");
   }
 
   function matches() {
@@ -422,7 +456,13 @@
     badges.appendChild(h("span", "badge " + n.type, n.type));
     n.methods.forEach(function (m) { badges.appendChild(h("span", "badge mono", m)); });
     badges.appendChild(h("span", "badge", featureById(n.feature).name));
+    if (n.provenance === "human") badges.appendChild(h("span", "badge human", "named by a person"));
+    if (n.hidden) badges.appendChild(h("span", "badge", "hidden"));
     d.appendChild(badges);
+    if (n.review) d.appendChild(h("div", "review", n.review));
+    if (n.description) d.appendChild(h("p", "description", n.description));
+    else if (!EDIT) d.appendChild(h("p", "description empty", "No description yet. Run builtlore serve to add one."));
+    if (EDIT) d.appendChild(stepForm(n));
 
     var dl = h("dl");
     row(dl, "URI", "/" + (n.uri === "/" ? "" : n.uri), true);
@@ -445,6 +485,155 @@
     var inc = data.edges.filter(function (e) { return e.to === n.id; });
     navList(d, "Leads to", out, "to");
     navList(d, "Comes from", inc, "from");
+  }
+
+  function renderFeatureDetails(f) {
+    var d = $("#details-body");
+    d.innerHTML = "";
+    d.appendChild(h("h2", null, f.name));
+    var badges = h("div", "badges");
+    badges.appendChild(h("span", "badge", "feature"));
+    badges.appendChild(h("span", "badge", f.nodes.length + " steps"));
+    if (f.provenance === "human") badges.appendChild(h("span", "badge human", "named by a person"));
+    d.appendChild(badges);
+    if (f.description) d.appendChild(h("p", "description", f.description));
+    else if (!EDIT) d.appendChild(h("p", "description empty", "No description yet. Run builtlore serve to add one."));
+    if (EDIT) {
+      var form = h("form", "edit-form");
+      var name = field(form, "Name", "input", f.name);
+      var desc = field(form, "What this feature is for", "textarea", f.description || "");
+      desc.placeholder = "e.g. Monthly target input by area managers; approved by the regional head before it counts.";
+      form.appendChild(h("div", "hint", "Leave the name empty to go back to the name builtlore generates."));
+      formButtons(form, function () {
+        var fields = { description: desc.value };
+        if (name.value !== f.name || f.provenance === "human") fields.name = name.value;
+        return save({ target: "feature", id: f.id, fields: fields });
+      });
+      d.appendChild(form);
+    }
+    d.appendChild(h("h4", null, "Steps"));
+    var ul = h("ul", "nav");
+    f.nodes.forEach(function (id) {
+      var n = nodesById[id];
+      if (!n) return;
+      var li = h("li");
+      li.appendChild(h("div", null, n.label));
+      li.appendChild(h("div", "how", subtitle(n)));
+      li.onclick = function () { select(id); centerOn(id); };
+      ul.appendChild(li);
+    });
+    d.appendChild(ul);
+    if (f.files.length) {
+      d.appendChild(h("h4", null, "Files (" + f.files.length + ")"));
+      var fl = h("ul", "files");
+      f.files.forEach(function (x) { fl.appendChild(h("li", "mono", x)); });
+      d.appendChild(fl);
+    }
+  }
+
+  // --------------------------------------------------------------- editing
+  function stepForm(n) {
+    var form = h("form", "edit-form");
+    var label = field(form, "Name", "input", n.label);
+    var desc = field(form, "What happens here", "textarea", n.description || "");
+    desc.placeholder = "e.g. Area manager reviews the request and approves it or sends it back with a reason.";
+    var feat = field(form, "Feature", "input", featureById(n.feature).name);
+    feat.setAttribute("list", "feature-names");
+    var dl = document.createElement("datalist");
+    dl.id = "feature-names";
+    data.features.forEach(function (f) { var o = document.createElement("option"); o.value = f.name; dl.appendChild(o); });
+    form.appendChild(dl);
+    form.appendChild(h("div", "hint", "Type an existing feature to move this step, or a new name to start a new feature."));
+    var hideRow = h("label", "toggle-row");
+    var hide = document.createElement("input");
+    hide.type = "checkbox";
+    hide.checked = !!n.hidden;
+    hideRow.appendChild(hide);
+    hideRow.appendChild(document.createTextNode(" Hide this step (internal or not worth documenting)"));
+    form.appendChild(hideRow);
+    var originalFeature = featureById(n.feature).name;
+    formButtons(form, function () {
+      var target = feat.value.trim();
+      var match = data.features.find(function (f) { return f.name.toLowerCase() === target.toLowerCase(); });
+      var fields = { description: desc.value, hidden: hide.checked };
+      // An untouched generated name stays generated (it can still improve in later versions).
+      if (label.value !== n.label || n.provenance === "human") fields.label = label.value;
+      if (target && target !== originalFeature) fields.feature = match ? match.id : target;
+      return save({ target: "step", id: n.id, fields: fields });
+    });
+    return form;
+  }
+
+  function field(form, labelText, tag, value) {
+    var wrap = h("label", "field");
+    wrap.appendChild(h("span", null, labelText));
+    var input = document.createElement(tag);
+    input.value = value;
+    if (tag === "textarea") input.rows = 4;
+    wrap.appendChild(input);
+    form.appendChild(wrap);
+    return input;
+  }
+
+  function formButtons(form, onSave) {
+    var bar = h("div", "form-buttons");
+    var btn = h("button", "primary", "Save");
+    btn.type = "submit";
+    var status = h("span", "status");
+    bar.appendChild(btn);
+    bar.appendChild(status);
+    form.appendChild(bar);
+    form.onsubmit = function (e) {
+      e.preventDefault();
+      btn.disabled = true;
+      status.textContent = "Saving…";
+      onSave().catch(function (err) {
+        btn.disabled = false;
+        status.textContent = "Not saved: " + err.message;
+      });
+    };
+    form.addEventListener("keydown", function (e) {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") form.requestSubmit();
+    });
+  }
+
+  function save(patch) {
+    return fetch("/api/edit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Builtlore-Token": EDIT.token },
+      body: JSON.stringify(patch),
+    }).then(function (r) {
+      if (!r.ok) return r.text().then(function (t) { throw new Error(t || r.statusText); });
+      persistState();
+      location.reload();
+    });
+  }
+
+  function persistState() {
+    try {
+      sessionStorage.setItem("builtlore-state", JSON.stringify({
+        hidden: state.hidden, showData: state.showData, showHidden: state.showHidden, direction: state.direction,
+        view: state.view, selected: state.selected, selectedFeature: state.selectedFeature,
+      }));
+    } catch (e) { /* storage unavailable */ }
+  }
+
+  function restoreState() {
+    if (!EDIT) return false;
+    try {
+      var raw = sessionStorage.getItem("builtlore-state");
+      if (!raw) return false;
+      sessionStorage.removeItem("builtlore-state");
+      var s = JSON.parse(raw);
+      state.hidden = s.hidden || {};
+      state.showData = !!s.showData;
+      state.showHidden = !!s.showHidden;
+      state.direction = s.direction || "RIGHT";
+      state.view = s.view || state.view;
+      state.pending = { selected: s.selected, feature: s.selectedFeature };
+      $("#btn-direction").textContent = state.direction === "RIGHT" ? "Layout: left → right" : "Layout: top → bottom";
+      return true;
+    } catch (e) { return false; }
   }
 
   function navList(container, title, edges, key) {

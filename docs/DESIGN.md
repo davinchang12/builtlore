@@ -2,7 +2,7 @@
 
 > **Name.** `builtlore` = "the lore of what you built": the knowledge, flows and history of an application that usually live only in people's heads, made visible. Chosen 2026-11-16 (see [Open questions](#16-open-questions)).
 
-**Status:** v0.1.0-alpha.2 (Laravel flows, dogfooded on a 145-route internal app) · **Next:** Process view · **Last updated:** 2026-11-16
+**Status:** v0.1.0-alpha.3 (Laravel flows + edits that survive rescans) · **Next:** Process view, then project documentation · **Last updated:** 2026-11-16
 
 ---
 
@@ -106,7 +106,7 @@ v0.1 ships **Flows** only. Every other layer is a separate release. Dogfooding s
                │ 2. EXTRACT     adapters → raw facts           │  deterministic
                │ 3. HISTORY     git log → facts over time      │  deterministic
                │ 4. SYNTHESIZE  facts → features & flows       │  LLM (optional)
-               │ 5. MERGE       apply human overrides          │  deterministic
+               │ 5. MERGE       apply human edits              │  deterministic
                │ 6. RENDER      canvas · docs · AI context     │  deterministic
                └──────────────────────────────────────────────┘
                                    │
@@ -199,22 +199,34 @@ Rules:
 - Providers are pluggable: Anthropic, OpenAI, or any OpenAI-compatible local endpoint (e.g., Ollama).
 - `--no-ai` skips this step entirely; the canvas then shows raw entries and navigation edges, which is still useful.
 
-### 6.5 Merge (human overrides)
+### 6.5 Merge (human edits) — implemented in alpha.3
 
-Humans correct and annotate in `builtlore.overrides.yaml` (written by hand or by the canvas editor):
+Principle: **scans always start from the code; people's edits are applied on top.** Nothing a person writes is overwritten by a rescan, and nothing generated is passed off as human.
+
+Edits live in `builtlore.edits.yaml` at the project root (committed with the code, reviewed in PRs like any other file). They are written by `builtlore serve` (the canvas with editing on) or by hand; the canvas writes through the YAML document API, so comments and ordering survive.
 
 ```yaml
 features:
-  booking-cancel:
-    name: "Cancel booking"
-    note: "Cancellation allowed until H-1 because vaccine stock is allocated the day before."
-flows:
-  checkout:
-    hide_steps: ["debug-page"]
-    add_edge: { from: "payment", to: "e-ticket", label: "paid" }
+  booking:                         # feature id
+    name: Booking a visit
+    description: Patients pick a vaccine and a slot, then pay. Unpaid bookings expire after 24 hours.
+steps:
+  route:booking.index:             # stable step id: route name, or METHOD + URI
+    label: My bookings
+    description: Patient sees upcoming visits and can cancel one.
+    feature: Booking a visit       # move: existing feature id/name, or a new name
+    hidden: true                   # kept in the model, not drawn by default
+    code: b6bb4d23ab               # fingerprint of the code when described
+glossary:
+  MTDI: Month-to-date input
 ```
 
-Stable IDs (derived from route paths and file paths, not from LLM output) make overrides survive re-scans. If the code behind a human note changes, the note is flagged **needs review** rather than deleted.
+- **Order of application:** feature edits first (so steps can be moved into a renamed feature by its new name), then step edits; features emptied by moves disappear.
+- **Needs review:** saving a described step records a fingerprint of type, methods, URI, handler and view. If a later scan differs, the step is flagged (amber dot, note) instead of silently showing an outdated description. Saving again acknowledges it.
+- **Orphans:** edits whose id no longer exists are kept and listed in the scan notes; never deleted automatically.
+- **Untouched generated names stay generated**, so they keep improving as the extractor improves; only names a person actually changed are pinned (`provenance: human`).
+- `builtlore serve` binds to 127.0.0.1 and requires a per-session token in a custom header for writes (blocks cross-site requests from other tabs).
+- The same file will hold later human inputs: status names for the Process view (`statuses:`), actor names (`roles:`), and documentation prose (6.8).
 
 ### 6.6 Render
 
@@ -239,7 +251,7 @@ Goal: one swimlane diagram per business process (e.g. "Purchase request"), reada
 - Writes: `$model->status = X`, `->update(['status' => X])`, `Model::where(...)->update([...])`, on any status-like column (`status`, `state`, `approval_status`, `stage`, `step`, `is_approved`, …).
 - Values: string literals; class constants (`PurchaseRequest::STATUS_HOLD`, resolved by reading the class); enums (`LeaveStatus::Approved`); numbers (`status = 3`), named from label arrays on the model, `getStatusLabelAttribute`, `match`/`switch` maps, or Blade badges (`@if($row->status == 3) Approved`).
 - Guards: `if ($x->status !== 'APPROVED_MANAGER') return back()->with('error', ...)` gives the "from" state of a transition.
-- Unnamed values stay raw (`status = 3`) until a human names them once in `builtlore.overrides.yaml`:
+- Unnamed values stay raw (`status = 3`) until a human names them once in `builtlore.edits.yaml`:
 
 ```yaml
 statuses:
@@ -249,6 +261,28 @@ statuses:
 ```
 
 **Rendering:** lanes = actors, boxes = steps (business label), arrows = transitions labelled with the resulting status, red dashed = rejection/hold/back. AI naming stays optional and labelled as inferred.
+
+### 6.8 Project documentation (after the Process view)
+
+Goal: documentation an enterprise team would hand over or audit, generated from code and kept current by rescans, with the "why" written by people once and kept.
+
+| Section | Content | Source |
+|---|---|---|
+| System overview | What the app is for, who uses it, modules | Code + optional AI draft (marked *inferred* until a person confirms) + edits |
+| Roles and permissions | Matrix of roles × actions | Middleware, gates, policies, user conditions (Process layer) |
+| Business processes | Swimlane per process, status lifecycle, purpose | Process layer + edits |
+| Screens and flows | Pages, what leads where | Flows layer (exists) |
+| Business rules | Required fields, formats, limits, per form | `validate()` rules, Form Requests, guard conditions |
+| Data dictionary | Tables, columns, relationships | Migrations, models (Data layer) |
+| Integrations | External APIs, SSO, mail, notifications, storage | `Http::`, `Mail::`, `Notification`, `Storage`, SDK calls |
+| Automation | Scheduler, jobs, queues | Console kernel / `routes/console.php`, job classes |
+| API reference | Endpoints, parameters, responses | Routes + validation + returns |
+| Configuration | Required `.env` keys (names only, never values) | `config/*.php`, `env()` calls |
+| Glossary | Project terms | Edits (`glossary:`) |
+| Findings | Duplicate routes, unreachable pages, unvalidated writes | Scan notes |
+| Change history | When modules appeared and changed, by whom | Git (History layer) |
+
+Each fact carries provenance (*from code* / *inferred* / *written by a person*) so readers know what to trust. Outputs: a Markdown folder (versioned with the repo), a static HTML docs site, and Word/PDF export for formal handover. Prose fields are edited the same way as names (canvas or YAML) and survive rescans.
 
 ---
 
@@ -299,7 +333,7 @@ statuses:
 }
 ```
 
-Provenance values: `extracted` (from code, deterministic) · `inferred` (from LLM) · `human` (from overrides).
+Provenance values: `extracted` (from code, deterministic) · `inferred` (from LLM) · `human` (from `builtlore.edits.yaml`).
 
 ---
 
@@ -310,11 +344,12 @@ Provenance values: `extracted` (from code, deterministic) · `inferred` (from LL
 | `builtlore init` | Detect stacks, write a default `builtlore.config.yaml`, add `.builtlore/` to `.gitignore` |
 | `builtlore scan [paths...]` | Run the full pipeline and write `builtlore.json`; several project paths can be given, each gets its own map |
 | `builtlore view` | Open the canvas in the browser |
+| `builtlore serve` | Scan and serve the canvas on 127.0.0.1 with editing on; saves to `builtlore.edits.yaml` |
 | `builtlore docs` | Generate Markdown docs into `docs/builtlore/` |
 | `builtlore diff <refA> <refB>` | Show features/flows added, changed, removed between two git refs |
 | `builtlore check` | CI mode: exit non-zero if the committed map is out of date |
 
-Implemented in v0.1: `init`, `scan`, `view`, flags `--mode auto|static|artisan`, `--out`, `--open`, `--php <path>`.
+Implemented in v0.1: `init`, `scan`, `view`, `serve`, flags `--mode auto|static|artisan`, `--out`, `--open`, `--php <path>`, `--port`.
 Planned flags: `--no-ai` (becomes meaningful once the AI pass exists; v0.1 is fully deterministic), `--since <ref>` (incremental), `--provider`, `--model`, `--workspace <file>` (named sets of projects).
 
 ---
@@ -368,9 +403,10 @@ Alternative considered: a Go CLI (single binary by default). Rejected for v0.1 b
 | Version | Scope |
 |---|---|
 | **v0.1** | Flows layer for **one** stack · `scan`, `view` · single-HTML canvas · `--no-ai` mode |
+| v0.1 (alpha.3) | Human edits + stable IDs + `serve` (done, 6.5) |
 | v0.2 | **Process layer:** swimlanes from actors + status transitions (6.7); becomes the default view |
-| v0.2.x | History layer: feature birth, churn, contributors · timeline slider · `diff` |
-| v0.3 | Overrides + stable IDs · incremental scans · `docs` output · `check` for CI · GitHub Action |
+| v0.3 | **Project documentation** (6.8): `builtlore docs` → Markdown, HTML site, Word/PDF |
+| v0.3.x | History layer: feature birth, churn, contributors · timeline slider · `diff` · `check` for CI · GitHub Action |
 | v0.4 | Data layer: migrations/ORM → ERD · live read-only DB (FKs, stored procedures) · step ↔ table links |
 | v0.5 | Automation layer: schedulers, cron, queues, webhooks as time/event-triggered flows |
 | v0.6 | More adapters (Go, then Next.js, then Flutter) · adapter SDK and contributor guide |

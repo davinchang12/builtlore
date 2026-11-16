@@ -4,6 +4,7 @@ import { basename, join, resolve } from "node:path";
 import YAML from "yaml";
 import { adapters } from "../adapters/index.js";
 import { renderHtml } from "../render/html.js";
+import { applyEdits, loadEdits } from "./edits.js";
 import { buildMap } from "./model.js";
 import type { BuiltMap, ExtractOptions, Fact } from "./types.js";
 import { VERSION } from "./version.js";
@@ -36,6 +37,9 @@ export async function detectStacks(root: string): Promise<string[]> {
 
 export interface ScanResult {
   root: string;
+  /** What the code says, before edits. */
+  raw: BuiltMap;
+  /** raw + builtlore.edits.yaml; this is what gets written. */
   map: BuiltMap;
   jsonPath: string;
   htmlPath: string;
@@ -62,7 +66,7 @@ export async function scanProject(rootArg: string, overrides: Partial<Config> = 
     );
   }
 
-  const map = buildMap({
+  const raw = buildMap({
     projectName: projectName(root),
     commit: gitCommit(root),
     stacks,
@@ -70,11 +74,12 @@ export async function scanProject(rootArg: string, overrides: Partial<Config> = 
     notes,
     generator: `builtlore ${VERSION}`,
   });
+  const map = applyEdits(raw, loadEdits(root));
 
   const jsonPath = join(root, config.output);
   writeFileSync(jsonPath, JSON.stringify(map, null, 2) + "\n");
   const htmlPath = writeHtml(root, map);
-  return { root, map, jsonPath, htmlPath };
+  return { root, raw, map, jsonPath, htmlPath };
 }
 
 export function writeHtml(root: string, map: BuiltMap): string {
@@ -83,6 +88,12 @@ export function writeHtml(root: string, map: BuiltMap): string {
   const htmlPath = join(dir, "map.html");
   writeFileSync(htmlPath, renderHtml(map));
   return htmlPath;
+}
+
+export function writeJson(root: string, map: BuiltMap): string {
+  const jsonPath = join(root, loadConfig(root).output);
+  writeFileSync(jsonPath, JSON.stringify(map, null, 2) + "\n");
+  return jsonPath;
 }
 
 function projectName(root: string): string {

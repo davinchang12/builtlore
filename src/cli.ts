@@ -5,6 +5,7 @@ import { join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { adapters } from "./adapters/index.js";
 import { detectStacks, scanProject, writeHtml, DEFAULT_CONFIG, loadConfig } from "./core/scan.js";
+import { serveProject } from "./core/serve.js";
 import type { BuiltMap } from "./core/types.js";
 import { VERSION } from "./core/version.js";
 
@@ -15,6 +16,9 @@ Usage
   builtlore init [path]                 Detect stacks and write builtlore.config.yaml
   builtlore scan [paths...] [options]   Scan one or more projects (default: current folder)
   builtlore view [path] [--no-open]     Open the canvas for a scanned project
+  builtlore serve [path] [--port 4321]  Scan and open the canvas with editing on:
+                                        name steps, describe features, regroup, hide.
+                                        Edits save to builtlore.edits.yaml and survive rescans.
 
 Scan options
   --mode <auto|static|artisan>         Laravel: artisan (exact, needs PHP + vendor/), static (no PHP), auto (default)
@@ -38,6 +42,7 @@ async function main(argv: string[]): Promise<number> {
       mode: { type: "string" },
       out: { type: "string" },
       php: { type: "string" },
+      port: { type: "string" },
       open: { type: "boolean", default: false },
       "no-open": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -67,6 +72,13 @@ async function main(argv: string[]): Promise<number> {
       });
     case "view":
       return view(paths[0] ?? ".", !values["no-open"]);
+    case "serve":
+      return serve(paths[0] ?? ".", {
+        mode: values.mode as "auto" | "static" | "artisan" | undefined,
+        php: values.php,
+        port: values.port ? Number(values.port) : undefined,
+        open: !values["no-open"],
+      });
     default:
       console.error(`Unknown command: ${command}\n`);
       console.log(HELP);
@@ -144,6 +156,26 @@ async function view(pathArg: string, open: boolean): Promise<number> {
   console.log(`Canvas: ${rel(html)}`);
   if (open) openFile(html);
   return 0;
+}
+
+async function serve(pathArg: string, opts: { mode?: "auto" | "static" | "artisan"; php?: string; port?: number; open: boolean }): Promise<number> {
+  try {
+    const h = await serveProject(pathArg, { mode: opts.mode, php: opts.php, port: opts.port });
+    console.log(`\n✔ Editing ${h.root}`);
+    console.log(`  canvas: ${h.url}`);
+    console.log(`  edits:  ${rel(join(h.root, "builtlore.edits.yaml"))} (commit this file)`);
+    console.log("  Press Ctrl+C to stop.");
+    if (opts.open) openFile(h.url);
+    await new Promise<void>((resolve) => {
+      process.on("SIGINT", () => { h.server.close(); resolve(); });
+    });
+    return 0;
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "EADDRINUSE") console.error(`Port ${opts.port ?? 4321} is in use. Try: builtlore serve --port 4322`);
+    else console.error(`✖ ${e.message}`);
+    return 1;
+  }
 }
 
 function openFile(path: string): void {
