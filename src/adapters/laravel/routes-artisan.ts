@@ -27,10 +27,10 @@ export function artisanAvailable(root: string): boolean {
   return existsSync(join(root, "artisan")) && existsSync(join(root, "vendor", "autoload.php"));
 }
 
-export function extractRoutesArtisan(root: string, timeoutMs = 30000): ArtisanResult {
+export function extractRoutesArtisan(root: string, php = "php", timeoutMs = 30000): ArtisanResult {
   if (!artisanAvailable(root)) return { ok: false, routes: [], reason: "artisan or vendor/ not found" };
   const run = (args: string[]) =>
-    spawnSync("php", ["artisan", "route:list", "--json", ...args], {
+    spawnSync(php, ["artisan", "route:list", "--json", ...args], {
       cwd: root,
       encoding: "utf8",
       timeout: timeoutMs,
@@ -38,7 +38,16 @@ export function extractRoutesArtisan(root: string, timeoutMs = 30000): ArtisanRe
     });
   let res = run(["--except-vendor"]);
   if (res.status !== 0) res = run([]);
-  if (res.error) return { ok: false, routes: [], reason: `php not runnable: ${res.error.message}` };
+  if (res.error) {
+    const missing = (res.error as NodeJS.ErrnoException).code === "ENOENT";
+    return {
+      ok: false,
+      routes: [],
+      reason: missing
+        ? `PHP not found at '${php}'. Add PHP to PATH or pass --php <path> (e.g. Laragon/XAMPP php.exe)`
+        : `php not runnable: ${res.error.message}`,
+    };
+  }
   if (res.status !== 0) return { ok: false, routes: [], reason: (res.stderr || res.stdout || "route:list failed").trim().split("\n")[0] };
 
   let parsed: ArtisanRoute[];

@@ -2,7 +2,7 @@
 
 > **Name.** `builtlore` = "the lore of what you built": the knowledge, flows and history of an application that usually live only in people's heads, made visible. Chosen 2026-11-16 (see [Open questions](#16-open-questions)).
 
-**Status:** v0.1 alpha implemented (Laravel flows) · **Last updated:** 2026-11-16
+**Status:** v0.1.0-alpha.1 (Laravel flows, dogfooded on a 145-route internal app) · **Next:** Process view · **Last updated:** 2026-11-16
 
 ---
 
@@ -86,14 +86,15 @@ All information lives on one canvas, organized into layers that can be toggled, 
 
 | Layer | Contents | Primary sources |
 |---|---|---|
-| **Flows** | Entry points, screens/pages, steps, branches, business flows | Routes, pages, navigation, handlers |
+| **Process** | Business processes as swimlanes: who does each step, how the status changes | Actions + role checks + status writes and guards (see 6.7) |
+| **Flows** (screens) | Entry points, screens/pages, steps, branches | Routes, pages, navigation, handlers |
 | **Data** | Tables, relationships, stored procedures, which step reads/writes what | Migrations, ORM models, schema files, live DB (read-only) |
 | **Automation** | Scheduled jobs, cron, queues, workers, webhooks | Scheduler definitions, cron configs, job classes |
 | **History** | When each feature appeared, how it changed, who worked on it | Git history |
 | **Tests** | Which flows are covered, results, screenshots | Test files, coverage reports, runner output |
 | **Requirements** | What was requested vs. what is built | Human-captured notes, issues (later) |
 
-v0.1 ships **Flows** only. Every other layer is a separate release.
+v0.1 ships **Flows** only. Every other layer is a separate release. Dogfooding showed that Flows answers "how do users move through the screens", while people mostly ask "what is the business process"; so **Process** is the next layer and will become the default view, with Flows as the detailed technical tab.
 
 ---
 
@@ -165,7 +166,16 @@ Then, for every route:
 - **View → next step:** scan the Blade view for `route('name')` / `url()` / `action()` in `<a href>` and `<form action>` to create navigation edges (form `method` becomes the edge trigger, e.g. "submit").
 - **Handler → next step:** `redirect()->route()`, `to_route()`, `redirect()->back()` (marked as "back"), plus `->with('error', …)` / `withErrors()` to label failure branches.
 
+- **Scripts and attributes → AJAX / links (alpha.1):** `route()` / `url()` outside `<a href>` and `<form action>` (in `<script>`, `data-*`, `onclick`) become `ajax` edges when they target an action or data endpoint, `link` edges when they target a page. Blade comments are blanked first.
+- **Response kind → node type (alpha.1):** JSON responses (`response()->json`, DataTables, `toJson()`) make a *data* node, file responses (`Excel::download`, `response()->download()`, PDF) a *download* node, unless the handler also renders a view or redirects. JSON returned by a write verb (store, update, approve, …) stays an *action*.
+- **Duplicates (alpha.1):** routes with the same method and URI are reported (Laravel keeps the last one, and so does builtlore), as are route names shared by several routes.
+
 Inertia (`Inertia::render('Booking/Index')`) and Livewire components are common Laravel front ends; they are detected and listed in v0.1, with full edge extraction planned for a later release.
+
+#### Feature grouping
+
+1. Base group: auth routes → `auth`; known area prefixes (`admin.`, `api.`, `master.`…) → first two name segments; otherwise first name segment, or first URI segment.
+2. Groups with ≥ 12 entries whose entries belong to ≥ 2 controller *domains* (and ≥ 2 entries per domain on average) are areas, not features, and are split by domain. A domain is the controller name minus noise words (`Status`, `Report`, `Laporan`, `Export`, `Detail`, …), so `StatusMTDIController` joins `MTDIController`; generic controllers (`LaporanController`) fall back to the method name (`indexMTDI` → `MTDI`), then to the route name or URI.
 
 ### 6.3 History
 
@@ -211,6 +221,34 @@ Stable IDs (derived from route paths and file paths, not from LLM output) make o
 - **Canvas:** one self-contained HTML file (no server needed). ELK layered auto-layout rendered as SVG; edges inside a feature are routed orthogonally, edges between features are drawn as direct curves. Search, feature filters, details panel, SVG export. Planned: hand-drawn style and export to `.excalidraw` for free-form editing.
 - **Docs:** Markdown, one page per feature, plus an index; can be served as a static site.
 - **AI context:** a compact `builtlore.md` (and later an MCP server) that agents can read: feature → flow → files → tables → jobs.
+
+### 6.7 Process view (next)
+
+Goal: one swimlane diagram per business process (e.g. "Purchase request"), readable by non-developers, generated from code.
+
+**Steps** come from actions (store, update, approve, hold, delegate…), already extracted.
+
+**Actors (lanes)**, found by builtlore, most specific first:
+1. Route middleware: `role:manager`, `can:approve`, custom middleware such as `isAtasan`.
+2. Authorization in the handler: `$this->authorize()`, `Gate::allows()`, policies.
+3. Conditions on the current user: `if ($user->jabatan == ...)`, `if (auth()->user()->nik == $request->nik_atasan)`.
+4. Names: `atasan-approve`, `approveManager`, `changePIC`.
+5. Otherwise the lane is "actor unknown". Never guessed.
+
+**Status transitions** — teams mix styles, so all are read:
+- Writes: `$model->status = X`, `->update(['status' => X])`, `Model::where(...)->update([...])`, on any status-like column (`status`, `state`, `approval_status`, `stage`, `step`, `is_approved`, …).
+- Values: string literals; class constants (`PurchaseRequest::STATUS_HOLD`, resolved by reading the class); enums (`LeaveStatus::Approved`); numbers (`status = 3`), named from label arrays on the model, `getStatusLabelAttribute`, `match`/`switch` maps, or Blade badges (`@if($row->status == 3) Approved`).
+- Guards: `if ($x->status !== 'APPROVED_MANAGER') return back()->with('error', ...)` gives the "from" state of a transition.
+- Unnamed values stay raw (`status = 3`) until a human names them once in `builtlore.overrides.yaml`:
+
+```yaml
+statuses:
+  purchase-request:
+    1: Waiting for manager
+    3: Approved by procurement
+```
+
+**Rendering:** lanes = actors, boxes = steps (business label), arrows = transitions labelled with the resulting status, red dashed = rejection/hold/back. AI naming stays optional and labelled as inferred.
 
 ---
 
@@ -276,7 +314,7 @@ Provenance values: `extracted` (from code, deterministic) · `inferred` (from LL
 | `builtlore diff <refA> <refB>` | Show features/flows added, changed, removed between two git refs |
 | `builtlore check` | CI mode: exit non-zero if the committed map is out of date |
 
-Implemented in v0.1: `init`, `scan`, `view`, flags `--mode auto|static|artisan`, `--out`, `--open`.
+Implemented in v0.1: `init`, `scan`, `view`, flags `--mode auto|static|artisan`, `--out`, `--open`, `--php <path>`.
 Planned flags: `--no-ai` (becomes meaningful once the AI pass exists; v0.1 is fully deterministic), `--since <ref>` (incremental), `--provider`, `--model`, `--workspace <file>` (named sets of projects).
 
 ---
@@ -287,7 +325,7 @@ Planned flags: `--no-ai` (becomes meaningful once the AI pass exists; v0.1 is fu
 
 | Concern | Choice | Why |
 |---|---|---|
-| CLI language | TypeScript (Node ≥ 20 / Bun) | Same language as the viewer; fastest path to a working prototype |
+| CLI language | TypeScript (Node ≥ 22 / Bun) | Same language as the viewer; fastest path to a working prototype |
 | Distribution | `npx builtlore`, plus single-file binaries via `bun build --compile` | Works on machines without Node for Go/PHP/Flutter teams |
 | Parsing | PHP: `php-parser` (pure JS, PHP 8 syntax). Other stacks: `web-tree-sitter` (WASM grammars) when their adapters land | No native build step; each adapter picks the most reliable parser for its language |
 | Git | `git` CLI via child process | Simple, fast, always available where git is |
@@ -330,7 +368,8 @@ Alternative considered: a Go CLI (single binary by default). Rejected for v0.1 b
 | Version | Scope |
 |---|---|
 | **v0.1** | Flows layer for **one** stack · `scan`, `view` · single-HTML canvas · `--no-ai` mode |
-| v0.2 | History layer: feature birth, churn, contributors · timeline slider · `diff` |
+| v0.2 | **Process layer:** swimlanes from actors + status transitions (6.7); becomes the default view |
+| v0.2.x | History layer: feature birth, churn, contributors · timeline slider · `diff` |
 | v0.3 | Overrides + stable IDs · incremental scans · `docs` output · `check` for CI · GitHub Action |
 | v0.4 | Data layer: migrations/ORM → ERD · live read-only DB (FKs, stored procedures) · step ↔ table links |
 | v0.5 | Automation layer: schedulers, cron, queues, webhooks as time/event-triggered flows |
@@ -347,7 +386,7 @@ Alternative considered: a Go CLI (single binary by default). Rejected for v0.1 b
 
 ### Milestones
 
-Status (2026-11-16): milestones 1–3 done (CLI, Laravel adapter with static and artisan modes, canvas, 15 passing tests). Next: 5 (dogfood on real apps), then 4 (AI synthesis) as an opt-in.
+Status (2026-11-16): milestones 1–3 done (CLI, Laravel adapter with static and artisan modes, canvas). Milestone 5 started: first run on a real 145-route internal app led to alpha.1 (area/domain grouping, data and file endpoints, AJAX edges, duplicate warnings, `--php`; 24 tests). Next: Process view (6.7), then 4 (AI synthesis) as an opt-in.
 
 1. **Skeleton** — repo, TypeScript CLI with `init` / `scan` / `view`, a small fixture Laravel app (booking flow with success and failure branches) for tests, CI.
 2. **Extraction** — Laravel adapter (see [Laravel adapter strategy](#laravel-adapter-strategy-v01)): artisan mode + static mode for routes, handler → view, Blade links/forms → edges, redirects → edges with failure labels. Snapshot tests against fixtures.
@@ -379,7 +418,8 @@ builtlore/
 │   └── render/           # single-file HTML canvas
 ├── assets/               # viewer.js + viewer.css (inlined into the canvas)
 ├── fixtures/
-│   └── laravel-clinic/   # sample app with success and failure branches
+│   ├── laravel-clinic/   # sample app with success and failure branches
+│   └── laravel-workflow/ # approval workflow: area prefixes, status controllers, AJAX, exports
 ├── test/                 # node:test suites
 ├── docs/DESIGN.md
 └── README.md

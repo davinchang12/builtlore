@@ -46,7 +46,7 @@ export const laravelAdapter: Adapter = {
     let mode = "static";
     if (options.mode !== "static") {
       if (artisanAvailable(repo.root)) {
-        const art = extractRoutesArtisan(repo.root);
+        const art = extractRoutesArtisan(repo.root, options.php ?? process.env.BUILTLORE_PHP ?? "php");
         if (art.ok) {
           routes = mergeRoutes(art.routes, fromStatic.routes);
           mode = "artisan";
@@ -58,6 +58,7 @@ export const laravelAdapter: Adapter = {
       }
     }
     notes.push(`Laravel routes: ${routes.length} (${mode} mode; files: ${fromStatic.filesRead.join(", ") || "none"}).`);
+    routes = dropDuplicates(routes, notes);
 
     // 2. Entries
     const locator = new ClassLocator(repo.root);
@@ -104,7 +105,7 @@ export const laravelAdapter: Adapter = {
       entries.push({
         kind: "entry",
         id,
-        type: entryType(r, view),
+        type: entryType(r, view, analysis),
         methods: r.methods.filter((m) => m !== "HEAD"),
         uri: r.uri,
         name: r.name,
@@ -133,11 +134,13 @@ export const laravelAdapter: Adapter = {
           layoutLinks += blade.layoutLinkCount(l);
         }
         for (const link of b.links) {
-          const method = link.trigger === "submit" ? link.method ?? "POST" : "GET";
+          const method = link.trigger === "submit" ? link.method ?? "POST" : link.trigger === "ref" ? "ANY" : "GET";
           const to = resolver.resolve(link.target, method);
           if (to) {
-            if (to !== e.id) edges.push({ kind: "navigates", from: e.id, to, trigger: link.trigger, source: { file: link.file, line: link.line } });
-          } else {
+            if (to === e.id) continue;
+            const trigger = link.trigger === "ref" ? (resolver.typeOf(to) === "page" ? "link" : "ajax") : link.trigger;
+            edges.push({ kind: "navigates", from: e.id, to, trigger, source: { file: link.file, line: link.line } });
+          } else if (link.trigger !== "ref") {
             skipped.push({ kind: "skipped", reason: `Unresolved ${link.trigger} target ${describeTarget(link.target)}`, source: { file: link.file, line: link.line } });
           }
         }
@@ -198,26 +201,77 @@ function entryId(r: RawRoute): string {
   return `route:${methods} /${r.uri === "/" ? "" : r.uri}`;
 }
 
-function entryType(r: RawRoute, view?: ViewRef): EntryType {
+function entryType(r: RawRoute, view: ViewRef | undefined, a: HandlerAnalysis | null): EntryType {
   if (r.routeFile === "api" || r.uri.startsWith("api/")) return "api";
   if (r.action.kind === "redirect") return "redirect";
+  if (!view && a) {
+    if (a.returnsFile && !a.redirects.length) return "download";
+    // JSON from a write (store/update/approve...) is an AJAX action; JSON from a read is a data endpoint.
+    if (a.returnsJson && !a.redirects.length) return isWrite(r) ? "action" : "data";
+  }
   const readOnly = r.methods.every((m) => m === "GET" || m === "HEAD" || m === "ANY");
   if (readOnly || view) return "page";
   return "action";
 }
 
+const WRITE_VERBS = /^(store|update|destroy|delete|save|approve|reject|hold|cancel|submit|insert|change|assign|reassign|delegat|upload|import|revis|confirm|close|reopen|send|toggle|set)/i;
+
+function isWrite(r: RawRoute): boolean {
+  const method = r.action.kind === "controller" ? r.action.method : "";
+  const last = r.name?.split(".").pop() ?? "";
+  return WRITE_VERBS.test(method) || WRITE_VERBS.test(last.replace(/[-_]/g, ""));
+}
+
+/**
+ * Two routes with the same method and URI: Laravel keeps the last one registered.
+ * Keep the same one and say so, because it is almost always a copy-paste leftover.
+ */
+function dropDuplicates(routes: RawRoute[], notes: string[]): RawRoute[] {
+  const key = (r: RawRoute) => `${r.methods.filter((m) => m !== "HEAD").join("|")} /${r.uri === "/" ? "" : r.uri}`;
+  const lastIndex = new Map<string, number>();
+  routes.forEach((r, i) => lastIndex.set(key(r), i));
+  const seen = new Map<string, RawRoute[]>();
+  for (const r of routes) {
+    const k = key(r);
+    if (!seen.has(k)) seen.set(k, []);
+    seen.get(k)!.push(r);
+  }
+  for (const [k, list] of seen) {
+    if (list.length < 2) continue;
+    const where = list.map((r) => `${r.file}${r.line ? ":" + r.line : ""}`).join(", ");
+    notes.push(`Warning: duplicate route ${k} defined ${list.length} times (${where}); Laravel uses the last one.`);
+  }
+  const byName = new Map<string, RawRoute[]>();
+  for (const r of routes) if (r.name) byName.set(r.name, [...(byName.get(r.name) ?? []), r]);
+  for (const [name, list] of byName) {
+    if (list.length < 2 || new Set(list.map(key)).size < 2) continue;
+    notes.push(`Warning: route name '${name}' is used by ${list.length} different routes; route('${name}') points to the last one.`);
+  }
+  return routes.filter((r, i) => lastIndex.get(key(r)) === i);
+}
+
 class TargetResolver {
   private byName = new Map<string, EntryFact>();
+  private byId = new Map<string, EntryFact>();
   private patterns: Array<{ entry: EntryFact; re: RegExp }> = [];
 
   constructor(private entries: EntryFact[]) {
     for (const e of entries) {
+      this.byId.set(e.id, e);
       if (e.name) this.byName.set(e.name, e);
       this.patterns.push({ entry: e, re: uriPattern(e.uri) });
     }
   }
 
+  typeOf(id: string): EntryType | undefined {
+    return this.byId.get(id)?.type;
+  }
+
   resolve(target: BladeTarget, method: string): string | null {
+    if (method === "ANY") {
+      if (target.kind === "name") return this.byName.get(target.name)?.id ?? null;
+      if (target.kind === "uri") return this.byUri(target.uri, "GET") ?? this.byUri(target.uri, "POST");
+    }
     if (target.kind === "name") {
       // route('login') in a POST form points at the POST route on the same URI.
       const named = this.byName.get(target.name);

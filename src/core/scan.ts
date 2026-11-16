@@ -11,6 +11,8 @@ import { VERSION } from "./version.js";
 export interface Config {
   mode: ExtractOptions["mode"];
   output: string;
+  /** PHP executable for Laravel artisan mode. */
+  php?: string;
 }
 
 export const DEFAULT_CONFIG: Config = { mode: "auto", output: "builtlore.json" };
@@ -50,7 +52,7 @@ export async function scanProject(rootArg: string, overrides: Partial<Config> = 
   for (const adapter of adapters) {
     if (!(await adapter.detect({ root }))) continue;
     stacks.push(adapter.id);
-    const res = await adapter.extract({ root }, { mode: config.mode });
+    const res = await adapter.extract({ root }, { mode: config.mode, php: config.php });
     facts.push(...res.facts);
     notes.push(...res.notes);
   }

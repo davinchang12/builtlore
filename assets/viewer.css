@@ -86,6 +86,7 @@ main svg.panning { cursor: grabbing; }
 .edge.redirect path { stroke: #334155; }
 .edge.back path { stroke-dasharray: 5 4; }
 .edge.error path { stroke: var(--error); }
+.edge.ajax path { stroke: #0d9488; stroke-dasharray: 2 3; }
 .edge.hl path { stroke-width: 2.4; }
 .edge-label rect { fill: #fff; stroke: none; }
 .edge-label text { font-size: 11px; fill: #475569; }
@@ -104,6 +105,10 @@ main svg.panning { cursor: grabbing; }
 .badge.page { background: #eff6ff; border-color: #bfdbfe; color: #1d4ed8; }
 .badge.action { background: #fffbeb; border-color: #fde68a; color: #b45309; }
 .badge.api { background: #f5f3ff; border-color: #ddd6fe; color: #6d28d9; }
+.badge.data { background: #f0fdfa; border-color: #99f6e4; color: #0f766e; }
+.badge.download { background: #f8fafc; border-color: #cbd5e1; color: #334155; }
+.toggle-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink); cursor: pointer; }
+.toggle-row .count { color: var(--muted); font-size: 12px; margin-left: auto; }
 .details dl { margin: 0; display: grid; grid-template-columns: 96px 1fr; gap: 8px 10px; font-size: 13px; }
 .details dt { color: var(--muted); }
 .details dd { margin: 0; word-break: break-word; }

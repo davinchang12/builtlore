@@ -7,7 +7,8 @@
 
 export type HttpMethod = "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS" | "ANY";
 
-export type EntryType = "page" | "action" | "api" | "redirect";
+/** page: renders a screen · action: form submit · api: routes/api.php · data: returns JSON (AJAX) · download: returns a file · redirect: Route::redirect */
+export type EntryType = "page" | "action" | "api" | "data" | "download" | "redirect";
 
 export interface SourceRef {
   file: string; // repo-relative, forward slashes
@@ -45,7 +46,8 @@ export interface ViewRef {
   file?: string;
 }
 
-export type EdgeTrigger = "link" | "submit" | "redirect" | "back" | "include";
+/** ajax: referenced from a script or data attribute (fetch, DataTables, $.post) */
+export type EdgeTrigger = "link" | "submit" | "redirect" | "back" | "ajax" | "include";
 
 /** Navigation from one entry to another. */
 export interface NavigatesFact {
@@ -88,6 +90,8 @@ export interface Adapter {
 export interface ExtractOptions {
   /** "auto" tries artisan first, then static parsing. */
   mode: "auto" | "static" | "artisan";
+  /** PHP executable for artisan mode (default: "php" on PATH). */
+  php?: string;
 }
 
 // ---------------------------------------------------------------------------

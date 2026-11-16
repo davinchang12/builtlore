@@ -7,7 +7,8 @@
   var elk = new ELK();
 
   var PALETTE = ["#2563eb", "#059669", "#d97706", "#7c3aed", "#db2777", "#0891b2", "#65a30d", "#dc2626", "#4f46e5", "#ea580c", "#0d9488", "#9333ea"];
-  var TYPE_COLOR = { page: "#2563eb", action: "#d97706", api: "#7c3aed", redirect: "#6b7280" };
+  var TYPE_COLOR = { page: "#2563eb", action: "#d97706", api: "#7c3aed", data: "#0d9488", download: "#475569", redirect: "#6b7280" };
+  var HIDDEN_BY_DEFAULT = { data: true, download: true };
 
   var nodesById = {};
   data.nodes.forEach(function (n) { nodesById[n.id] = n; });
@@ -16,6 +17,7 @@
 
   var state = {
     hidden: {},
+    showData: false,
     selected: null,
     query: "",
     direction: "RIGHT",
@@ -44,6 +46,11 @@
 
   renderFeatureList();
   renderNotes();
+
+  var dataCount = data.nodes.filter(function (n) { return HIDDEN_BY_DEFAULT[n.type]; }).length;
+  $("#data-count").textContent = String(dataCount);
+  if (!dataCount) $("#data-toggle-row").style.display = "none";
+  $("#show-data").onchange = function (e) { state.showData = e.target.checked; layout(true); };
 
   $("#search").addEventListener("input", function (e) {
     state.query = e.target.value.trim().toLowerCase();
@@ -82,7 +89,9 @@
 
   // --------------------------------------------------------------- layout
   function visibleNodes() {
-    return data.nodes.filter(function (n) { return !state.hidden[n.feature]; });
+    return data.nodes.filter(function (n) {
+      return !state.hidden[n.feature] && (state.showData || !HIDDEN_BY_DEFAULT[n.type]);
+    });
   }
 
   function nodeSize(n) {

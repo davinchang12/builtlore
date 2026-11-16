@@ -62,6 +62,7 @@ builtlore init                              # write builtlore.config.yaml and ig
 | `--mode static` | Parse route files directly. Works without PHP. |
 | `--out <file>` | Where to write the JSON model (default `builtlore.json`). |
 | `--open` | Open the canvas after scanning. |
+| `--php <path>` | PHP executable for artisan mode, e.g. Laragon or XAMPP `php.exe` (or set `BUILTLORE_PHP`). |
 
 Each scan writes two files into the project:
 
@@ -78,9 +79,14 @@ Each scan writes two files into the project:
 | Grey arrow | Link (`<a href>`) |
 | Blue arrow | Form submit (`<form action>`, including `@method()` spoofing) |
 | Dark arrow | Redirect from the handler |
+| Teal bar | Data endpoint: returns JSON (AJAX, DataTables, dropdown data). Hidden by default |
+| Slate bar | File: export or download (Excel, PDF, `response()->download()`). Hidden by default |
 | Red dashed arrow | Failure branch: validation failed, `withErrors()`, `with('error')` |
+| Teal dotted arrow | AJAX call from a page (`$.post`, `fetch`, DataTables `ajax:`) |
 
-Shortcuts: `/` search, `f` fit to screen, `Esc` clear selection. Scroll to zoom, drag to pan. Use **only** next to a feature to focus on it.
+Shortcuts: `/` search, `f` fit to screen, `Esc` clear selection. Scroll to zoom, drag to pan. Use **only** next to a feature to focus on it. Tick **Show data & file endpoints** to see the AJAX and export endpoints behind each page.
+
+Large apps: route name prefixes that act as menus or areas (`menu.*`, `master.*`, `admin.*`) are split into one feature per controller domain, so `MTDIController` and `StatusMTDIController` end up in the same feature.
 
 ## What builtlore reads in a Laravel app
 
@@ -90,7 +96,9 @@ Shortcuts: `/` search, `f` fit to screen, `Esc` clear selection. Scroll to zoom,
 | Controllers (via `composer.json` PSR-4) | Rendered views (`view()`, `View::make`, `Inertia::render`), redirects (`redirect()->route()`, `to_route()`, `back()`, `redirect('/path')`, `intended()`, `action()`), validation (`$request->validate()`, Form Request parameters) |
 | Route closures | Same as controllers |
 | Blade views and `@include`d partials | Links and forms pointing at `route()`, `url()`, `action()` or literal paths |
+| Scripts and attributes in Blade (`$.post("{{ route('x') }}")`, DataTables `ajax:`, `data-url="{{ route('x') }}"`) | AJAX calls and links built in JavaScript |
 | Layouts (`@extends`, `<x-app-layout>`) | Counted but not drawn, so navigation menus do not connect every page to every other page |
+| The route table as a whole | Warnings for duplicate routes (same method and URI defined twice) and route names used by more than one route |
 
 Inertia and Livewire pages are detected; following their navigation is planned.
 
@@ -103,7 +111,8 @@ builtlore v0.1 runs entirely on your machine. It does not use AI and makes no ne
 | Version | Scope |
 |---|---|
 | **v0.1** | Laravel flows · canvas · JSON model |
-| v0.2 | History: when each feature appeared and how it changed (git) · timeline slider |
+| v0.2 | **Process view:** business processes as swimlanes: who does each step (roles from middleware, policies, role checks) and how the status changes (strings, numbers, constants, enums) |
+| v0.2.x | History: when each feature appeared and how it changed (git) · timeline slider |
 | v0.3 | Human notes and corrections that survive re-scans · Markdown docs · CI check |
 | v0.4 | Data layer: tables, relationships, stored procedures, step ↔ table links |
 | v0.5 | Automation layer: schedulers, cron, queues, webhooks |

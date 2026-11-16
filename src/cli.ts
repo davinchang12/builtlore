@@ -19,6 +19,7 @@ Usage
 Scan options
   --mode <auto|static|artisan>         Laravel: artisan (exact, needs PHP + vendor/), static (no PHP), auto (default)
   --out <file>                         Output JSON path relative to the project (default: builtlore.json)
+  --php <path>                         PHP executable for artisan mode (default: php on PATH; or set BUILTLORE_PHP)
   --open                               Open the canvas after scanning (single project only)
 
 Examples
@@ -36,6 +37,7 @@ async function main(argv: string[]): Promise<number> {
     options: {
       mode: { type: "string" },
       out: { type: "string" },
+      php: { type: "string" },
       open: { type: "boolean", default: false },
       "no-open": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -60,6 +62,7 @@ async function main(argv: string[]): Promise<number> {
       return scan(paths.length ? paths : ["."], {
         mode: values.mode as "auto" | "static" | "artisan" | undefined,
         out: values.out,
+        php: values.php,
         open: values.open,
       });
     case "view":
@@ -103,13 +106,13 @@ output: ${DEFAULT_CONFIG.output}
   return 0;
 }
 
-async function scan(paths: string[], opts: { mode?: "auto" | "static" | "artisan"; out?: string; open: boolean }): Promise<number> {
+async function scan(paths: string[], opts: { mode?: "auto" | "static" | "artisan"; out?: string; php?: string; open: boolean }): Promise<number> {
   let failures = 0;
   const done: string[] = [];
   for (const p of paths) {
     const started = Date.now();
     try {
-      const res = await scanProject(p, { mode: opts.mode, output: opts.out });
+      const res = await scanProject(p, { mode: opts.mode, output: opts.out, php: opts.php });
       const m = res.map;
       const secs = ((Date.now() - started) / 1000).toFixed(1);
       console.log(`\n✔ ${m.project.name}  (${m.stacks.join(", ")}, ${secs}s)`);

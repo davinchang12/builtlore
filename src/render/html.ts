@@ -44,6 +44,9 @@ export function renderHtml(map: BuiltMap): string {
       <div class="stat"><b id="stat-nodes"></b><span>steps</span></div>
       <div class="stat"><b id="stat-edges"></b><span>transitions</span></div>
     </div>
+    <label class="toggle-row" id="data-toggle-row" title="Endpoints that return JSON (AJAX, DataTables) or files (exports, downloads)">
+      <input type="checkbox" id="show-data"> Show data &amp; file endpoints <span class="count" id="data-count"></span>
+    </label>
     <section>
       <h3>Features</h3>
       <div class="links"><a id="all-features">show all</a><a id="no-features">hide all</a></div>
@@ -54,11 +57,14 @@ export function renderHtml(map: BuiltMap): string {
       <div class="legend">
         <div><span class="sw" style="background:#2563eb"></span>Page (renders a screen)</div>
         <div><span class="sw" style="background:#d97706"></span>Action (form submit, save, delete)</div>
-        <div><span class="sw" style="background:#7c3aed"></span>API endpoint</div>
+        <div><span class="sw" style="background:#7c3aed"></span>API endpoint (routes/api.php)</div>
+        <div><span class="sw" style="background:#0d9488"></span>Data endpoint (returns JSON)</div>
+        <div><span class="sw" style="background:#475569"></span>File (export, download)</div>
         <div><svg width="22" height="10"><line x1="0" y1="5" x2="22" y2="5" stroke="#94a3b8" stroke-width="2"/></svg>Link</div>
         <div><svg width="22" height="10"><line x1="0" y1="5" x2="22" y2="5" stroke="#2563eb" stroke-width="2"/></svg>Form submit</div>
         <div><svg width="22" height="10"><line x1="0" y1="5" x2="22" y2="5" stroke="#334155" stroke-width="2"/></svg>Redirect</div>
         <div><svg width="22" height="10"><line x1="0" y1="5" x2="22" y2="5" stroke="#dc2626" stroke-width="2" stroke-dasharray="5 4"/></svg>Failure / back with errors</div>
+        <div><svg width="22" height="10"><line x1="0" y1="5" x2="22" y2="5" stroke="#0d9488" stroke-width="2" stroke-dasharray="2 3"/></svg>AJAX call from a page</div>
       </div>
     </section>
     <section id="notes"></section>

@@ -14,7 +14,8 @@ export type BladeTarget =
 
 export interface BladeLink {
   target: BladeTarget;
-  trigger: "link" | "submit";
+  /** ref: route()/url() used outside <a href> and <form action> (scripts, data-* attributes). */
+  trigger: "link" | "submit" | "ref";
   /** HTTP method for forms, after @method()/_method spoofing. */
   method?: string;
   file: string;
@@ -148,15 +149,20 @@ function attr(tag: string, name: string): string | null {
   return m[2] ?? m[3] ?? null;
 }
 
-function parseLinks(src: string, file: string): BladeLink[] {
+function parseLinks(raw: string, file: string): BladeLink[] {
   const out: BladeLink[] = [];
+  const src = stripBladeComments(raw);
+  const covered: Array<[number, number]> = [];
 
   // <a ... href="...">
   for (const m of src.matchAll(/<a\b(?:"[^"]*"|'[^']*'|[^'">])*>/gi)) {
     const href = attr(m[0], "href");
     if (!href) continue;
     const target = parseTarget(href);
-    if (target) out.push({ target, trigger: "link", file, line: lineAt(src, m.index ?? 0) });
+    if (target) {
+      out.push({ target, trigger: "link", file, line: lineAt(src, m.index ?? 0) });
+      covered.push([m.index ?? 0, (m.index ?? 0) + m[0].length]);
+    }
   }
 
   // <form ... action="..." method="..."> ... </form>
@@ -174,6 +180,23 @@ function parseLinks(src: string, file: string): BladeLink[] {
       body.match(/value=["'](\w+)["'][^>]*name=["']_method["']/i);
     if (spoof) method = spoof[1].toUpperCase();
     out.push({ target, trigger: "submit", method, file, line: lineAt(src, m.index ?? 0) });
+    covered.push([m.index ?? 0, (m.index ?? 0) + open.length]);
+  }
+
+  // Everything else: route('x') / url('/x') in scripts, data-* attributes, onclick, etc.
+  for (const m of src.matchAll(/\b(route|url)\(\s*['"]([^'"]*)['"]/g)) {
+    const idx = m.index ?? 0;
+    if (covered.some(([a, b]) => idx >= a && idx < b)) continue;
+    const before = src.slice(Math.max(0, idx - 2), idx);
+    if (before.endsWith(":") || before.endsWith(">") || before.endsWith("$")) continue; // Storage::url(), $x->url()
+    if (m[1] === "url" && m[2] && !m[2].startsWith("/")) continue;
+    const target: BladeTarget = m[1] === "route" ? { kind: "name", name: m[2] } : { kind: "uri", uri: m[2] || "/" };
+    out.push({ target, trigger: "ref", file, line: lineAt(src, idx) });
   }
   return out;
+}
+
+/** Blank out {{-- comments --}} while keeping offsets (and so line numbers) intact. */
+function stripBladeComments(src: string): string {
+  return src.replace(/\{\{--[\s\S]*?--\}\}/g, (c) => c.replace(/[^\n]/g, " "));
 }

@@ -30,12 +30,13 @@ export function buildMap(input: {
   const navs = input.facts.filter((f): f is NavigatesFact => f.kind === "navigates");
   const skipped = input.facts.filter((f): f is SkippedFact => f.kind === "skipped");
 
+  const { featureById, display } = assignFeatures(entries);
   const nodes: MapNode[] = entries.map((e) => {
-    const feature = featureOf(e);
+    const feature = featureById.get(e.id)!;
     return {
       id: e.id,
       type: e.type,
-      label: labelOf(e, feature),
+      label: labelOf(e, feature, display.get(feature) ?? featureName(feature)),
       methods: e.methods,
       uri: e.uri,
       name: e.name,
@@ -70,7 +71,7 @@ export function buildMap(input: {
   const features: Feature[] = [...byFeature.entries()]
     .map(([id, ns]) => ({
       id,
-      name: featureName(id),
+      name: display.get(id) ?? featureName(id),
       nodes: ns.map((n) => n.id),
       files: [...new Set(ns.flatMap((n) => [n.handler?.file, n.view?.file].filter((f): f is string => Boolean(f))))].sort(),
       provenance: "extracted" as const,
@@ -107,6 +108,84 @@ export function featureOf(e: EntryFact): string {
   return (segs[0] === "api" ? "api." : "") + meaningful[0];
 }
 
+/** Groups larger than this are split by controller domain when that gives meaningful groups. */
+const SPLIT_THRESHOLD = 12;
+
+/**
+ * First pass: group by route name prefix / URI (featureOf). Big groups whose
+ * entries belong to several controller "domains" (menu.* holding MTDI, Presentasi,
+ * Review...) are areas, not features: split them by domain, so StatusMTDIController
+ * and MTDIController land in the same feature.
+ */
+export function assignFeatures(entries: EntryFact[]): { featureById: Map<string, string>; display: Map<string, string> } {
+  const featureById = new Map<string, string>();
+  const display = new Map<string, string>();
+  const displayRank = new Map<string, number>();
+  const groups = new Map<string, EntryFact[]>();
+  for (const e of entries) {
+    const f = featureOf(e);
+    if (!groups.has(f)) groups.set(f, []);
+    groups.get(f)!.push(e);
+  }
+  for (const [base, list] of groups) {
+    const domains = list.map((e) => domainOf(e, base));
+    const distinct = new Set(domains.map((d) => d?.key).filter(Boolean));
+    const split = list.length >= SPLIT_THRESHOLD && distinct.size >= 2 && list.length / distinct.size >= 2;
+    list.forEach((e, i) => {
+      const d = domains[i];
+      if (split && d) {
+        const id = `${base}.${d.key}`;
+        featureById.set(e.id, id);
+        // Prefer the spelling from a controller (MTDI) over one from a URI (mtdi).
+        if ((displayRank.get(id) ?? -1) < d.rank) {
+          display.set(id, `${featureName(base)} › ${d.label}`);
+          displayRank.set(id, d.rank);
+        }
+      } else {
+        featureById.set(e.id, base);
+      }
+    });
+  }
+  return { featureById, display };
+}
+
+const DOMAIN_NOISE = new Set([
+  "status", "report", "reports", "laporan", "export", "import", "download", "upload", "detail", "details",
+  "api", "admin", "master", "get", "data", "manage", "management", "approval", "history", "list", "base",
+]);
+const HANDLER_VERBS = new Set([
+  "index", "show", "create", "store", "edit", "update", "destroy", "delete", "export", "import", "get", "download",
+  "upload", "approve", "approved", "reject", "hold", "list", "view", "print", "data", "invoke",
+]);
+
+function splitWords(s: string): string[] {
+  return s.match(/[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+/g) ?? [];
+}
+
+function domainOf(e: EntryFact, base: string): { key: string; label: string; rank: number } | null {
+  const cls = e.handler?.class?.split("\\").pop()?.replace(/Controller$/, "");
+  let words: string[] = [];
+  let rank = 2;
+  if (cls) words = splitWords(cls).filter((w) => !DOMAIN_NOISE.has(w.toLowerCase()));
+  if (!words.length && e.handler?.method) {
+    rank = 1;
+    words = splitWords(e.handler.method).filter((w) => !HANDLER_VERBS.has(w.toLowerCase()) && !DOMAIN_NOISE.has(w.toLowerCase()));
+  }
+  if (!words.length) {
+    rank = 0;
+    const fromName = e.name?.startsWith(base + ".") ? e.name.slice(base.length + 1).split(".")[0] : undefined;
+    const fromUri = e.uri.split("/").filter((s) => s && !s.startsWith("{") && s !== "api")[1];
+    const seg = fromName ?? fromUri;
+    if (seg) words = seg.split(/[-_]+/).filter(Boolean);
+  }
+  if (!words.length) return null;
+  const key = words.join("").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const label = words
+    .map((w, i) => (w.length > 1 && w === w.toUpperCase() ? w : i === 0 ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : w.toLowerCase()))
+    .join(" ");
+  return key ? { key, label, rank } : null;
+}
+
 export function featureName(id: string): string {
   if (id === "auth") return "Authentication";
   if (id === "home") return "Home";
@@ -116,14 +195,27 @@ export function featureName(id: string): string {
     .join(" › ");
 }
 
+const LABEL_NOISE = new Set(["status", "statuses", "action", "actions"]);
+
 const METHOD_VERBS: Record<string, string> = { POST: "Submit", PUT: "Update", PATCH: "Update", DELETE: "Delete" };
 
-function labelOf(e: EntryFact, feature: string): string {
-  const subject = humanize(singularish(feature.split(".").pop() ?? feature)).toLowerCase();
+function labelOf(e: EntryFact, feature: string, featureLabel: string): string {
+  const lastPart = featureLabel.split(" › ").pop() ?? featureLabel;
+  const subject = lastPart === lastPart.toUpperCase() && lastPart.length > 1 ? lastPart : singularish(lastPart).toLowerCase();
   if (e.name) {
     const last = e.name.split(".").pop()!;
     if (VERBS[last]) return `${VERBS[last]} ${subject}`;
     const rest = e.name === feature ? last : e.name.startsWith(feature + ".") ? e.name.slice(feature.length + 1) : e.name;
+    const [area, domainKey] = feature.split(".");
+    if (domainKey && e.name.startsWith(area + ".")) {
+      // menu.purchase-requests.status.approve-manager in feature menu.purchaserequest -> "Approve manager"
+      const norm = (x: string) => x.toLowerCase().replace(/[^a-z0-9]/g, "").replace(/s$/, "");
+      const segs = e.name
+        .slice(area.length + 1)
+        .split(".")
+        .filter((seg) => norm(seg) !== norm(domainKey) && !LABEL_NOISE.has(seg.toLowerCase()));
+      if (segs.length) return humanize(segs.join(" "));
+    }
     return humanize((rest || last).split(".").join(" "));
   }
   if (e.type === "redirect") return `Redirect /${e.uri}`;

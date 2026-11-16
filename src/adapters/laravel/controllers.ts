@@ -25,6 +25,10 @@ export interface HandlerAnalysis {
   redirects: RedirectTarget[];
   /** Request validation present: Laravel redirects back with errors on failure. */
   validates: boolean;
+  /** Returns JSON (response()->json, DataTables, ->toJson()): an AJAX/data endpoint. */
+  returnsJson?: boolean;
+  /** Returns a file (download, stream, Excel/PDF export). */
+  returnsFile?: boolean;
 }
 
 export type RedirectTarget =
@@ -116,7 +120,7 @@ export function analyzeClosure(node: PhpNode, names: NameContext, file: string):
 }
 
 function analyzeBody(body: PhpNode, names: NameContext, file: string): HandlerAnalysis {
-  const out: HandlerAnalysis = { views: [], redirects: [], validates: false };
+  const out: HandlerAnalysis = { views: [], redirects: [], validates: false, returnsJson: false, returnsFile: false };
   const consumed = new WeakSet<object>();
 
   walk(body, (n) => {
@@ -147,6 +151,28 @@ function analyzeBody(body: PhpNode, names: NameContext, file: string): HandlerAn
     if (/(^|\\)Inertia$/.test(rootStatic) && first.name === "render") {
       const v = stringValue(first.args[0]);
       if (v) out.views.push({ engine: "inertia", name: v, line });
+    }
+
+    // JSON / file responses
+    const stepNames = chain.steps.map((s) => s.name);
+    if (
+      (rootName === "response" && stepNames.includes("json")) ||
+      (/(^|\\)Response$/.test(rootStatic) && stepNames.includes("json")) ||
+      rootName === "datatables" ||
+      /(^|\\)(DataTables|Datatables)$/.test(rootStatic) ||
+      stepNames.includes("toJson") ||
+      (rootName === "json_encode")
+    ) {
+      out.returnsJson = true;
+    }
+    if (
+      stepNames.some((n) => n === "download" || n === "streamDownload") ||
+      (rootName === "response" && stepNames.includes("file"))
+    ) {
+      out.returnsFile = true;
+    }
+    if (/(^|\\)(Excel|PDF|Pdf|SnappyPdf)$/.test(rootStatic) && stepNames.some((n) => /^(download|stream|export)$/.test(n))) {
+      out.returnsFile = true;
     }
 
     // Validation
