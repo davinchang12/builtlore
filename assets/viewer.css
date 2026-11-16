@@ -88,6 +88,8 @@ main svg.panning { cursor: grabbing; }
 .edge.error path { stroke: var(--error); }
 .edge.ajax path { stroke: #0d9488; stroke-dasharray: 2 3; }
 .edge.hl path { stroke-width: 2.4; }
+.edge.cross path { opacity: 0.28; }
+.edge.cross.hl path { opacity: 1; }
 .edge-label rect { fill: #fff; stroke: none; }
 .edge-label text { font-size: 11px; fill: #475569; }
 .edge.error .edge-label text { fill: var(--error); }

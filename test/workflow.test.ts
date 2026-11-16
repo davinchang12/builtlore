@@ -64,6 +64,19 @@ describe("internal approval-workflow app", () => {
     assert.equal(edge("menu.leave-requests.index", "menu.leave-requests.show")?.trigger, "link");
   });
 
+  it("resolves URLs written by hand in scripts, using the HTTP method nearby", () => {
+    assert.equal(edge("menu.leave-requests.show", "menu.leave-requests.reject")?.trigger, "ajax");
+  });
+
+  it("treats /api/... routes in web.php that return JSON as data endpoints", () => {
+    assert.equal(node("master.departments.lookup")?.type, "data");
+    assert.equal(edge("master.departments.index", "master.departments.lookup")?.trigger, "ajax");
+  });
+
+  it("says plainly that static mode needs no PHP", () => {
+    assert.ok(map.notes.some((n) => n.includes("static mode, no PHP needed")), map.notes.join("\n"));
+  });
+
   it("ignores links inside Blade comments", () => {
     assert.equal(edge("menu.purchase-requests.show", "report.purchase-requests"), undefined);
   });

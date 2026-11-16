@@ -2,7 +2,7 @@
 
 > **Name.** `builtlore` = "the lore of what you built": the knowledge, flows and history of an application that usually live only in people's heads, made visible. Chosen 2026-11-16 (see [Open questions](#16-open-questions)).
 
-**Status:** v0.1.0-alpha.1 (Laravel flows, dogfooded on a 145-route internal app) · **Next:** Process view · **Last updated:** 2026-11-16
+**Status:** v0.1.0-alpha.2 (Laravel flows, dogfooded on a 145-route internal app) · **Next:** Process view · **Last updated:** 2026-11-16
 
 ---
 
@@ -218,7 +218,7 @@ Stable IDs (derived from route paths and file paths, not from LLM output) make o
 
 ### 6.6 Render
 
-- **Canvas:** one self-contained HTML file (no server needed). ELK layered auto-layout rendered as SVG; edges inside a feature are routed orthogonally, edges between features are drawn as direct curves. Search, feature filters, details panel, SVG export. Planned: hand-drawn style and export to `.excalidraw` for free-form editing.
+- **Canvas:** one self-contained HTML file (no server needed). Each feature is laid out separately with ELK (layered, orthogonal edges) and the feature boxes are packed into rows. Layout follows a **journey order**: entry points are pages with no incoming forward edge and no `{parameter}` in the URL; steps are ranked breadth-first along links, submits, AJAX calls and redirects; steps reachable only through invisible JavaScript are placed after the steps they lead to. Edges that go against that order are laid out reversed (and drawn the right way round), so back/retry/"return to list" edges never reorder steps. Edges between features are faint curves, highlighted on selection. Search, feature filters, a data/file toggle, details panel, SVG export. Planned: hand-drawn style and export to `.excalidraw` for free-form editing.
 - **Docs:** Markdown, one page per feature, plus an index; can be served as a static site.
 - **AI context:** a compact `builtlore.md` (and later an MCP server) that agents can read: feature → flow → files → tables → jobs.
 

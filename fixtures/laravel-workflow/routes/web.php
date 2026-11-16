@@ -38,6 +38,8 @@ Route::prefix('master')->name('master.')->middleware(['auth', 'can:admin'])->gro
     Route::resource('items', ItemController::class)->except(['show', 'create', 'edit']);
 });
 
+Route::get('/api/master/departments/lookup', [DepartmentController::class, 'lookup'])->middleware('auth')->name('master.departments.lookup');
+
 Route::prefix('report')->name('report.')->middleware('auth')->group(function () {
     Route::get('purchase-requests', [ReportController::class, 'indexPurchaseRequest'])->name('purchase-requests');
     Route::post('purchase-requests/export', [ReportController::class, 'exportPurchaseRequest'])->name('purchase-requests.export');

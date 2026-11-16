@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## 0.1.0-alpha.2 — 2026-11-16
+
+### Changed
+- **Canvas layout follows the user's journey.** Each feature is laid out on its own, left to right in the order a user meets the steps (entry page → list → create/detail → actions). Entry points are pages nothing links to and whose URL has no `{parameter}`; steps only reachable through JavaScript are placed right after the steps they lead to. Edges that go back (retry, "return to list", validation failed) no longer pull later steps to the left.
+- **Features are packed into rows** in journey order instead of one large tangled graph. Edges between features are drawn faintly and highlighted when a step is selected.
+- Notes say plainly when static mode is used: route files are read directly and no PHP is needed.
+
+### Added
+- URLs written by hand in scripts (`'/items/' + id + '/approve'`) are matched to routes, using a nearby `type:` / `method:` to pick the right one; ambiguous ones are left out rather than guessed.
+- `/api/...` routes defined in `routes/web.php` that return JSON are treated as data endpoints of the web app.
+
 ## 0.1.0-alpha.1 — 2026-11-16
 
 First round of fixes from running builtlore on a real 145-route internal Laravel app.

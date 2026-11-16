@@ -13,6 +13,11 @@ class DepartmentController extends Controller
         return view('master.departments.index');
     }
 
+    public function lookup()
+    {
+        return response()->json(Department::orderBy('name')->get(['id', 'name']));
+    }
+
     public function store(Request $request)
     {
         Department::create($request->validate(['name' => 'required']));

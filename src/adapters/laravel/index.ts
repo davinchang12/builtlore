@@ -50,14 +50,18 @@ export const laravelAdapter: Adapter = {
         if (art.ok) {
           routes = mergeRoutes(art.routes, fromStatic.routes);
           mode = "artisan";
-        } else {
-          notes.push(`Artisan mode unavailable (${art.reason}); used static parsing.`);
+        } else if (options.mode === "artisan") {
+          notes.push(`Artisan mode unavailable (${art.reason}); used static mode instead.`);
         }
       } else if (options.mode === "artisan") {
         notes.push("Artisan mode requested but artisan/vendor not found; used static parsing.");
       }
     }
-    notes.push(`Laravel routes: ${routes.length} (${mode} mode; files: ${fromStatic.filesRead.join(", ") || "none"}).`);
+    notes.push(
+      mode === "static"
+        ? `Laravel routes: ${routes.length}, read directly from ${fromStatic.filesRead.join(", ") || "no route files"} (static mode, no PHP needed).`
+        : `Laravel routes: ${routes.length}, from php artisan route:list (artisan mode).`,
+    );
     routes = dropDuplicates(routes, notes);
 
     // 2. Entries
@@ -134,7 +138,7 @@ export const laravelAdapter: Adapter = {
           layoutLinks += blade.layoutLinkCount(l);
         }
         for (const link of b.links) {
-          const method = link.trigger === "submit" ? link.method ?? "POST" : link.trigger === "ref" ? "ANY" : "GET";
+          const method = link.trigger === "submit" ? link.method ?? "POST" : link.trigger === "ref" ? link.method ?? "ANY" : "GET";
           const to = resolver.resolve(link.target, method);
           if (to) {
             if (to === e.id) continue;
@@ -202,7 +206,9 @@ function entryId(r: RawRoute): string {
 }
 
 function entryType(r: RawRoute, view: ViewRef | undefined, a: HandlerAnalysis | null): EntryType {
-  if (r.routeFile === "api" || r.uri.startsWith("api/")) return "api";
+  if (r.routeFile === "api") return "api";
+  // web.php routes under /api/... are usually AJAX endpoints of the web app
+  if (r.uri.startsWith("api/") && !view && !(a?.returnsJson || a?.returnsFile)) return "api";
   if (r.action.kind === "redirect") return "redirect";
   if (!view && a) {
     if (a.returnsFile && !a.redirects.length) return "download";
@@ -270,7 +276,7 @@ class TargetResolver {
   resolve(target: BladeTarget, method: string): string | null {
     if (method === "ANY") {
       if (target.kind === "name") return this.byName.get(target.name)?.id ?? null;
-      if (target.kind === "uri") return this.byUri(target.uri, "GET") ?? this.byUri(target.uri, "POST");
+      if (target.kind === "uri") return this.byUri(target.uri, "GET") ?? this.byUri(target.uri, "POST") ?? this.byUri(target.uri, "ANY");
     }
     if (target.kind === "name") {
       // route('login') in a POST form points at the POST route on the same URI.
@@ -297,6 +303,10 @@ class TargetResolver {
     const path = uri.replace(/^https?:\/\/[^/]+/, "").replace(/^\/+|\/+$/g, "") || "/";
     const m = method.toUpperCase();
     const candidates = this.patterns.filter((p) => p.re.test(path));
+    if (m === "ANY") {
+      // No method known (a URL in a script): only resolve when it is unambiguous.
+      return candidates.length === 1 ? candidates[0].entry.id : null;
+    }
     const exact = candidates.find((p) => p.entry.methods.includes(m as never) || p.entry.methods.includes("ANY"));
     return (exact ?? (m === "GET" ? undefined : candidates[0]))?.entry.id ?? null;
   }

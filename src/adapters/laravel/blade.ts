@@ -193,6 +193,28 @@ function parseLinks(raw: string, file: string): BladeLink[] {
     const target: BladeTarget = m[1] === "route" ? { kind: "name", name: m[2] } : { kind: "uri", uri: m[2] || "/" };
     out.push({ target, trigger: "ref", file, line: lineAt(src, idx) });
   }
+
+  // URLs written by hand in scripts: '/master/items/' + id (+ '/approve'), with type/method nearby.
+  for (const block of src.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)) {
+    const body = block[1];
+    const offset = (block.index ?? 0) + block[0].indexOf(body);
+    const re = /(['"`])(\/[A-Za-z0-9_\-./]*)\1(?:\s*\+\s*[\w$.[\]()]+(?:\s*\+\s*(['"`])([A-Za-z0-9_\-./]*)\3)?)?/g;
+    for (const m of body.matchAll(re)) {
+      const [whole, , head, , tail] = m;
+      if (head.length < 2 || /\.(js|css|png|jpe?g|svg|gif|ico|woff2?|json)$/i.test(head)) continue;
+      const concatenated = whole.includes("+");
+      const uri = concatenated ? `${head.replace(/\/$/, "")}/{x}${tail ? "/" + tail.replace(/^\//, "") : ""}` : head;
+      const after = body.slice((m.index ?? 0) + whole.length, (m.index ?? 0) + whole.length + 200);
+      const hint = after.match(/\b(?:type|method)\s*:\s*['"](GET|POST|PUT|PATCH|DELETE)['"]/i) ?? after.match(/_method['"]?\s*[:,]\s*['"](PUT|PATCH|DELETE)['"]/i);
+      out.push({
+        target: { kind: "uri", uri },
+        trigger: "ref",
+        method: hint ? hint[1].toUpperCase() : undefined,
+        file,
+        line: lineAt(src, offset + (m.index ?? 0)),
+      });
+    }
+  }
   return out;
 }
 

@@ -9,6 +9,9 @@
   var PALETTE = ["#2563eb", "#059669", "#d97706", "#7c3aed", "#db2777", "#0891b2", "#65a30d", "#dc2626", "#4f46e5", "#ea580c", "#0d9488", "#9333ea"];
   var TYPE_COLOR = { page: "#2563eb", action: "#d97706", api: "#7c3aed", data: "#0d9488", download: "#475569", redirect: "#6b7280" };
   var HIDDEN_BY_DEFAULT = { data: true, download: true };
+  var reversed = {};
+  var TYPE_RANK = { page: 0, redirect: 1, action: 2, data: 3, download: 4, api: 5 };
+  var FORWARD = { link: true, submit: true, ajax: true, redirect: true };
 
   var nodesById = {};
   data.nodes.forEach(function (n) { nodesById[n.id] = n; });
@@ -100,46 +103,162 @@
     return { w: Math.round(Math.min(300, Math.max(150, chars * 7.4 + 34))), h: 52 };
   }
 
+
+  /**
+   * Order steps the way a user meets them: start from entry points (nothing leads
+   * there), then breadth-first along links, submits and redirects. Back and error
+   * edges never decide the order. Unreached steps go last, pages first.
+   */
+  function journeyRank(nodes, edges) {
+    var ids = {};
+    nodes.forEach(function (n) { ids[n.id] = true; });
+    var fwd = edges.filter(function (e) {
+      return ids[e.from] && ids[e.to] && e.from !== e.to && FORWARD[e.trigger] && e.outcome !== "error";
+    });
+    var incoming = {};
+    fwd.forEach(function (e) { incoming[e.to] = (incoming[e.to] || 0) + 1; });
+    // Reached only when something fails (payment failed page) is still "reached": not an entry point.
+    var reachedSomehow = {};
+    edges.forEach(function (e) { if (ids[e.from] && ids[e.to] && e.from !== e.to && e.trigger !== "back") reachedSomehow[e.to] = true; });
+    var out = {};
+    fwd.forEach(function (e) { (out[e.from] = out[e.from] || []).push(e); });
+    // Entry points: nothing leads there, and the URL can be opened from a menu
+    // (no {parameter}). /items/{id}/edit is never where a journey starts.
+    var isEntry = function (n) {
+      return (!reachedSomehow[n.id] || entryScore(n) === 0) && (n.type === "page" || n.type === "redirect") && n.uri.indexOf("{") < 0;
+    };
+    var roots = nodes.filter(isEntry);
+    if (!roots.length) roots = nodes.filter(function (n) { return n.type === "page"; }).slice(0, 1);
+    roots.sort(function (a, b) { return entryScore(a) - entryScore(b); });
+    var dist = {};
+    var queue = [];
+    var bfs = function () {
+      while (queue.length) {
+        var id = queue.shift();
+        (out[id] || []).sort(function (a, b) { return triggerRank(a) - triggerRank(b); }).forEach(function (e) {
+          if (dist[e.to] === undefined) { dist[e.to] = dist[id] + 1; queue.push(e.to); }
+        });
+      }
+    };
+    roots.forEach(function (r) { dist[r.id] = 0; queue.push(r.id); });
+    bfs();
+    // Steps nobody links to in a way we can see (buttons built in JavaScript):
+    // place them right after the steps they lead to, e.g. Edit after View.
+    var changed = true;
+    while (changed) {
+      changed = false;
+      nodes.forEach(function (n) {
+        if (dist[n.id] !== undefined) return;
+        var targets = (out[n.id] || []).map(function (e) { return dist[e.to]; }).filter(function (d) { return d !== undefined; });
+        if (targets.length) {
+          dist[n.id] = Math.min.apply(null, targets) + 1;
+          queue.push(n.id);
+          changed = true;
+        }
+      });
+      bfs();
+    }
+    nodes.forEach(function (n) {
+      if (dist[n.id] === undefined && !reachedSomehow[n.id]) { dist[n.id] = 0; queue.push(n.id); }
+    });
+    bfs();
+    var order = nodes.slice().sort(function (a, b) {
+      var da = dist[a.id] === undefined ? 1e6 : dist[a.id];
+      var db = dist[b.id] === undefined ? 1e6 : dist[b.id];
+      return da - db || entryScore(a) - entryScore(b) || TYPE_RANK[a.type] - TYPE_RANK[b.type] || a.label.localeCompare(b.label);
+    });
+    var rank = {};
+    order.forEach(function (n, i) { rank[n.id] = i; });
+    return rank;
+  }
+  function entryScore(n) {
+    var name = (n.name || "") + " " + n.uri;
+    if (n.uri === "/" || /dashboard|home/i.test(name)) return 0;
+    if (/\.index$|^List /.test(n.name || "") || /^List /.test(n.label)) return 1;
+    return 2;
+  }
+  function triggerRank(e) { return { link: 0, submit: 1, redirect: 2, ajax: 3 }[e.trigger] || 4; }
+
   function layout(refit) {
     var nodes = visibleNodes();
     var ids = {};
     nodes.forEach(function (n) { ids[n.id] = true; });
+    var edges = data.edges.filter(function (e) { return ids[e.from] && ids[e.to]; });
+    var rank = journeyRank(nodes, edges);
     var groups = {};
     nodes.forEach(function (n) { (groups[n.feature] = groups[n.feature] || []).push(n); });
+    var features = data.features.filter(function (f) { return groups[f.id]; });
+    features.forEach(function (f) {
+      groups[f.id].sort(function (a, b) { return rank[a.id] - rank[b.id]; });
+      f._rank = rank[groups[f.id][0].id];
+    });
+    features.sort(function (a, b) { return a._rank - b._rank; });
 
-    var graph = {
-      id: "root",
-      layoutOptions: {
-        "elk.algorithm": "layered",
-        "elk.direction": state.direction,
-        "elk.hierarchyHandling": "INCLUDE_CHILDREN",
-        "elk.edgeRouting": "ORTHOGONAL",
-        "elk.layered.spacing.nodeNodeBetweenLayers": "56",
-        "elk.spacing.nodeNode": "22",
-        "elk.spacing.edgeNode": "18",
-        "elk.spacing.componentComponent": "48",
-        "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX",
-        "elk.padding": "[top=24,left=24,bottom=24,right=24]",
-      },
-      children: data.features.filter(function (f) { return groups[f.id]; }).map(function (f) {
-        return {
-          id: "feature::" + f.id,
-          layoutOptions: { "elk.padding": "[top=42,left=16,bottom=16,right=16]" },
-          labels: [{ text: f.name, width: f.name.length * 8 + 20, height: 16 }],
-          children: groups[f.id].map(function (n) {
-            var s = nodeSize(n);
-            return { id: n.id, width: s.w, height: s.h };
-          }),
-        };
-      }),
-      edges: data.edges.filter(function (e) { return ids[e.from] && ids[e.to]; }).map(function (e) {
-        var lbl = e.label ? [{ text: e.label, width: e.label.length * 6.4 + 10, height: 16 }] : [];
-        return { id: e.id, sources: [e.from], targets: [e.to], labels: lbl };
-      }),
-    };
+    // One layout per feature: a feature reads left to right on its own.
+    var jobs = features.map(function (f) {
+      var inside = {};
+      groups[f.id].forEach(function (n) { inside[n.id] = true; });
+      var own = edges.filter(function (e) { return inside[e.from] && inside[e.to]; });
+      own.sort(function (a, b) {
+        var fa = FORWARD[a.trigger] && a.outcome !== "error" ? 0 : 1;
+        var fb = FORWARD[b.trigger] && b.outcome !== "error" ? 0 : 1;
+        return fa - fb || rank[a.from] - rank[b.from];
+      });
+      return elk.layout({
+        id: "feature::" + f.id,
+        layoutOptions: {
+          "elk.algorithm": "layered",
+          "elk.direction": state.direction,
+          "elk.edgeRouting": "ORTHOGONAL",
+          "elk.layered.cycleBreaking.strategy": "MODEL_ORDER",
+          "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
+          "elk.layered.spacing.nodeNodeBetweenLayers": "56",
+          "elk.spacing.nodeNode": "22",
+          "elk.spacing.edgeNode": "18",
+          "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX",
+          "elk.padding": "[top=42,left=16,bottom=16,right=16]",
+        },
+        labels: [{ text: f.name }],
+        children: groups[f.id].map(function (n) {
+          var sz = nodeSize(n);
+          return { id: n.id, width: sz.w, height: sz.h };
+        }),
+        edges: own.map(function (e) {
+          var lbl = e.label ? [{ text: e.label, width: e.label.length * 6.4 + 10, height: 16 }] : [];
+          // Edges that go against the journey (back, retry, "return to list") are laid out
+          // reversed so they never pull a later step to the left; drawn the right way round.
+          var backwards = rank[e.from] > rank[e.to];
+          reversed[e.id] = backwards;
+          return backwards
+            ? { id: e.id, sources: [e.to], targets: [e.from], labels: lbl }
+            : { id: e.id, sources: [e.from], targets: [e.to], labels: lbl };
+        }),
+      });
+    });
 
-    elk.layout(graph).then(function (res) {
-      draw(res);
+    Promise.all(jobs).then(function (results) {
+      // Pack feature boxes into rows, in journey order.
+      var gap = 48;
+      var area = results.reduce(function (s, r) { return s + r.width * r.height; }, 0);
+      var widest = results.reduce(function (m, r) { return Math.max(m, r.width); }, 0);
+      var rowWidth = Math.max(widest, Math.sqrt(area) * 1.6);
+      var x = 0, y = 0, rowH = 0;
+      var children = [];
+      var edgesOut = [];
+      results.forEach(function (r) {
+        if (x > 0 && x + r.width > rowWidth) { x = 0; y += rowH + gap; rowH = 0; }
+        children.push({ id: r.id, x: x, y: y, width: r.width, height: r.height, labels: r.labels, children: r.children });
+        (r.edges || []).forEach(function (e) { e.container = r.id; edgesOut.push(e); });
+        x += r.width + gap;
+        rowH = Math.max(rowH, r.height);
+      });
+      // Edges between features: drawn as faint curves, highlighted on selection.
+      edges.forEach(function (e) {
+        if (nodesById[e.from].feature !== nodesById[e.to].feature) {
+          edgesOut.push({ id: e.id, container: "root", sections: [], labels: [] });
+        }
+      });
+      draw({ children: children, edges: edgesOut, width: rowWidth, height: y + rowH });
       if (refit) fit();
     }).catch(function (err) {
       console.error(err);
@@ -210,6 +329,7 @@
       var marker = meta.outcome === "error" ? "url(#arrow-error)" : meta.trigger === "submit" ? "url(#arrow-submit)" : "url(#arrow)";
       var a = nodesById[meta.from], b = nodesById[meta.to];
       var crossFeature = a.feature !== b.feature;
+      if (crossFeature) g.classList.add("cross");
       var labelPos = null;
       if (crossFeature && a._box && b._box) {
         // Edges between features: a direct curve reads better than routing around groups.
@@ -219,6 +339,7 @@
       } else {
         (e.sections || []).forEach(function (s) {
           var pts = [s.startPoint].concat(s.bendPoints || [], [s.endPoint]);
+          if (reversed[e.id]) pts.reverse();
           var d = pts.map(function (p, i) { return (i ? "L" : "M") + (p.x + off.x) + " " + (p.y + off.y); }).join(" ");
           g.appendChild(el("path", { d: d, "marker-end": marker }));
         });
