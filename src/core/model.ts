@@ -3,7 +3,8 @@
  * grouped by route name / URI, labels are derived from names. (An optional
  * AI pass that renames and regroups is planned; see docs/DESIGN.md.)
  */
-import type { BuiltMap, EntryFact, Feature, MapEdge, MapNode, NavigatesFact, SkippedFact, Fact } from "./types.js";
+import { buildProcesses } from "./process.js";
+import type { BuiltMap, EntryFact, Feature, MapEdge, MapNode, NavigatesFact, SkippedFact, StatesFact, Fact } from "./types.js";
 
 const AUTH_NAMES = /^(login|logout|register|password|verification|two-factor|auth|sanctum)(\.|$)/;
 const AUTH_URIS = /^(login|logout|register|forgot-password|reset-password|verify-email|email|confirm-password|two-factor-challenge)(\/|$)/;
@@ -78,6 +79,14 @@ export function buildMap(input: {
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
 
+  const processes = buildProcesses({
+    entries,
+    navs,
+    states: input.facts.filter((f): f is StatesFact => f.kind === "states"),
+    nodes,
+    features,
+  });
+
   return {
     schema: "builtlore/0.1",
     generatedAt: new Date().toISOString(),
@@ -89,6 +98,7 @@ export function buildMap(input: {
     edges,
     skipped,
     notes: input.notes,
+    ...(processes.length ? { processes } : {}),
   };
 }
 

@@ -38,6 +38,10 @@ export function renderHtml(map: BuiltMap, options: RenderOptions = {}): string {
     <div class="logo">built<span>lore</span></div>
     <div class="project" id="project"></div>
     <div class="meta" id="meta"></div>
+    <div class="tabs" id="tabs" style="display:none">
+      <button data-mode="process" title="Business processes: who does each step and how the status changes">Process</button>
+      <button data-mode="screens" title="Every page, form and endpoint, and how they connect">Screens</button>
+    </div>
     <div class="spacer"></div>
     <button id="btn-direction" title="Switch layout direction">Layout: left → right</button>
     <button id="btn-svg" title="Download the current canvas as SVG">Download SVG</button>
@@ -56,12 +60,27 @@ export function renderHtml(map: BuiltMap, options: RenderOptions = {}): string {
     <label class="toggle-row" id="hidden-toggle-row" style="display:none">
       <input type="checkbox" id="show-hidden"> Show hidden steps <span class="count" id="hidden-count"></span>
     </label>
-    <section>
+    <section id="processes-section" style="display:none">
+      <h3>Processes</h3>
+      <ul class="features" id="processes"></ul>
+    </section>
+    <section id="features-section">
       <h3>Features</h3>
       <div class="links"><a id="all-features">show all</a><a id="no-features">hide all</a></div>
       <ul class="features" id="features"></ul>
     </section>
-    <section>
+    <section id="legend-process" style="display:none">
+      <h3>Legend</h3>
+      <div class="legend">
+        <div><span class="sw lane-sw"></span>Lane: who does the step</div>
+        <div><span class="sw" style="background:#d97706"></span>Step that changes the status</div>
+        <div><svg width="22" height="10"><line x1="0" y1="5" x2="22" y2="5" stroke="#475569" stroke-width="2"/></svg>Moves the record to a status</div>
+        <div><svg width="22" height="10"><line x1="0" y1="5" x2="22" y2="5" stroke="#dc2626" stroke-width="2" stroke-dasharray="5 4"/></svg>Hold, reject, return, cancel</div>
+        <div><span class="pill-sw">Approved</span>Last status (nothing follows)</div>
+        <div class="legend-note">Click a lane, status or step to see where it was found in the code.</div>
+      </div>
+    </section>
+    <section id="legend-screens">
       <h3>Legend</h3>
       <div class="legend">
         <div><span class="sw" style="background:#2563eb"></span>Page (renders a screen)</div>

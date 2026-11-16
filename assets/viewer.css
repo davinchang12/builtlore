@@ -145,3 +145,43 @@ main svg.panning { cursor: grabbing; }
 .form-buttons .primary:disabled { opacity: .6; cursor: default; }
 .form-buttons .status { font-size: 12px; color: var(--muted); }
 .details ul.files { list-style: none; padding: 0; margin: 0; font-size: 12px; color: var(--muted); display: grid; gap: 3px; }
+
+/* process view */
+.tabs { display: flex; gap: 2px; background: var(--bg); border: 1px solid var(--line); border-radius: 9px; padding: 2px; margin-left: 12px; }
+.tabs button { border: none; background: none; padding: 5px 14px; border-radius: 7px; font: inherit; font-size: 13px; color: var(--muted); cursor: pointer; }
+.tabs button.active { background: #fff; color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+.lane-sw { background: #f1f5f9 !important; border: 1px solid #cbd5e1; }
+.pill-sw { display: inline-block; font-size: 10.5px; padding: 1px 7px; border-radius: 999px; background: #ecfdf5; border: 1px solid #6ee7b7; color: #047857; margin-right: 8px; }
+.legend-note { font-size: 11.5px; color: var(--muted); margin-top: 6px; }
+.proc-box { fill: #fff; stroke: #e2e8f0; }
+.proc-title { font-size: 15px; font-weight: 700; fill: #0f172a; cursor: pointer; }
+.proc-title:hover { text-decoration: underline; }
+.proc-sub { font-size: 11.5px; fill: #64748b; }
+.lane-band { fill: #f8fafc; stroke: #e2e8f0; }
+.lane-band.alt { fill: #f1f5f9; }
+.lane-label { font-size: 12.5px; font-weight: 600; fill: #334155; cursor: pointer; }
+.lane-label:hover { text-decoration: underline; }
+.lane-label.fallback { fill: #94a3b8; font-weight: 500; font-style: italic; }
+.lane-label.inferred { fill: #64748b; }
+.pedge path { fill: none; stroke: #475569; stroke-width: 1.5; }
+.pedge.negative path { stroke: #dc2626; stroke-dasharray: 5 4; }
+.pedge.start path { stroke: #94a3b8; }
+.pedge.hl path { stroke-width: 2.6; }
+.pedge .plabel rect { fill: #fff; stroke: #cbd5e1; }
+.pedge.negative .plabel rect { stroke: #fca5a5; }
+.pedge .plabel text { font-size: 10.5px; fill: #334155; }
+.pedge .plabel { cursor: pointer; }
+.state-end rect { fill: #ecfdf5; stroke: #6ee7b7; }
+.state-end text { font-size: 10.5px; fill: #047857; }
+.state-end.negative rect { fill: #fef2f2; stroke: #fca5a5; }
+.state-end.negative text { fill: #b91c1c; }
+.state-end { cursor: pointer; }
+.start-dot { fill: #334155; }
+.node .to-line { font-size: 10.5px; fill: #64748b; }
+.node .to-line.none { font-style: italic; fill: #94a3b8; }
+.states-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.states-table td { border-top: 1px solid var(--line); padding: 6px 4px; vertical-align: top; }
+.states-table td.mono { font-size: 11.5px; color: var(--muted); }
+.states-table input { width: 100%; box-sizing: border-box; font: inherit; font-size: 12.5px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; }
+.evidence { font-size: 12px; color: var(--muted); padding-left: 16px; margin: 4px 0; }
+.chip.state { background: #f1f5f9; }

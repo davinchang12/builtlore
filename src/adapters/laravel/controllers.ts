@@ -112,6 +112,21 @@ export function analyzeControllerMethod(locator: ClassLocator, fqcn: string, met
   return analysis;
 }
 
+/** The AST of a controller method, for further analysis. */
+export function findMethod(locator: ClassLocator, fqcn: string, method: string): { node: PhpNode; names: NameContext; file: string } | null {
+  const loaded = locator.load(fqcn);
+  if (!loaded) return null;
+  let found: PhpNode | null = null;
+  walk(loaded.ast, (n) => {
+    if (found) return false;
+    if (n.kind === "method" && (n.name?.name ?? n.name) === method) {
+      found = n;
+      return false;
+    }
+  });
+  return found ? { node: found, names: loaded.names, file: loaded.file } : null;
+}
+
 export function analyzeClosure(node: PhpNode, names: NameContext, file: string): HandlerAnalysis {
   const analysis = analyzeBody(node, names, file);
   analysis.file = file;

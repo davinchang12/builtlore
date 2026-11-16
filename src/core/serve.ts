@@ -74,7 +74,7 @@ export async function serveProject(path: string, opts: Partial<Config> & { port?
 function validatePatch(p: unknown): EditPatch {
   const o = p as { target?: unknown; id?: unknown; fields?: unknown };
   if (!o || typeof o.id !== "string" || !o.id || !o.fields || typeof o.fields !== "object") throw new Error("Invalid edit");
-  if (o.target !== "step" && o.target !== "feature" && o.target !== "glossary") throw new Error("Invalid edit target");
+  if (!["step", "feature", "glossary", "role", "status"].includes(o.target as string)) throw new Error("Invalid edit target");
   for (const v of Object.values(o.fields as Record<string, unknown>)) {
     if (typeof v === "string" && v.length > 20000) throw new Error("Text too long");
   }

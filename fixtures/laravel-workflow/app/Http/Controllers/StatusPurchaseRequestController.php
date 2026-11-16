@@ -9,6 +9,7 @@ class StatusPurchaseRequestController extends Controller
 {
     public function approveManager(PurchaseRequest $purchaseRequest)
     {
+        abort_unless(auth()->user()->nik === $purchaseRequest->manager_nik, 403);
         $purchaseRequest->status = 'APPROVED_MANAGER';
         $purchaseRequest->save();
 
@@ -17,6 +18,9 @@ class StatusPurchaseRequestController extends Controller
 
     public function holdManager(Request $request, PurchaseRequest $purchaseRequest)
     {
+        if ($purchaseRequest->status != PurchaseRequest::STATUS_WAITING_MANAGER) {
+            return back()->with('error', 'Only waiting requests can be put on hold.');
+        }
         $request->validate(['reason' => 'required']);
         $purchaseRequest->update(['status' => PurchaseRequest::STATUS_HOLD]);
 

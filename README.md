@@ -2,11 +2,11 @@
 
 *The lore of what you built.*
 
-**See how your app is actually built.** builtlore reads your code and draws its business flows on one interactive canvas: every page, every form, every redirect, and every failure branch, with links back to the exact file and line.
+**See how your app is actually built.** builtlore reads your code and draws its business processes on one interactive canvas: who does each step, how the status of a record changes, and every page, form and redirect behind it, with links back to the exact file and line.
 
-![builtlore canvas for a sample Laravel app](docs/images/canvas.png)
+![Process view: who does each step and how the status changes](docs/images/process.png)
 
-> **Status: early alpha (v0.1).** Laravel is supported today. Go, Next.js and Flutter are next. See the [design document](docs/DESIGN.md) for the full plan.
+> **Status: early alpha (v0.2).** Laravel is supported today. Go, Next.js and Flutter are next. See the [design document](docs/DESIGN.md) for the full plan.
 
 ## Why
 
@@ -16,18 +16,20 @@ builtlore generates a map of the system **as it is built**, straight from the co
 
 ## What you get
 
-- **Business flows, not call graphs.** Pages, form submissions and redirects become steps and arrows, grouped into features.
+- **Business processes, found in the code.** Swimlanes per role, with the status each step needs and the status it leaves behind. Roles come from middleware, policies, role checks and Blade conditions; statuses from strings, numbers, constants and enums, named from your model's label arrays.
+- **Screens and flows.** Pages, form submissions, redirects and AJAX calls become steps and arrows, grouped into features.
 - **Failure branches.** Validation errors, `withErrors()`, `with('error')` and `back()` show up as red dashed arrows, so you can see what happens when things go wrong.
 - **Click through to code.** Every step shows its route, handler, view, middleware and the file and line that defines it.
 - **One offline HTML file.** No server, no account, no network. Open it, share it, or attach it to a ticket.
 - **A JSON model you can commit.** `builtlore.json` is a stable, diff-friendly description of your app's flows.
-- **No guessing.** Anything builtlore can't resolve is listed under *Skipped*, never invented.
+- **No guessing.** Anything builtlore can't resolve is listed under *Skipped*, never invented. A step with no role check sits in *Signed-in user*, not in an invented role.
+- **Your corrections stick.** Rename roles and statuses, describe steps, regroup features in the canvas (`builtlore serve`); edits live in `builtlore.edits.yaml` and survive every rescan.
 
-![Details panel](docs/images/details.png)
+![Screens view](docs/images/canvas.png)
 
 ## Quick start
 
-builtlore is not on npm yet. Run it from source (Node.js 20 or newer):
+builtlore is not on npm yet. Run it from source (Node.js 22 or newer):
 
 ```bash
 git clone https://github.com/<your-account>/builtlore.git
@@ -70,7 +72,24 @@ Each scan writes two files into the project:
 - `builtlore.json`: the as-built model. Commit it to track how your app's flows change over time.
 - `.builtlore/map.html`: the canvas. Generated, so `builtlore init` adds `.builtlore/` to `.gitignore`.
 
-### Reading the canvas
+### The Process view
+
+The canvas opens on **Process** when builtlore finds steps that change a record's status. One box per process (e.g. *Purchase request · status*):
+
+| On the canvas | Means |
+|---|---|
+| Lane (row) | Who does the step. Found in route middleware (`role:procurement`, `can:admin`, custom ones like `isAtasan`), checks in the handler (`hasRole()`, `$user->jabatan == 'Atasan'`, `auth()->user()->nik == $pr->manager_nik` → *Manager*), Blade conditions around the button (`@role`, `@can`, `@if`), and role words in route names (`approve-manager`). |
+| *Signed-in user* (grey) | No role check found; the route only requires login. builtlore does not guess. |
+| Step card | An action. The second line is the status it leaves the record in. |
+| Arrow with a status | The record moves on in that status; the next step only runs in that status. That rule comes from a guard in code (`if ($pr->status != X) return back()`), an `@if` around the button, or the page the form is on. |
+| Red dashed | Hold, reject, return, cancel. |
+| Green pill | A status nothing follows. |
+
+Statuses are read however your team writes them: `'APPROVED'`, `3`, `PurchaseRequest::STATUS_HOLD`, `LeaveStatus::Approved`, `$attributes` defaults, and label arrays or `match` maps on the model (`3 => 'Approved by procurement'`). A number with no label shows as `status = 3` until someone names it: click it in `builtlore serve`.
+
+Click a lane, a status or a step to see where in the code builtlore found it.
+
+### Reading the Screens view
 
 | On the canvas | Means |
 |---|---|
@@ -145,7 +164,7 @@ builtlore v0.1 runs entirely on your machine. It does not use AI and makes no ne
 | Version | Scope |
 |---|---|
 | **v0.1** | Laravel flows · canvas · JSON model |
-| v0.2 | **Process view:** business processes as swimlanes: who does each step (roles from middleware, policies, role checks) and how the status changes (strings, numbers, constants, enums) |
+| **v0.2** | **Process view** (alpha): swimlanes per role, status changes from strings, numbers, constants and enums; roles and statuses editable |
 | v0.3 | **Project documentation:** a full docs site generated from code + your edits: system overview, roles and permissions, processes, screens, business rules (validation), data dictionary, integrations, jobs, API reference, glossary, change history. Export to Markdown, HTML, Word/PDF |
 | v0.3.x | History: when each feature appeared and how it changed (git) · timeline slider · CI check |
 | v0.4 | Data layer: tables, relationships, stored procedures, step ↔ table links |

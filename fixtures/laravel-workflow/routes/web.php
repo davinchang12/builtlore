@@ -23,7 +23,7 @@ Route::prefix('menu')->name('menu.')->middleware('auth')->group(function () {
     Route::prefix('purchase-requests/status')->name('purchase-requests.status.')->controller(StatusPurchaseRequestController::class)->group(function () {
         Route::post('{purchase_request}/approve-manager', 'approveManager')->name('approve-manager');
         Route::post('{purchase_request}/hold-manager', 'holdManager')->name('hold-manager');
-        Route::post('{purchase_request}/approve', 'approve')->name('approve');
+        Route::post('{purchase_request}/approve', 'approve')->middleware('role:procurement')->name('approve');
         Route::post('{purchase_request}/reassign', 'reassign')->name('reassign');
     });
 

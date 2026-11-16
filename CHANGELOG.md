@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## 0.2.0-alpha.0 — 2026-11-16
+
+### Added
+- **Process view**, the new default tab when the app has status workflows: one swimlane diagram per process (feature × status column). Lanes are roles, cards are steps with the status they leave the record in, arrows carry the status the next step needs.
+- **Roles found in code:** route middleware (`role:`, `can:`, custom middleware such as `isAtasan`), handler checks (`hasRole()`, `$user->jabatan == 'X'`, `abort_unless(auth()->user()->nik === $pr->manager_nik)` → *Manager*), Blade conditions around the button (`@role`, `@can`, `@if`), and role words in route names. Steps with no role check go to *Signed-in user*; nothing is guessed.
+- **Statuses found in code**, in every common style: string literals, numbers, class constants, backed enums (including `$casts`), `$attributes` defaults; names from label arrays and `match` maps on the model.
+- **Status rules:** guards in handlers (`if ($x->status != X) return back()`, `abort_unless`), `@if`/`@elseif` around links and buttons in Blade, and forms on a page that is itself only linked in some status.
+- **Editing for processes** in `builtlore serve`: rename a role (`roles:`), name a status (`statuses:`), set who does a step (`actor:` on a step). Stored in `builtlore.edits.yaml`.
+- Details panel shows *Who / When / Result* for each step, with the code that proves it.
+
+### Fixed
+- Saving a step whose description was empty failed on its first edit ("Expected YAML collection").
+- README said Node 20; builtlore needs Node 22.
+
 ## 0.1.0-alpha.3 — 2026-11-16
 
 ### Added

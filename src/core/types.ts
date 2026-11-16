@@ -28,6 +28,66 @@ export interface EntryFact {
   /** View rendered by this entry, e.g. "booking.index" (Blade) or "Booking/Index" (Inertia). */
   view?: ViewRef;
   source: SourceRef;
+  /** Who may do this and how it changes a record's status (Process layer). */
+  process?: ProcessInfo;
+}
+
+// ---------------------------------------------------------------------------
+// Process layer facts: actors and status
+// ---------------------------------------------------------------------------
+
+/** A status value as found in code, e.g. 3, 'APPROVED_MANAGER', PurchaseRequest::STATUS_HOLD. */
+export interface StatusValue {
+  /** Canonical value (constants and enum cases resolved): "3", "APPROVED_MANAGER", "approved". */
+  value: string;
+  /** How it is written in code, e.g. "PurchaseRequest::STATUS_HOLD". */
+  code: string;
+  /** Human label when the code gives one (label arrays, constant/enum names). */
+  label?: string;
+  labelFrom?: "labels" | "constant" | "enum" | "literal";
+}
+
+/** "PurchaseRequest.status"; ".status" when the model is unknown (e.g. a Blade variable). */
+export type Subject = string;
+
+export interface StatusWrite {
+  subject: Subject;
+  to: StatusValue;
+  source: SourceRef;
+}
+
+export interface StatusCondition {
+  subject: Subject;
+  /** The record must be in one of these states. */
+  values: StatusValue[];
+  via: "guard" | "view";
+  source: SourceRef;
+}
+
+export interface ActorRef {
+  /** Display name, e.g. "Manager". */
+  name: string;
+  via: "middleware" | "code" | "view" | "name";
+  /** What it was read from, e.g. "role:procurement", "auth()->user()->nik == $pr->manager_nik". */
+  detail: string;
+}
+
+export interface ProcessInfo {
+  actors: ActorRef[];
+  writes: StatusWrite[];
+  requires: StatusCondition[];
+  /** Models this step creates (Model::create, new Model). */
+  creates: string[];
+}
+
+/** Known values of a status column: constants, enum cases, label arrays, defaults. */
+export interface StatesFact {
+  kind: "states";
+  subject: Subject;
+  values: StatusValue[];
+  /** Default for new records ($attributes on the model). */
+  initial?: StatusValue;
+  source: SourceRef;
 }
 
 export interface HandlerRef {
@@ -59,6 +119,8 @@ export interface NavigatesFact {
   outcome?: "success" | "error";
   label?: string;
   source: SourceRef;
+  /** Conditions around the link or button in the view (@if status, @role, @can). */
+  when?: { actors: ActorRef[]; requires: StatusCondition[] };
 }
 
 /** Something the adapter saw but could not resolve. Reported, never guessed. */
@@ -68,7 +130,7 @@ export interface SkippedFact {
   source: SourceRef;
 }
 
-export type Fact = EntryFact | NavigatesFact | SkippedFact;
+export type Fact = EntryFact | NavigatesFact | SkippedFact | StatesFact;
 
 export interface RepoInfo {
   root: string; // absolute path
@@ -154,4 +216,46 @@ export interface BuiltMap {
   notes: string[];
   /** Project terms and their meaning, written by people. */
   glossary?: Record<string, string>;
+  /** Business processes: who does each step and how the status changes. */
+  processes?: Process[];
+}
+
+export interface ProcessState {
+  id: string; // "<subject>=<value>"
+  value: string;
+  code: string;
+  label: string;
+  /** "code": named by the code (labels, constants, enums); "raw": just the value; "human": edited. */
+  named: "code" | "raw" | "human";
+}
+
+export interface ProcessLane {
+  id: string; // lowercase key
+  name: string;
+  /** Where builtlore found this actor; empty for the fallback lanes. */
+  evidence: string[];
+  provenance: Provenance;
+}
+
+export interface ProcessStep {
+  node: string;
+  lane: string;
+  /** States the record must be in (empty: not found in code). */
+  from: string[];
+  fromVia?: "guard" | "view" | "page";
+  /** State(s) after this step (empty: status unchanged or not found). */
+  to: string[];
+  /** This step creates the record. */
+  creates?: boolean;
+}
+
+export interface Process {
+  id: string;
+  feature: string;
+  name: string;
+  subject: Subject;
+  states: ProcessState[];
+  initial?: string;
+  lanes: ProcessLane[];
+  steps: ProcessStep[];
 }

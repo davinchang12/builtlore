@@ -9,6 +9,7 @@ class StatusLeaveRequestController extends Controller
 {
     public function approve(LeaveRequest $leaveRequest)
     {
+        $this->authorize('approve', $leaveRequest);
         $leaveRequest->update(['status' => LeaveStatus::Approved]);
 
         return redirect()->route('menu.leave-requests.index');

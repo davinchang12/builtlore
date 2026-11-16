@@ -12,6 +12,8 @@
   var reversed = {};
   var TYPE_RANK = { page: 0, redirect: 1, action: 2, data: 3, download: 4, api: 5 };
   var FORWARD = { link: true, submit: true, ajax: true, redirect: true };
+  var NEGATIVE = /reject|declin|hold|cancel|return|revis|tolak|batal|void|fail|expire|kembali|draft/i;
+  var CARD_W = 190, CARD_H = 50, COL_W = 270, LANE_PAD = 16, LABEL_W = 200, STACK_GAP = 12;
 
   var nodesById = {};
   data.nodes.forEach(function (n) { nodesById[n.id] = n; });
@@ -19,7 +21,11 @@
   data.features.forEach(function (f, i) { featureColor[f.id] = PALETTE[i % PALETTE.length]; });
 
   var EDIT = window.BUILTLORE_EDIT || null;
+  var PROCESSES = data.processes || [];
   var state = {
+    mode: PROCESSES.length ? "process" : "screens",
+    hiddenProc: {},
+    procEdges: [],
     hidden: {},
     showData: false,
     showHidden: false,
@@ -53,7 +59,15 @@
   if (EDIT) $("#edit-banner").style.display = "block";
 
   renderFeatureList();
+  renderProcessList();
   renderNotes();
+  if (PROCESSES.length) {
+    $("#tabs").style.display = "flex";
+    Array.prototype.forEach.call(document.querySelectorAll("#tabs button"), function (b) {
+      b.onclick = function () { setMode(b.getAttribute("data-mode")); };
+    });
+  }
+  applyModeChrome();
 
   var hiddenCount = data.nodes.filter(function (n) { return n.hidden; }).length;
   $("#hidden-count").textContent = String(hiddenCount);
@@ -191,7 +205,31 @@
   }
   function triggerRank(e) { return { link: 0, submit: 1, redirect: 2, ajax: 3 }[e.trigger] || 4; }
 
+  function setMode(mode) {
+    if (state.mode === mode) return;
+    state.mode = mode;
+    select(null);
+    applyModeChrome();
+    layout(true);
+  }
+
+  function applyModeChrome() {
+    var proc = state.mode === "process";
+    Array.prototype.forEach.call(document.querySelectorAll("#tabs button"), function (b) {
+      b.classList.toggle("active", b.getAttribute("data-mode") === state.mode);
+    });
+    $("#processes-section").style.display = proc ? "block" : "none";
+    $("#legend-process").style.display = proc ? "block" : "none";
+    $("#features-section").style.display = proc ? "none" : "block";
+    $("#legend-screens").style.display = proc ? "none" : "block";
+    $("#btn-direction").style.display = proc ? "none" : "";
+    $("#data-toggle-row").style.visibility = proc ? "hidden" : "visible";
+    $("#stat-features").textContent = proc ? PROCESSES.length : data.features.length;
+    $("#stat-features").nextElementSibling.textContent = proc ? "processes" : "features";
+  }
+
   function layout(refit) {
+    if (state.mode === "process") { layoutProcesses(refit); return; }
     var nodes = visibleNodes();
     var ids = {};
     nodes.forEach(function (n) { ids[n.id] = true; });
@@ -396,10 +434,406 @@
     applyHighlight();
   }
 
+
+  // ------------------------------------------------------------ process view
+
+  function processById(id) { return PROCESSES.find(function (p) { return p.id === id; }); }
+  function stateOf(p, id) { return p.states.find(function (s) { return s.id === id; }) || { label: id, value: id, code: id }; }
+  function laneById(p, id) { return p.lanes.find(function (l) { return l.id === id; }) || { name: id, evidence: [] }; }
+
+  /** Columns: creation first, then each step after the step that produces the status it needs. */
+  function processColumns(p) {
+    var col = {}, level = {};
+    var queue = [];
+    p.steps.forEach(function (s) { if (s.creates) { col[s.node] = 0; queue.push(s); } });
+    if (!queue.length && p.initial) level[p.initial] = 0;
+    var changed = true, guard = 0;
+    while (changed && guard++ < 50) {
+      changed = false;
+      p.steps.forEach(function (s) {
+        if (col[s.node] !== undefined) s.to.forEach(function (t) {
+          if (level[t] === undefined || level[t] > col[s.node] + 1) { level[t] = col[s.node] + 1; changed = true; }
+        });
+      });
+      p.steps.forEach(function (s) {
+        var lv = s.from.map(function (f) { return level[f]; }).filter(function (x) { return x !== undefined; });
+        if (lv.length) {
+          var c = Math.min.apply(null, lv);
+          if (col[s.node] === undefined || (col[s.node] > c && !s.creates)) { col[s.node] = c; changed = true; }
+        }
+      });
+    }
+    var base = p.steps.some(function (s) { return s.creates; }) ? 1 : 0;
+    p.steps.forEach(function (s) { if (col[s.node] === undefined) col[s.node] = base; });
+    return col;
+  }
+
+  function layoutProcesses(refit) {
+    viewport.innerHTML = "";
+    nodeEls = {}; edgeEls = {};
+    state.procEdges = [];
+    var groupLayer = el("g", {}), edgeLayer = el("g", {}), nodeLayer = el("g", {});
+    viewport.appendChild(groupLayer); viewport.appendChild(edgeLayer); viewport.appendChild(nodeLayer);
+    var y = 0, maxW = 0;
+    var shown = PROCESSES.filter(function (p) { return !state.hiddenProc[p.id]; });
+    $("#empty").style.display = shown.length ? "none" : "grid";
+    shown.forEach(function (p) {
+      var steps = p.steps.filter(function (s) { return nodesById[s.node] && (state.showHidden || !nodesById[s.node].hidden); });
+      var col = processColumns(p);
+      var maxCol = 0;
+      steps.forEach(function (s) { maxCol = Math.max(maxCol, col[s.node]); });
+      // Lane order: by the first column a lane works in
+      var laneFirst = {};
+      steps.forEach(function (s) { laneFirst[s.lane] = Math.min(laneFirst[s.lane] === undefined ? 99 : laneFirst[s.lane], col[s.node]); });
+      var lanes = p.lanes.filter(function (l) { return laneFirst[l.id] !== undefined; })
+        .sort(function (a, b) { return laneFirst[a.id] - laneFirst[b.id] || (a.provenance === "extracted" && /^(signed-in-user|anyone)$/.test(a.id) ? -1 : 0); });
+      // Stack steps that share a lane and column
+      var slot = {}, laneRows = {};
+      steps.forEach(function (s) {
+        var k = s.lane + "|" + col[s.node];
+        slot[s.node] = slot[k] = (slot[k] === undefined ? 0 : slot[k] + 1);
+        laneRows[s.lane] = Math.max(laneRows[s.lane] || 1, slot[s.node] + 1);
+      });
+      var endW = 0;
+      steps.forEach(function (s) { if (s.to.some(function (t) { return !consumers(p, t).length; })) endW = 160; });
+      var width = LABEL_W + (maxCol + 1) * COL_W + endW + 40;
+      var top = y + 56;
+      var laneY = {}, cy = top;
+      lanes.forEach(function (l) {
+        var h = laneRows[l.id] * (CARD_H + STACK_GAP) - STACK_GAP + LANE_PAD * 2;
+        laneY[l.id] = { y: cy, h: h };
+        cy += h;
+      });
+      var height = cy - y + 20;
+      maxW = Math.max(maxW, width);
+
+      groupLayer.appendChild(el("rect", { x: 0, y: y, width: width, height: height, rx: 14, "class": "proc-box" }));
+      var title = el("text", { x: 18, y: y + 28, "class": "proc-title" });
+      title.textContent = p.name;
+      title.addEventListener("click", function (ev) { ev.stopPropagation(); selectProcess(p.id); });
+      groupLayer.appendChild(title);
+      var sub = el("text", { x: 18, y: y + 45, "class": "proc-sub" });
+      sub.textContent = p.subject.replace(/^\./, "") + " · " + p.states.length + " statuses · " + lanes.length + " roles";
+      groupLayer.appendChild(sub);
+
+      lanes.forEach(function (l, i) {
+        var ly = laneY[l.id];
+        groupLayer.appendChild(el("rect", { x: 8, y: ly.y, width: width - 16, height: ly.h, "class": "lane-band" + (i % 2 ? " alt" : "") }));
+        var lt = el("text", { x: 20, y: ly.y + ly.h / 2 + 4, "class": "lane-label" + (/^(signed-in-user|anyone)$/.test(l.id) && l.provenance !== "human" ? " fallback" : "") + (l.provenance === "inferred" ? " inferred" : "") });
+        lt.textContent = truncate(l.name, 20);
+        var tip = el("title", {});
+        tip.textContent = l.name + "\n" + l.evidence.join("\n") + (EDIT ? "\nClick to rename" : "");
+        lt.appendChild(tip);
+        lt.addEventListener("click", function (ev) { ev.stopPropagation(); selectLane(p.id, l.id); });
+        groupLayer.appendChild(lt);
+      });
+
+      var box = {};
+      steps.forEach(function (s) {
+        var ly = laneY[s.lane];
+        var x = LABEL_W + col[s.node] * COL_W;
+        var sy = ly.y + LANE_PAD + slot[s.node] * (CARD_H + STACK_GAP);
+        box[s.node] = { x: x, y: sy, w: CARD_W, h: CARD_H };
+        var n = nodesById[s.node];
+        var g = el("g", { "class": "node" + (n.hidden ? " is-hidden" : "") + (n.review ? " needs-review" : ""), transform: "translate(" + x + "," + sy + ")" });
+        g.appendChild(el("rect", { "class": "card", width: CARD_W, height: CARD_H, rx: 9 }));
+        g.appendChild(el("rect", { width: 5, height: CARD_H - 12, x: 6, y: 6, rx: 2.5, fill: s.to.length ? "#d97706" : "#94a3b8" }));
+        var lb = el("text", { x: 20, y: 21, "class": "label" });
+        lb.textContent = truncate(n.label, 24);
+        g.appendChild(lb);
+        var tl = el("text", { x: 20, y: 38, "class": "to-line" + (s.to.length ? "" : " none") });
+        tl.textContent = truncate(s.creates && !s.to.length ? "creates the record" : s.to.length ? "→ " + s.to.map(function (t) { return stateOf(p, t).label; }).join(" / ") : "status unchanged", 30);
+        g.appendChild(tl);
+        if (n.review) g.appendChild(el("circle", { cx: CARD_W - 10, cy: 10, r: 4.5, "class": "review-dot" }));
+        else if (n.description) g.appendChild(el("circle", { cx: CARD_W - 10, cy: 10, r: 3.5, "class": "note-dot" }));
+        var tip = el("title", {});
+        tip.textContent = n.label + "\n" + laneById(p, s.lane).name + (s.from.length ? "\nwhen: " + s.from.map(function (f) { return stateOf(p, f).label; }).join(" or ") : "") + (n.description ? "\n\n" + n.description : "");
+        g.appendChild(tip);
+        g.addEventListener("click", function (ev) { ev.stopPropagation(); select(s.node); });
+        nodeLayer.appendChild(g);
+        nodeEls[s.node] = g;
+        n._box = box[s.node];
+      });
+
+      // Start: a dot into the steps that create the record
+      steps.filter(function (s) { return s.creates; }).forEach(function (s) {
+        var b = box[s.node];
+        groupLayer.appendChild(el("circle", { cx: b.x - 34, cy: b.y + b.h / 2, r: 6, "class": "start-dot" }));
+        var e = el("g", { "class": "pedge start" });
+        e.appendChild(el("path", { d: "M" + (b.x - 28) + " " + (b.y + b.h / 2) + " L" + (b.x - 2) + " " + (b.y + b.h / 2), "marker-end": "url(#arrow)" }));
+        edgeLayer.appendChild(e);
+      });
+
+      // Transitions: producer -> consumer, labelled with the status in between
+      var endCount = {};
+      steps.forEach(function (s) {
+        s.to.forEach(function (t) {
+          var st = stateOf(p, t);
+          var neg = NEGATIVE.test(st.label) || NEGATIVE.test(st.value);
+          var cons = consumers(p, t).filter(function (c) { return box[c.node]; });
+          if (!cons.length) {
+            var b = box[s.node];
+            var k = endCount[s.node] = (endCount[s.node] || 0) + 1;
+            var pw = Math.min(150, 16 + st.label.length * 6.2);
+            var px = b.x + b.w + 46, py = b.y + 4 + (k - 1) * 24;
+            var e = el("g", { "class": "pedge" + (neg ? " negative" : "") });
+            e.appendChild(el("path", { d: "M" + (b.x + b.w) + " " + (b.y + b.h / 2) + " C" + (b.x + b.w + 24) + " " + (b.y + b.h / 2) + " " + (px - 22) + " " + (py + 9) + " " + (px - 2) + " " + (py + 9), "marker-end": "url(#arrow)" }));
+            edgeLayer.appendChild(e);
+            var pill = el("g", { "class": "state-end" + (neg ? " negative" : "") });
+            pill.appendChild(el("rect", { x: px, y: py, width: pw, height: 18, rx: 9 }));
+            var tx = el("text", { x: px + 8, y: py + 13 });
+            tx.textContent = truncate(st.label, 24);
+            pill.appendChild(tx);
+            pill.addEventListener("click", function (ev) { ev.stopPropagation(); selectState(p.id, t); });
+            nodeLayer.appendChild(pill);
+            var id0 = "p" + state.procEdges.length;
+            state.procEdges.push({ id: id0, from: s.node, to: s.node });
+            edgeEls[id0] = e;
+            return;
+          }
+          var shared = cons.length > 1;
+          cons.forEach(function (c, ci) {
+            var a = box[s.node], b = box[c.node];
+            var d, mid;
+            if (b.x > a.x) {
+              var x1 = a.x + a.w, y1 = a.y + a.h / 2, x2 = b.x, y2 = b.y + b.h / 2, k = Math.max(40, (x2 - x1) / 2);
+              d = "M" + x1 + " " + y1 + " C" + (x1 + k) + " " + y1 + " " + (x2 - k) + " " + y2 + " " + (x2 - 2) + " " + y2;
+              mid = { x: (x1 + x2) / 2, y: (y1 + y2) / 2 };
+            } else {
+              // Back to an earlier column: loop under the cards
+              var bx1 = a.x + a.w / 2, by1 = a.y + a.h, bx2 = b.x + b.w / 2, by2 = b.y + b.h;
+              var low = Math.max(by1, by2) + 34;
+              d = "M" + bx1 + " " + by1 + " C" + bx1 + " " + low + " " + bx2 + " " + low + " " + bx2 + " " + (by2 + 2);
+              mid = { x: (bx1 + bx2) / 2, y: low - 8 };
+            }
+            var e = el("g", { "class": "pedge" + (neg ? " negative" : "") });
+            e.appendChild(el("path", { d: d, "marker-end": neg ? "url(#arrow-error)" : "url(#arrow)" }));
+            edgeLayer.appendChild(e);
+            var id = "p" + state.procEdges.length;
+            state.procEdges.push({ id: id, from: s.node, to: c.node });
+            edgeEls[id] = e;
+            // One label per status: in the middle for a single arrow, at the fork when it fans out
+            if (shared && ci > 0) return;
+            var lw = Math.min(150, 14 + st.label.length * 5.9);
+            if (shared) mid = b.x > a.x ? { x: a.x + a.w + 12 + lw / 2, y: a.y + a.h / 2 - 16 } : { x: a.x + a.w / 2, y: a.y + a.h + 16 };
+            var lg = el("g", { "class": "plabel" });
+            lg.appendChild(el("rect", { x: mid.x - lw / 2, y: mid.y - 9, width: lw, height: 17, rx: 8.5 }));
+            var tx = el("text", { x: mid.x, y: mid.y + 3.5, "text-anchor": "middle" });
+            tx.textContent = truncate(st.label, 24);
+            lg.appendChild(tx);
+            lg.addEventListener("click", function (ev) { ev.stopPropagation(); selectState(p.id, t); });
+            e.appendChild(lg);
+          });
+        });
+      });
+      y += height + 36;
+    });
+    state.bounds = { x: -30, y: -30, w: maxW + 60, h: Math.max(y, 1) + 30 };
+    if (refit) fit(); else applyTransform();
+    applyHighlight();
+    if (state.pending) {
+      var pend = state.pending;
+      state.pending = null;
+      if (pend.selected) select(pend.selected);
+      else if (pend.lane) selectLane(pend.lane[0], pend.lane[1]);
+      else if (pend.stateSel) selectState(pend.stateSel[0], pend.stateSel[1]);
+      else if (pend.process) selectProcess(pend.process);
+    }
+  }
+
+  function consumers(p, stateId) {
+    return p.steps.filter(function (s) { return s.from.indexOf(stateId) >= 0; });
+  }
+
+  function renderProcessList() {
+    var ul = $("#processes");
+    ul.innerHTML = "";
+    PROCESSES.forEach(function (p) {
+      var li = h("li");
+      var cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = !state.hiddenProc[p.id];
+      cb.onchange = function () { state.hiddenProc[p.id] = !cb.checked; layout(true); };
+      var name = h("span", "name", p.name);
+      name.onclick = function () { selectProcess(p.id); };
+      var only = h("button", "only", "only");
+      only.onclick = function () {
+        PROCESSES.forEach(function (x) { state.hiddenProc[x.id] = x.id !== p.id; });
+        renderProcessList(); layout(true);
+      };
+      li.appendChild(cb); li.appendChild(name); li.appendChild(only);
+      li.appendChild(h("span", "count", String(p.steps.length)));
+      ul.appendChild(li);
+    });
+  }
+
+  function openPanel(render) {
+    state.selected = null;
+    applyHighlight();
+    var d = $("#details-body");
+    d.innerHTML = "";
+    render(d);
+    $("#details").classList.add("open");
+  }
+
+  function selectProcess(pid) {
+    var p = processById(pid);
+    if (!p) return;
+    state.panel = { process: pid };
+    openPanel(function (d) {
+      d.appendChild(h("h2", null, p.name));
+      var badges = h("div", "badges");
+      badges.appendChild(h("span", "badge", "process"));
+      badges.appendChild(h("span", "badge mono", p.subject.replace(/^\./, "")));
+      d.appendChild(badges);
+      var f = featureById(p.feature);
+      if (f.description) d.appendChild(h("p", "description", f.description));
+      d.appendChild(h("h4", null, "Statuses (" + p.states.length + ")"));
+      d.appendChild(statesTable(p));
+      d.appendChild(h("h4", null, "Roles (" + p.lanes.length + ")"));
+      var ul = h("ul", "nav");
+      p.lanes.forEach(function (l) {
+        var li = h("li");
+        li.appendChild(h("div", null, l.name));
+        li.appendChild(h("div", "how", l.evidence.join(" · ")));
+        li.onclick = function () { selectLane(p.id, l.id); };
+        ul.appendChild(li);
+      });
+      d.appendChild(ul);
+    });
+  }
+
+  function statesTable(p, only) {
+    var t = h("table", "states-table");
+    var inputs = [];
+    p.states.filter(function (s) { return !only || s.id === only; }).forEach(function (s) {
+      var tr = h("tr");
+      var tdL = h("td");
+      if (EDIT) {
+        var inp = document.createElement("input");
+        inp.value = s.named === "raw" ? "" : s.label;
+        inp.placeholder = s.label;
+        inp.setAttribute("data-value", s.value);
+        inputs.push({ input: inp, state: s });
+        tdL.appendChild(inp);
+      } else tdL.textContent = s.label;
+      tr.appendChild(tdL);
+      tr.appendChild(h("td", "mono", s.code + (s.id === p.initial ? " · initial" : "")));
+      t.appendChild(tr);
+    });
+    if (!EDIT) return t;
+    var wrap = h("form", "edit-form");
+    wrap.appendChild(t);
+    wrap.appendChild(h("div", "hint", "Name statuses the way the business says them. Empty uses the name from the code."));
+    formButtons(wrap, function () {
+      var changed = inputs.filter(function (x) {
+        var orig = x.state.named === "human" ? x.state.label : null;
+        var v = x.input.value.trim();
+        return x.state.named === "human" ? v !== orig : v && v !== x.state.label;
+      });
+      if (!changed.length) return Promise.resolve(location.reload());
+      return changed.reduce(function (pr, x, i) {
+        return pr.then(function () {
+          return post({ target: "status", id: p.subject, fields: { value: x.state.value, label: x.input.value } }, i === changed.length - 1);
+        });
+      }, Promise.resolve());
+    });
+    return wrap;
+  }
+
+  function selectLane(pid, laneId) {
+    var p = processById(pid);
+    if (!p) return;
+    var l = laneById(p, laneId);
+    state.panel = { lane: [pid, laneId] };
+    openPanel(function (d) {
+      d.appendChild(h("h2", null, l.name));
+      var badges = h("div", "badges");
+      badges.appendChild(h("span", "badge", "role"));
+      if (l.provenance === "human") badges.appendChild(h("span", "badge human", "named by a person"));
+      if (l.provenance === "inferred") badges.appendChild(h("span", "badge", "from a route name"));
+      d.appendChild(badges);
+      d.appendChild(h("h4", null, "Found in"));
+      var ev = h("ul", "evidence");
+      l.evidence.forEach(function (x) { ev.appendChild(h("li", null, x)); });
+      d.appendChild(ev);
+      if (EDIT) {
+        var form = h("form", "edit-form");
+        var name = field(form, "Role name", "input", l.provenance === "human" ? l.name : "");
+        name.placeholder = l.name;
+        form.appendChild(h("div", "hint", "Renames this role in every process. Empty uses the name from the code."));
+        formButtons(form, function () { return save({ target: "role", id: l.id, fields: { name: name.value } }); });
+        d.appendChild(form);
+      }
+      d.appendChild(h("h4", null, "Steps"));
+      var ul = h("ul", "nav");
+      p.steps.filter(function (s) { return s.lane === l.id; }).forEach(function (s) {
+        var li = h("li");
+        li.appendChild(h("div", null, nodesById[s.node].label));
+        li.onclick = function () { select(s.node); centerOn(s.node); };
+        ul.appendChild(li);
+      });
+      d.appendChild(ul);
+    });
+  }
+
+  function selectState(pid, stateId) {
+    var p = processById(pid);
+    if (!p) return;
+    var st = stateOf(p, stateId);
+    state.panel = { stateSel: [pid, stateId] };
+    openPanel(function (d) {
+      d.appendChild(h("h2", null, st.label));
+      var badges = h("div", "badges");
+      badges.appendChild(h("span", "badge", "status"));
+      badges.appendChild(h("span", "badge mono", st.code));
+      if (st.named === "human") badges.appendChild(h("span", "badge human", "named by a person"));
+      if (st.named === "raw") badges.appendChild(h("span", "badge", "no name in the code"));
+      d.appendChild(badges);
+      d.appendChild(statesTable(p, stateId));
+      var into = p.steps.filter(function (s) { return s.to.indexOf(stateId) >= 0; });
+      var out = consumers(p, stateId);
+      navSteps(d, "Set by", into);
+      navSteps(d, "Next steps from here", out);
+    });
+  }
+
+  function navSteps(d, title, steps) {
+    d.appendChild(h("h4", null, title + " (" + steps.length + ")"));
+    if (!steps.length) { d.appendChild(h("div", "how", "—")); return; }
+    var ul = h("ul", "nav");
+    steps.forEach(function (s) {
+      var li = h("li");
+      li.appendChild(h("div", null, nodesById[s.node].label));
+      li.onclick = function () { select(s.node); centerOn(s.node); };
+      ul.appendChild(li);
+    });
+    d.appendChild(ul);
+  }
+
+  /** Process facts about a step, shown in its details. */
+  function processSection(d, n) {
+    PROCESSES.forEach(function (p) {
+      var s = p.steps.find(function (x) { return x.node === n.id; });
+      if (!s) return;
+      d.appendChild(h("h4", null, "In " + p.name));
+      var dl = h("dl");
+      var lane = laneById(p, s.lane);
+      row(dl, "Who", lane.name);
+      row(dl, "When", s.from.length ? s.from.map(function (f) { return stateOf(p, f).label; }).join(" or ") + " (" + { guard: "checked in code", view: "button shown only then", page: "page shown only then" }[s.fromVia] + ")" : "not restricted in code");
+      row(dl, "Result", s.to.length ? s.to.map(function (t) { return stateOf(p, t).label; }).join(" or ") : s.creates ? "creates the record" : "status unchanged");
+      d.appendChild(dl);
+      var ev = h("ul", "evidence");
+      lane.evidence.forEach(function (x) { ev.appendChild(h("li", null, x)); });
+      d.appendChild(ev);
+    });
+  }
+
   // ------------------------------------------------------------ selection
   function select(id) {
     state.selected = id;
     state.selectedFeature = null;
+    state.panel = null;
     applyHighlight();
     var panel = $("#details");
     if (!id || !nodesById[id]) { state.selected = null; panel.classList.remove("open"); return; }
@@ -408,6 +842,7 @@
   }
 
   function selectFeature(fid) {
+    state.panel = null;
     state.selected = null;
     state.selectedFeature = fid;
     applyHighlight();
@@ -429,7 +864,7 @@
     var hlEdges = {};
     if (sel) {
       related[sel] = true;
-      data.edges.forEach(function (e) {
+      (state.mode === "process" ? state.procEdges : data.edges).forEach(function (e) {
         if (e.from === sel || e.to === sel) { related[e.from] = related[e.to] = true; hlEdges[e.id] = true; }
       });
     }
@@ -463,6 +898,8 @@
     if (n.description) d.appendChild(h("p", "description", n.description));
     else if (!EDIT) d.appendChild(h("p", "description empty", "No description yet. Run builtlore serve to add one."));
     if (EDIT) d.appendChild(stepForm(n));
+    processSection(d, n);
+    d.appendChild(h("h4", null, "In the code"));
 
     var dl = h("dl");
     row(dl, "URI", "/" + (n.uri === "/" ? "" : n.uri), true);
@@ -537,6 +974,21 @@
     var label = field(form, "Name", "input", n.label);
     var desc = field(form, "What happens here", "textarea", n.description || "");
     desc.placeholder = "e.g. Area manager reviews the request and approves it or sends it back with a reason.";
+    var inProcess = PROCESSES.map(function (p) {
+      var st = p.steps.find(function (x) { return x.node === n.id; });
+      return st ? laneById(p, st.lane) : null;
+    }).filter(Boolean)[0];
+    var actor = null;
+    if (inProcess) {
+      actor = field(form, "Who does this", "input", inProcess.provenance === "human" ? inProcess.name : "");
+      actor.placeholder = inProcess.name;
+      actor.setAttribute("list", "lane-names");
+      var ldl = document.createElement("datalist");
+      ldl.id = "lane-names";
+      var seen = {};
+      PROCESSES.forEach(function (p) { p.lanes.forEach(function (l) { if (!seen[l.name]) { seen[l.name] = 1; var o = document.createElement("option"); o.value = l.name; ldl.appendChild(o); } }); });
+      form.appendChild(ldl);
+    }
     var feat = field(form, "Feature", "input", featureById(n.feature).name);
     feat.setAttribute("list", "feature-names");
     var dl = document.createElement("datalist");
@@ -559,6 +1011,7 @@
       // An untouched generated name stays generated (it can still improve in later versions).
       if (label.value !== n.label || n.provenance === "human") fields.label = label.value;
       if (target && target !== originalFeature) fields.feature = match ? match.id : target;
+      if (actor) fields.actor = actor.value;
       return save({ target: "step", id: n.id, fields: fields });
     });
     return form;
@@ -597,13 +1050,16 @@
     });
   }
 
-  function save(patch) {
+  function save(patch) { return post(patch, true); }
+
+  function post(patch, reload) {
     return fetch("/api/edit", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Builtlore-Token": EDIT.token },
       body: JSON.stringify(patch),
     }).then(function (r) {
       if (!r.ok) return r.text().then(function (t) { throw new Error(t || r.statusText); });
+      if (!reload) return;
       persistState();
       location.reload();
     });
@@ -614,6 +1070,7 @@
       sessionStorage.setItem("builtlore-state", JSON.stringify({
         hidden: state.hidden, showData: state.showData, showHidden: state.showHidden, direction: state.direction,
         view: state.view, selected: state.selected, selectedFeature: state.selectedFeature,
+        mode: state.mode, hiddenProc: state.hiddenProc, panel: state.panel,
       }));
     } catch (e) { /* storage unavailable */ }
   }
@@ -630,7 +1087,10 @@
       state.showHidden = !!s.showHidden;
       state.direction = s.direction || "RIGHT";
       state.view = s.view || state.view;
-      state.pending = { selected: s.selected, feature: s.selectedFeature };
+      state.mode = s.mode || state.mode;
+      state.hiddenProc = s.hiddenProc || {};
+      var pn = s.panel || {};
+      state.pending = { selected: s.selected, feature: s.selectedFeature, lane: pn.lane, stateSel: pn.stateSel, process: pn.process };
       $("#btn-direction").textContent = state.direction === "RIGHT" ? "Layout: left → right" : "Layout: top → bottom";
       return true;
     } catch (e) { return false; }
@@ -729,7 +1189,7 @@
     });
     svg.addEventListener("click", function () {
       if (justDragged) { justDragged = false; return; }
-      if (state.selected) select(null);
+      if (state.selected || $("#details").classList.contains("open")) select(null);
     });
   }
 

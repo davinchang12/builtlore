@@ -1,6 +1,6 @@
 {
   "name": "builtlore",
-  "version": "0.1.0-alpha.3",
+  "version": "0.2.0-alpha.0",
   "description": "See how your app is actually built: business flows, data and history on one canvas, generated from code.",
   "type": "module",
   "bin": {

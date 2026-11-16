@@ -9,12 +9,14 @@ import type {
   Fact,
   HandlerRef,
   NavigatesFact,
+  ProcessInfo,
   RepoInfo,
   SkippedFact,
   ViewRef,
 } from "../../core/types.js";
 import { BladeReader, viewFile, type BladeTarget } from "./blade.js";
-import { analyzeClosure, analyzeControllerMethod, ClassLocator, type HandlerAnalysis, type RedirectTarget } from "./controllers.js";
+import { analyzeClosure, analyzeControllerMethod, ClassLocator, findMethod, type HandlerAnalysis, type RedirectTarget } from "./controllers.js";
+import { parseViewConditions, ProcessReader } from "./process.js";
 import { shortClass } from "./php.js";
 import { artisanAvailable, extractRoutesArtisan, mergeRoutes } from "./routes-artisan.js";
 import { extractRoutesStatic, type RawRoute } from "./routes-static.js";
@@ -67,6 +69,7 @@ export const laravelAdapter: Adapter = {
     // 2. Entries
     const locator = new ClassLocator(repo.root);
     const blade = new BladeReader(repo.root);
+    const reader = new ProcessReader(repo.root, locator);
     const entries: EntryFact[] = [];
     const analyses = new Map<string, HandlerAnalysis | null>();
     const usedIds = new Set<string>();
@@ -78,14 +81,18 @@ export const laravelAdapter: Adapter = {
 
       let handler: HandlerRef = { kind: "unknown" };
       let analysis: HandlerAnalysis | null = null;
+      let process: ProcessInfo = { actors: [], writes: [], requires: [], creates: [] };
       if (r.action.kind === "controller") {
         analysis = analyzeControllerMethod(locator, r.action.class, r.action.method);
+        const m = findMethod(locator, r.action.class, r.action.method);
+        if (m) process = reader.analyzeHandler(m.node, m.names, m.file, r.action.class);
         handler = { kind: "controller", class: r.action.class, method: r.action.method, file: analysis?.file, line: analysis?.line };
         if (!analysis) {
           skipped.push({ kind: "skipped", reason: `Controller not found: ${r.action.class}@${r.action.method}`, source: { file: r.file, line: r.line } });
         }
       } else if (r.action.kind === "closure") {
         analysis = analyzeClosure(r.action.node, r.action.ctx, r.action.file);
+        process = reader.analyzeHandler(r.action.node, r.action.ctx, r.action.file);
         handler = { kind: "closure", file: r.action.file, line: analysis.line };
       } else if (r.action.kind === "view") {
         analysis = { views: [{ engine: "blade", name: r.action.view }], redirects: [], validates: false };
@@ -106,6 +113,10 @@ export const laravelAdapter: Adapter = {
         };
       }
 
+      for (const a of reader.actorsFromMiddleware(r.middleware)) {
+        if (!process.actors.some((x) => x.name === a.name)) process.actors.push(a);
+      }
+
       entries.push({
         kind: "entry",
         id,
@@ -117,6 +128,7 @@ export const laravelAdapter: Adapter = {
         handler,
         view,
         source: { file: r.file, line: r.line },
+        process: process.actors.length || process.writes.length || process.requires.length || process.creates.length ? process : undefined,
       });
     }
 
@@ -143,7 +155,12 @@ export const laravelAdapter: Adapter = {
           if (to) {
             if (to === e.id) continue;
             const trigger = link.trigger === "ref" ? (resolver.typeOf(to) === "page" ? "link" : "ajax") : link.trigger;
-            edges.push({ kind: "navigates", from: e.id, to, trigger, source: { file: link.file, line: link.line } });
+            const edge: NavigatesFact = { kind: "navigates", from: e.id, to, trigger, source: { file: link.file, line: link.line } };
+            if (link.when) {
+              const when = parseViewConditions(link.when, reader, link.file, link.line);
+              if (when.actors.length || when.requires.length) edge.when = when;
+            }
+            edges.push(edge);
           } else if (link.trigger !== "ref") {
             skipped.push({ kind: "skipped", reason: `Unresolved ${link.trigger} target ${describeTarget(link.target)}`, source: { file: link.file, line: link.line } });
           }
@@ -194,7 +211,37 @@ export const laravelAdapter: Adapter = {
     if (layoutLinks) notes.push(`Ignored ${layoutLinks} links from shared layouts (menus/navbars) to keep flows readable.`);
     if (inertiaViews) notes.push(`${inertiaViews} Inertia pages detected; Inertia navigation edges are planned for a later release.`);
 
-    const facts: Fact[] = [...entries, ...dedupe(resolved), ...skipped];
+    // 5. Actors from names (approve-manager), only for role words: known in the app or common ones
+    for (const e of entries) {
+      if (e.methods.every((m) => m === "GET")) continue;
+      const explicit = (e.process?.actors.length ?? 0) > 0 || edges.some((x) => x.to === e.id && x.when?.actors.length);
+      if (explicit) continue;
+      const role = reader.roleFromName(e.name ?? "") ?? (e.handler?.method ? reader.roleFromName(e.handler.method) : null);
+      if (!role) continue;
+      const p = e.process ?? { actors: [], writes: [], requires: [], creates: [] };
+      p.actors.push(reader.actor(role, "name", e.name ?? e.handler?.method ?? e.uri));
+      e.process = p;
+    }
+
+    // 6. Known states of the models involved
+    const models = new Set<string>();
+    const noteModel = (subject: string) => {
+      const short = subject.split(".")[0];
+      const fq = short ? reader.modelFor(short) : null;
+      if (fq) models.add(fq);
+    };
+    for (const e of entries) {
+      for (const w of e.process?.writes ?? []) noteModel(w.subject);
+      for (const q of e.process?.requires ?? []) noteModel(q.subject);
+      for (const c of e.process?.creates ?? []) noteModel(`${c}.`);
+    }
+    for (const x of edges) for (const q of x.when?.requires ?? []) noteModel(q.subject);
+    const states = reader.statesFacts(models);
+    const withStates = states.filter((st) => st.values.length || st.initial).length;
+    const steps = entries.filter((e) => e.process?.writes.length).length;
+    if (steps) notes.push(`Process: ${steps} step${steps === 1 ? "" : "s"} change a status; ${withStates} status column${withStates === 1 ? "" : "s"} with known values.`);
+
+    const facts: Fact[] = [...entries, ...dedupe(resolved), ...skipped, ...states];
     return { facts, notes };
   },
 };
@@ -355,6 +402,11 @@ function dedupe(edges: NavigatesFact[]): NavigatesFact[] {
     }
     const labels = [prev.label, e.label].filter((l): l is string => Boolean(l));
     prev.label = labels.length ? [...new Set(labels)].join(" / ") : undefined;
+    if (e.when) {
+      prev.when = prev.when ?? { actors: [], requires: [] };
+      for (const a of e.when.actors) if (!prev.when.actors.some((x) => x.name === a.name)) prev.when.actors.push(a);
+      prev.when.requires.push(...e.when.requires);
+    }
   }
   return [...byKey.values()];
 }

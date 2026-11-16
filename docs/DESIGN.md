@@ -2,7 +2,7 @@
 
 > **Name.** `builtlore` = "the lore of what you built": the knowledge, flows and history of an application that usually live only in people's heads, made visible. Chosen 2026-11-16 (see [Open questions](#16-open-questions)).
 
-**Status:** v0.1.0-alpha.3 (Laravel flows + edits that survive rescans) · **Next:** Process view, then project documentation · **Last updated:** 2026-11-16
+**Status:** v0.2.0-alpha.0 (Laravel: Process view, Screens view, edits that survive rescans) · **Next:** project documentation (6.8) · **Last updated:** 2026-11-16
 
 ---
 
@@ -234,7 +234,7 @@ glossary:
 - **Docs:** Markdown, one page per feature, plus an index; can be served as a static site.
 - **AI context:** a compact `builtlore.md` (and later an MCP server) that agents can read: feature → flow → files → tables → jobs.
 
-### 6.7 Process view (next)
+### 6.7 Process view — implemented in 0.2.0-alpha.0
 
 Goal: one swimlane diagram per business process (e.g. "Purchase request"), readable by non-developers, generated from code.
 
@@ -261,6 +261,15 @@ statuses:
 ```
 
 **Rendering:** lanes = actors, boxes = steps (business label), arrows = transitions labelled with the resulting status, red dashed = rejection/hold/back. AI naming stays optional and labelled as inferred.
+
+**As implemented (alpha.0):**
+- Facts: `EntryFact.process` (actors, writes, guard requirements, models created), `NavigatesFact.when` (actors and status conditions around the link/button in Blade), `StatesFact` (known values per `Model.column`: constants `STATUS_*`, enum cases via `$casts`, label arrays / `match` maps, `$attributes` default).
+- Subjects are `Model.column`; Blade variables map to models by name (`$purchaseRequest` → `PurchaseRequest`), otherwise `.column` joins the feature's only subject on that column.
+- A step's "from" states, in order of strength: guard in the handler → condition around the button that leads to it → condition around the link to the page the form is on.
+- Lane choice by source: code → view → middleware → route name; several names from the same source are joined ("Admin / Manager"). Fallback lanes: *Signed-in user* (auth middleware) or *Anyone*.
+- Name-based roles only match a role vocabulary (common words + every role found explicitly elsewhere in the app).
+- Columns: creation steps first; each step is placed after the step that produces the status it needs (BFS, loops drawn under the cards).
+- Human edits: `roles:` (lane id → name), `statuses:` (`Model.column` → value → label), `actor:` per step.
 
 ### 6.8 Project documentation (after the Process view)
 
@@ -404,7 +413,7 @@ Alternative considered: a Go CLI (single binary by default). Rejected for v0.1 b
 |---|---|
 | **v0.1** | Flows layer for **one** stack · `scan`, `view` · single-HTML canvas · `--no-ai` mode |
 | v0.1 (alpha.3) | Human edits + stable IDs + `serve` (done, 6.5) |
-| v0.2 | **Process layer:** swimlanes from actors + status transitions (6.7); becomes the default view |
+| v0.2 | **Process layer:** swimlanes from actors + status transitions (6.7); default view — alpha.0 done |
 | v0.3 | **Project documentation** (6.8): `builtlore docs` → Markdown, HTML site, Word/PDF |
 | v0.3.x | History layer: feature birth, churn, contributors · timeline slider · `diff` · `check` for CI · GitHub Action |
 | v0.4 | Data layer: migrations/ORM → ERD · live read-only DB (FKs, stored procedures) · step ↔ table links |
@@ -451,7 +460,7 @@ builtlore/
 │   ├── core/             # fact types, model builder, scan pipeline
 │   ├── adapters/
 │   │   └── laravel/      # routes (static + artisan), controllers, Blade
-│   └── render/           # single-file HTML canvas
+│   └── render/           # single-file HTML canvas (Process + Screens views)
 ├── assets/               # viewer.js + viewer.css (inlined into the canvas)
 ├── fixtures/
 │   ├── laravel-clinic/   # sample app with success and failure branches

@@ -20,6 +20,8 @@ export interface BladeLink {
   method?: string;
   file: string;
   line: number;
+  /** Raw conditions around the link: @if/@elseif expressions, "@role('x')", "@can('x')", "!(expr)" for @unless. */
+  when?: string[];
 }
 
 export interface BladeAnalysis {
@@ -160,7 +162,7 @@ function parseLinks(raw: string, file: string): BladeLink[] {
     if (!href) continue;
     const target = parseTarget(href);
     if (target) {
-      out.push({ target, trigger: "link", file, line: lineAt(src, m.index ?? 0) });
+      out.push({ target, trigger: "link", file, line: lineAt(src, m.index ?? 0), _at: m.index ?? 0 } as BladeLink);
       covered.push([m.index ?? 0, (m.index ?? 0) + m[0].length]);
     }
   }
@@ -179,7 +181,7 @@ function parseLinks(raw: string, file: string): BladeLink[] {
       body.match(/name=["']_method["'][^>]*value=["'](\w+)["']/i) ??
       body.match(/value=["'](\w+)["'][^>]*name=["']_method["']/i);
     if (spoof) method = spoof[1].toUpperCase();
-    out.push({ target, trigger: "submit", method, file, line: lineAt(src, m.index ?? 0) });
+    out.push({ target, trigger: "submit", method, file, line: lineAt(src, m.index ?? 0), _at: m.index ?? 0 } as BladeLink);
     covered.push([m.index ?? 0, (m.index ?? 0) + open.length]);
   }
 
@@ -191,7 +193,7 @@ function parseLinks(raw: string, file: string): BladeLink[] {
     if (before.endsWith(":") || before.endsWith(">") || before.endsWith("$")) continue; // Storage::url(), $x->url()
     if (m[1] === "url" && m[2] && !m[2].startsWith("/")) continue;
     const target: BladeTarget = m[1] === "route" ? { kind: "name", name: m[2] } : { kind: "uri", uri: m[2] || "/" };
-    out.push({ target, trigger: "ref", file, line: lineAt(src, idx) });
+    out.push({ target, trigger: "ref", file, line: lineAt(src, idx), _at: idx } as BladeLink);
   }
 
   // URLs written by hand in scripts: '/master/items/' + id (+ '/approve'), with type/method nearby.
@@ -212,10 +214,96 @@ function parseLinks(raw: string, file: string): BladeLink[] {
         method: hint ? hint[1].toUpperCase() : undefined,
         file,
         line: lineAt(src, offset + (m.index ?? 0)),
-      });
+        _at: offset + (m.index ?? 0),
+      } as BladeLink);
     }
   }
+  const conditions = conditionMap(src);
+  for (const l of out as Array<BladeLink & { _at?: number }>) {
+    const at = l._at ?? offsetOfLine(src, l.line);
+    delete l._at;
+    const when = conditions(at);
+    if (when.length) l.when = when;
+  }
   return out;
+}
+
+/**
+ * Conditions in effect at each offset of a Blade view. @else drops the
+ * condition (its negation is not useful for documentation); @unless(x) is "!(x)".
+ */
+export function conditionMap(src: string): (offset: number) => string[] {
+  type Frame = { start: number; end: number; conds: string[] };
+  const spans: Frame[] = [];
+  const stack: Array<{ kind: string; conds: string[]; start: number }> = [];
+  const re = /@(if|elseif|else|endif|unless|endunless|can|elsecan|cannot|endcan|endcannot|role|hasrole|hasanyrole|hasallroles|endrole|endhasrole|endhasanyrole|endhasallroles)\b/g;
+  const close = (end: number) => {
+    const top = stack[stack.length - 1];
+    if (top && top.conds.length) spans.push({ start: top.start, end, conds: top.conds });
+  };
+  for (const m of src.matchAll(re)) {
+    const kind = m[1];
+    const at = m.index ?? 0;
+    const after = at + m[0].length;
+    const arg = /^\s*\(/.test(src.slice(after, after + 20)) ? balanced(src, src.indexOf("(", after)) : null;
+    const argEnd = arg ? arg.end : after;
+    if (kind === "if" || kind === "unless") {
+      if (!arg) continue;
+      stack.push({ kind: "if", conds: [kind === "unless" ? `!(${arg.text})` : arg.text], start: argEnd });
+    } else if (kind === "elseif" || kind === "elsecan") {
+      close(at);
+      const top = stack[stack.length - 1];
+      if (top) {
+        top.conds = arg ? [kind === "elsecan" ? `@can(${arg.text})` : arg.text] : [];
+        top.start = argEnd;
+      }
+    } else if (kind === "else") {
+      close(at);
+      const top = stack[stack.length - 1];
+      if (top) {
+        top.conds = [];
+        top.start = after;
+      }
+    } else if (kind === "can" || kind === "role" || kind === "hasrole" || kind === "hasanyrole" || kind === "hasallroles") {
+      if (!arg) continue;
+      stack.push({ kind: "block", conds: [`@${kind}(${arg.text})`], start: argEnd });
+    } else if (kind === "cannot") {
+      if (!arg) continue;
+      stack.push({ kind: "block", conds: [], start: argEnd });
+    } else {
+      // any @end*
+      close(at);
+      stack.pop();
+    }
+  }
+  return (offset: number) => spans.filter((s) => offset >= s.start && offset < s.end).flatMap((s) => s.conds);
+}
+
+function balanced(src: string, open: number): { text: string; end: number } | null {
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = open; i < src.length && i < open + 2000; i++) {
+    const c = src[i];
+    if (quote) {
+      if (c === "\\") i++;
+      else if (c === quote) quote = null;
+      continue;
+    }
+    if (c === "'" || c === '"') quote = c;
+    else if (c === "(") depth++;
+    else if (c === ")" && --depth === 0) return { text: src.slice(open + 1, i).trim(), end: i + 1 };
+  }
+  return null;
+}
+
+function offsetOfLine(src: string, line: number): number {
+  let idx = 0;
+  for (let l = 1; l < line; l++) {
+    const next = src.indexOf("\n", idx);
+    if (next < 0) break;
+    idx = next + 1;
+  }
+  return idx;
 }
 
 /** Blank out {{-- comments --}} while keeping offsets (and so line numbers) intact. */
