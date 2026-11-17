@@ -7,6 +7,7 @@ use App\Http\Controllers\LoginController;
 use App\Http\Controllers\Master\DepartmentController;
 use App\Http\Controllers\Master\ItemController;
 use App\Http\Controllers\Master\SupplierController;
+use App\Http\Controllers\PresentationController;
 use App\Http\Controllers\PurchaseRequestController;
 use App\Http\Controllers\ReportController;
 use App\Http\Controllers\StatusLeaveRequestController;
@@ -39,6 +40,19 @@ Route::prefix('master')->name('master.')->middleware(['auth', 'can:admin'])->gro
 });
 
 Route::get('/api/master/departments/lookup', [DepartmentController::class, 'lookup'])->middleware('auth')->name('master.departments.lookup');
+
+Route::prefix('review')->name('review.')->middleware(['isLogin', 'can:Menu'])->group(function () {
+    Route::prefix('presentations')->name('presentations.')->middleware('can:Menu Presentasi')->controller(PresentationController::class)->group(function () {
+        Route::get('/', 'index')->name('index');
+        Route::post('/', 'store')->name('store');
+        Route::get('{id}', 'show')->name('show');
+        Route::post('{id}/approve', 'approve')->name('approve')->middleware('can:Menu Presentasi Approve');
+        Route::post('{id}/hold', 'hold')->name('hold')->middleware('can:Menu Presentasi Approve');
+        Route::post('{id}/decide', 'decide')->name('decide')->middleware('can:Menu Presentasi Approve');
+        Route::post('{id}/delegate', 'delegate')->name('delegate');
+        Route::post('{id}/revise', 'revise')->name('revise');
+    });
+});
 
 Route::prefix('report')->name('report.')->middleware('auth')->group(function () {
     Route::get('purchase-requests', [ReportController::class, 'indexPurchaseRequest'])->name('purchase-requests');

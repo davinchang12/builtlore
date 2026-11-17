@@ -12,8 +12,8 @@
   var reversed = {};
   var TYPE_RANK = { page: 0, redirect: 1, action: 2, data: 3, download: 4, api: 5 };
   var FORWARD = { link: true, submit: true, ajax: true, redirect: true };
-  var NEGATIVE = /reject|declin|hold|cancel|return|revis|tolak|batal|void|fail|expire|kembali|draft/i;
-  var CARD_W = 190, CARD_H = 50, COL_W = 270, LANE_PAD = 16, LABEL_W = 200, STACK_GAP = 12;
+  var NEGATIVE = /reject|declin|\bhold|cancel|tolak|batal|\bvoid|fail|expire|ditolak|dibatalkan/i;
+  var CARD_W = 190, CARD_H = 50, COL_W = 350, LANE_PAD = 16, LABEL_W = 200, STACK_GAP = 12;
 
   var nodesById = {};
   data.nodes.forEach(function (n) { nodesById[n.id] = n; });
@@ -520,7 +520,12 @@
         var ly = laneY[l.id];
         groupLayer.appendChild(el("rect", { x: 8, y: ly.y, width: width - 16, height: ly.h, "class": "lane-band" + (i % 2 ? " alt" : "") }));
         var lt = el("text", { x: 20, y: ly.y + ly.h / 2 + 4, "class": "lane-label" + (/^(signed-in-user|anyone)$/.test(l.id) && l.provenance !== "human" ? " fallback" : "") + (l.provenance === "inferred" ? " inferred" : "") });
-        lt.textContent = truncate(l.name, 20);
+        var lines = wrapWords(l.name, 22, 3);
+        lines.forEach(function (line, li) {
+          var ts = el("tspan", { x: 20, dy: li ? 15 : -(lines.length - 1) * 7.5 });
+          ts.textContent = line;
+          lt.appendChild(ts);
+        });
         var tip = el("title", {});
         tip.textContent = l.name + "\n" + l.evidence.join("\n") + (EDIT ? "\nClick to rename" : "");
         lt.appendChild(tip);
@@ -566,6 +571,12 @@
 
       // Transitions: producer -> consumer, labelled with the status in between
       var endCount = {};
+      var inbound = {}, inboundLabelled = {};
+      steps.forEach(function (s) {
+        s.to.forEach(function (t) {
+          consumers(p, t).forEach(function (c) { if (box[c.node]) inbound[c.node + "|" + t] = (inbound[c.node + "|" + t] || 0) + 1; });
+        });
+      });
       steps.forEach(function (s) {
         s.to.forEach(function (t) {
           var st = stateOf(p, t);
@@ -612,14 +623,22 @@
             var id = "p" + state.procEdges.length;
             state.procEdges.push({ id: id, from: s.node, to: c.node });
             edgeEls[id] = e;
-            // One label per status: in the middle for a single arrow, at the fork when it fans out
-            if (shared && ci > 0) return;
-            var lw = Math.min(150, 14 + st.label.length * 5.9);
-            if (shared) mid = b.x > a.x ? { x: a.x + a.w + 12 + lw / 2, y: a.y + a.h / 2 - 16 } : { x: a.x + a.w / 2, y: a.y + a.h + 16 };
+            // One label per status: at the fork when one step fans out, at the target when
+            // several steps lead into it with the same status, otherwise in the middle.
+            var lw = Math.min(136, 14 + st.label.length * 5.9);
+            var key = c.node + "|" + t;
+            if (inbound[key] > 1) {
+              if (inboundLabelled[key]) return;
+              inboundLabelled[key] = true;
+              mid = b.x > a.x ? { x: b.x - 10 - lw / 2, y: b.y + b.h / 2 - 16 } : { x: b.x + b.w / 2, y: b.y + b.h + 16 };
+            } else if (shared) {
+              if (ci > 0) return;
+              mid = b.x > a.x ? { x: a.x + a.w + 12 + lw / 2, y: a.y + a.h / 2 - 16 } : { x: a.x + a.w / 2, y: a.y + a.h + 16 };
+            }
             var lg = el("g", { "class": "plabel" });
             lg.appendChild(el("rect", { x: mid.x - lw / 2, y: mid.y - 9, width: lw, height: 17, rx: 8.5 }));
             var tx = el("text", { x: mid.x, y: mid.y + 3.5, "text-anchor": "middle" });
-            tx.textContent = truncate(st.label, 24);
+            tx.textContent = truncate(st.label, 21);
             lg.appendChild(tx);
             lg.addEventListener("click", function (ev) { ev.stopPropagation(); selectState(p.id, t); });
             e.appendChild(lg);
@@ -639,6 +658,17 @@
       else if (pend.stateSel) selectState(pend.stateSel[0], pend.stateSel[1]);
       else if (pend.process) selectProcess(pend.process);
     }
+  }
+
+  function wrapWords(text, width, maxLines) {
+    var words = String(text).split(/\s+/), lines = [], cur = "";
+    words.forEach(function (w) {
+      if ((cur + " " + w).trim().length > width && cur) { lines.push(cur); cur = w; }
+      else cur = (cur + " " + w).trim();
+    });
+    if (cur) lines.push(cur);
+    if (lines.length > maxLines) { lines = lines.slice(0, maxLines); lines[maxLines - 1] = truncate(lines[maxLines - 1] + "…", width); }
+    return lines;
   }
 
   function consumers(p, stateId) {

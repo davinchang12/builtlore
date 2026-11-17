@@ -72,14 +72,16 @@ export function buildProcesses(input: {
     // Subjects written by this feature
     const written = new Map<Subject, number>();
     for (const n of actions) for (const w of entryById.get(n.id)?.process?.writes ?? []) written.set(w.subject, (written.get(w.subject) ?? 0) + 1);
-    const subjects = [...written.keys()].filter((s) => !s.startsWith("."));
+    // History/log tables (SlideHistory, ApprovalLog) record the process; they are not a process of their own.
+    const isLog = (s: Subject) => /(History|Histories|Hist|Log|Logs|Audit|Audits|Trail|Activity|Activities|Tracking)$/i.test(s.split(".")[0]) || /(_history|_histories|_log|_logs|_audit|_trail)$/i.test(s.split(".")[0]);
+    const subjects = [...written.keys()].filter((s) => !s.startsWith(".") && !isLog(s));
     // Writes with an unknown model join the feature's only subject on that column
     const resolve = (s: Subject): Subject | null => {
       if (!s.startsWith(".")) return s;
       const same = subjects.filter((x) => x.endsWith(s));
       return same.length === 1 ? same[0] : null;
     };
-    for (const s of written.keys()) if (s.startsWith(".") && !resolve(s)) subjects.push(s);
+    for (const s of written.keys()) if (s.startsWith(".") && !resolve(s) && !subjects.length) subjects.push(s);
 
     for (const subject of subjects) {
       const model = subject.split(".")[0];
@@ -145,16 +147,22 @@ export function buildProcesses(input: {
   return processes;
 }
 
+/**
+ * One lane per step: the most specific actor from the strongest source.
+ * Roles beat permissions; among permissions the last one wins (route-level
+ * middleware comes after group-level, e.g. can:Master then can:Slide Approve).
+ */
 function pickLane(actors: ActorRef[], entry: EntryFact | undefined): ProcessLane {
   for (const via of VIA_PRIORITY) {
     const found = actors.filter((a) => a.via === via);
     if (!found.length) continue;
-    const names = [...new Set(found.map((a) => a.name))];
-    const name = names.join(" / ");
+    const roles = found.filter((a) => a.kind !== "permission");
+    const chosen = roles.length ? [...new Map(roles.map((r) => [r.name, r])).values()] : [found[found.length - 1]];
+    const name = chosen.map((a) => a.name).join(" / ");
     return {
       id: laneKey(name),
       name,
-      evidence: found.map((a) => describe(a)),
+      evidence: chosen.map((a) => describe(a)),
       provenance: via === "name" ? "inferred" : "extracted",
     };
   }

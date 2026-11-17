@@ -70,6 +70,8 @@ export interface ActorRef {
   via: "middleware" | "code" | "view" | "name";
   /** What it was read from, e.g. "role:procurement", "auth()->user()->nik == $pr->manager_nik". */
   detail: string;
+  /** "permission": a named permission (can:Slide Approve); "role": a role or position. */
+  kind?: "role" | "permission";
 }
 
 export interface ProcessInfo {
@@ -78,6 +80,10 @@ export interface ProcessInfo {
   requires: StatusCondition[];
   /** Models this step creates (Model::create, new Model). */
   creates: string[];
+  /** Status writes whose value builtlore could not read (reported, never guessed). */
+  unresolved?: Array<{ column: string; code: string; source: SourceRef }>;
+  /** Stored procedures called (their status changes are not visible in the code). */
+  procedures?: string[];
 }
 
 /** Known values of a status column: constants, enum cases, label arrays, defaults. */

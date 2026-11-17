@@ -17,8 +17,16 @@ import type { ActorRef, ProcessInfo, StatesFact, StatusCondition, StatusValue, S
 import { ClassLocator } from "./controllers.js";
 import { lineOf, resolveName, stringValue, walk, type NameContext, type PhpNode } from "./php.js";
 
-/** Columns that hold a workflow state. */
-export const STATUS_COLUMN = /^(status|state|stage|step|phase|approval|approval_status|approval_state|workflow_status|status_[a-z_]+|[a-z_]+_status|is_approved|approved)$/i;
+/** Columns that hold a workflow state (tested on the snake_case form, so StatusApproval works too). */
+const STATUS_COLUMN_RE = /^(status|state|stage|step|phase|approval|approval_status|approval_state|workflow_status|status_[a-z0-9_]+|[a-z0-9_]+_status|is_approved?|approved?|flag_approval|approval_flag)$/i;
+export const STATUS_COLUMN = { test: (c: string): boolean => STATUS_COLUMN_RE.test(snake(c)) };
+
+function snake(s: string): string {
+  return s.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2").toLowerCase();
+}
+
+/** Custom middleware that only checks login, not a role. */
+const AUTH_LIKE = /login|logged|auth|session|token|jwt|sso|signed|verify|verified|csrf|cors|locale|lang|csp|throttle|log|track|maintenance|xss|secure|header/i;
 
 /** Properties of the current user that name a role. */
 const ROLE_PROPS = /^(role|roles|role_name|role_id|level|user_level|jabatan|position|posisi|type|user_type|group|group_name|akses|hak_akses|access|access_level|divisi|division|department|departemen|bagian|title)$/i;
@@ -55,6 +63,8 @@ interface ClassInfo {
   labels: Map<string, Map<string, string>>;
   /** status column -> default ($attributes) */
   defaults: Map<string, StatusValue>;
+  /** protected $table = '...' */
+  table?: string;
   line?: number;
 }
 
@@ -119,6 +129,7 @@ export class ProcessReader {
       } else if (member.kind === "propertystatement") {
         for (const p of member.properties ?? []) {
           const name: string = p.name?.name ?? p.name;
+          if (name === "table" && stringValue(p.value)) info.table = stringValue(p.value)!;
           if (p.value?.kind !== "array") continue;
           if (name === "casts") {
             for (const it of p.value.items ?? []) {
@@ -264,6 +275,26 @@ export class ProcessReader {
     return this.shortIndex.get(short) ?? [];
   }
 
+  private tables: Map<string, string> | null = null;
+
+  /** Model short name for a database table: $table, or Laravel's snake_case plural convention. */
+  modelForTable(table: string): string | null {
+    if (!this.tables) {
+      this.tables = new Map();
+      this.findShort("__index__");
+      for (const [short, list] of this.shortIndex ?? []) {
+        for (const fq of list) {
+          const info = this.classInfo(fq);
+          if (!info?.isModel) continue;
+          const t = (info.table ?? pluralSnake(short)).toLowerCase();
+          if (!this.tables.has(t)) this.tables.set(t, short);
+        }
+      }
+    }
+    const t = table.toLowerCase().replace(/^.*\./, "");
+    return this.tables.get(t) ?? null;
+  }
+
   modelFor(short: string): string | null {
     for (const c of this.findShort(short)) if (this.classInfo(c)?.isModel) return c;
     return null;
@@ -322,12 +353,28 @@ export class ProcessReader {
       }
     }
 
+    const locals: Locals = { values: new Map(), arrays: new Map() };
     walk(body, (n) => {
       // $x = Model::find(...) / new Model / auth()->user()
       if (n.kind === "assign" && n.left?.kind === "variable" && typeof n.left.name === "string") {
         const model = this.modelOfExpr(n.right, names, types);
         if (model) types.set(n.left.name, model);
         if (isCurrentUser(n.right, userVars)) userVars.add(n.left.name);
+        // $status = 'Approved' / $data = ['status' => ...]
+        const list = locals.values.get(n.left.name) ?? [];
+        list.push(n.right);
+        locals.values.set(n.left.name, list);
+        if (n.right?.kind === "array") {
+          const arr = locals.arrays.get(n.left.name) ?? [];
+          for (const it of n.right.items ?? []) if (it?.kind === "entry" && it.key) arr.push({ key: it.key, value: it.value });
+          locals.arrays.set(n.left.name, arr);
+        }
+      }
+      // $data['status'] = 'Approved'
+      if (n.kind === "assign" && n.left?.kind === "offsetlookup" && n.left.what?.kind === "variable" && n.left.offset) {
+        const arr = locals.arrays.get(n.left.what.name) ?? [];
+        arr.push({ key: n.left.offset, value: n.right });
+        locals.arrays.set(n.left.what.name, arr);
       }
     });
 
@@ -336,13 +383,12 @@ export class ProcessReader {
         // $x->status = V
         const col = n.left.offset?.name;
         if (col && STATUS_COLUMN.test(col) && n.operator === "=") {
-          const v = this.value(n.right, names, selfClass);
           const subj = subjectOf(n.left.what, types, col);
-          if (v && subj) info.writes.push({ subject: subj, to: v, source: { file, line: lineOf(n) } });
+          if (subj) this.recordWrite(info, subj, col, n.right, names, selfClass, locals, { file, line: lineOf(n) });
         }
       }
       if (n.kind === "call" || n.kind === "new") {
-        this.readCall(n, names, types, file, info, selfClass, userVars);
+        this.readCall(n, names, types, file, info, selfClass, userVars, locals);
       }
       if (n.kind === "if" && n.test && exits(n.body)) {
         // if (status != V) return / abort: the step requires V
@@ -358,11 +404,76 @@ export class ProcessReader {
       const name = n.what?.offset?.name ?? n.what?.name;
       if (/^(authorize|allows|denies|authorizeForUser)$/.test(name ?? "") && n.arguments?.[0]) {
         const ability = stringValue(n.arguments[0]);
-        const role = ability ? this.roleFromName(ability) : null;
-        if (role) pushActor(info.actors, { name: role, via: "code", detail: `authorize('${ability}')` });
+        if (ability && !/^(view|viewAny|create|update|delete|restore|forceDelete|approve|reject)$/.test(ability)) {
+          pushActor(info.actors, this.ability(ability, "code", `authorize('${ability}')`));
+        }
       }
     });
     return info;
+  }
+
+  /** Resolve every value an expression can have: literals, constants, ternaries, match arms, local variables. */
+  private values(node: PhpNode, names: NameContext, selfClass: string | undefined, locals: Locals, depth = 0): StatusValue[] | null {
+    if (!node || depth > 4) return null;
+    const one = this.value(node, names, selfClass);
+    if (one) return [one];
+    if (node.kind === "retif") {
+      const a = this.values(node.trueExpr ?? node.test, names, selfClass, locals, depth + 1);
+      const b = this.values(node.falseExpr, names, selfClass, locals, depth + 1);
+      return a && b ? [...a, ...b] : null;
+    }
+    if (node.kind === "match") {
+      const out: StatusValue[] = [];
+      for (const arm of node.arms ?? []) {
+        const v = this.values(arm.body, names, selfClass, locals, depth + 1);
+        if (!v) return null;
+        out.push(...v);
+      }
+      return out.length ? out : null;
+    }
+    // $data['status'] from an array built earlier
+    if (node.kind === "offsetlookup" && node.what?.kind === "variable" && node.offset) {
+      const key = stringValue(node.offset);
+      const entries = (locals.arrays.get(node.what.name) ?? []).filter((e) => stringValue(e.key) === key);
+      if (!key || !entries.length) return null;
+      const out: StatusValue[] = [];
+      for (const e of entries) {
+        const v = this.values(e.value, names, selfClass, locals, depth + 1);
+        if (!v) return null;
+        out.push(...v);
+      }
+      return out;
+    }
+    if (node.kind === "variable" && typeof node.name === "string") {
+      const assigned = locals.values.get(node.name);
+      if (!assigned?.length) return null;
+      const out: StatusValue[] = [];
+      for (const a of assigned) {
+        const v = this.values(a, names, selfClass, locals, depth + 1);
+        if (!v) return null;
+        out.push(...v);
+      }
+      return out;
+    }
+    return null;
+  }
+
+  private recordWrite(
+    info: ProcessInfo,
+    subject: string,
+    column: string,
+    valueNode: PhpNode,
+    names: NameContext,
+    selfClass: string | undefined,
+    locals: Locals,
+    source: { file: string; line?: number },
+  ): void {
+    const vs = this.values(valueNode, names, selfClass, locals);
+    if (vs) {
+      for (const v of vs) if (!info.writes.some((w) => w.subject === subject && w.to.value === v.value)) info.writes.push({ subject, to: v, source });
+    } else {
+      (info.unresolved ??= []).push({ column: `${subject.split(".")[0] ? subject.split(".")[0] + "." : ""}${column}`, code: exprText(valueNode), source });
+    }
   }
 
   private readCall(
@@ -373,8 +484,18 @@ export class ProcessReader {
     info: ProcessInfo,
     selfClass: string | undefined,
     userVars: Set<string>,
+    locals: Locals,
   ): void {
     const fnName: string | undefined = n.kind === "call" && n.what?.kind === "name" ? n.what.name : undefined;
+    const callName: string | undefined = n.kind === "call" ? n.what?.offset?.name : undefined;
+    // Raw SQL and stored procedures: DB::update("update mtdi set status = 'Approved' ..."), DB::select('EXEC sp_x ?')
+    if (callName && /^(update|statement|select|insert|unprepared|affectingStatement)$/.test(callName) && n.arguments?.[0]) {
+      const sql = stringValue(n.arguments[0]) ?? stringPrefix(n.arguments[0]);
+      if (sql) {
+        this.readSql(sql, info, { file, line: lineOf(n) });
+        if (/^\s*(update|insert|exec|call|select)/i.test(sql)) return;
+      }
+    }
     // abort_unless(cond, 403) / abort_if(cond, 403) / throw_unless
     if (fnName && /^(abort_unless|abort_if|throw_unless|throw_if)$/.test(fnName) && n.arguments?.[0]) {
       const positive = /unless/.test(fnName);
@@ -391,21 +512,38 @@ export class ProcessReader {
     else if (n.what?.kind === "staticlookup") subjectModel = this.modelName(n.what.what, names);
     else if (n.what.what?.kind === "variable") subjectModel = types.get(n.what.what.name) ?? null;
     else subjectModel = this.modelOfChain(n.what.what, names, types);
-    const tableSubject = this.tableOfChain(n.what?.what);
+    const table = this.tableOfChain(n.what?.what);
+    const tableSubject = table ? this.modelForTable(table) ?? table : null;
     const subjectBase = subjectModel ?? tableSubject;
 
     if (subjectModel && /^(create|firstOrCreate|updateOrCreate|forceCreate|new|make)$/.test(method)) {
       if (!info.creates.includes(subjectModel)) info.creates.push(subjectModel);
     }
     for (const arg of n.arguments ?? []) {
-      for (const arr of arrays(arg)) {
-        for (const it of arr.items ?? []) {
-          const k = it?.key ? stringValue(it.key) : null;
-          if (!k || !STATUS_COLUMN.test(k)) continue;
-          const v = this.value(it.value, names, selfClass);
-          if (v) info.writes.push({ subject: `${subjectBase ?? ""}.${k}`, to: v, source: { file, line: lineOf(n) } });
-        }
+      for (const entry of entriesOf(arg, locals)) {
+        const k = stringValue(entry.key);
+        if (!k || !STATUS_COLUMN.test(k)) continue;
+        this.recordWrite(info, `${subjectBase ?? ""}.${k}`, k, entry.value, names, selfClass, locals, { file, line: lineOf(n) });
       }
+    }
+  }
+
+  /** UPDATE ... SET status = 'X' in raw SQL; EXEC / CALL of stored procedures. */
+  private readSql(sql: string, info: ProcessInfo, source: { file: string; line?: number }): void {
+    const upd = /\bupdate\s+\[?(?:\w+\]?\.\[?)?(\w+)\]?\s+set\s+([\s\S]+?)(?:\bwhere\b|$)/i.exec(sql);
+    if (upd) {
+      for (const m of upd[2].matchAll(/\[?(\w+)\]?\s*=\s*('([^']*)'|-?\d+|\?|:\w+)/g)) {
+        if (!STATUS_COLUMN.test(m[1])) continue;
+        const subject = `${this.modelForTable(upd[1]) ?? upd[1]}.${m[1]}`;
+        if (m[3] !== undefined || /^-?\d+$/.test(m[2])) {
+          const value = m[3] ?? m[2];
+          info.writes.push({ subject, to: { value, code: m[2], label: m[3] !== undefined ? literalLabel(value) : undefined, labelFrom: m[3] !== undefined ? "literal" : undefined }, source });
+        } else (info.unresolved ??= []).push({ column: subject, code: `SQL parameter ${m[2]}`, source });
+      }
+    }
+    for (const m of sql.matchAll(/\b(?:exec(?:ute)?|call)\s+\[?([\w.\]\[]+)/gi)) {
+      const name = m[1].replace(/[[\]]/g, "");
+      if (!/^(sp_executesql)$/i.test(name)) (info.procedures ??= []).includes(name) || info.procedures!.push(name);
     }
   }
 
@@ -460,7 +598,7 @@ export class ProcessReader {
     let cur = node;
     while (cur) {
       if (cur.kind === "call") {
-        if (cur.what?.kind === "staticlookup" && cur.what.offset?.name === "table" && cur.arguments?.[0]) return stringValue(cur.arguments[0]);
+        if (cur.what?.offset?.name === "table" && cur.arguments?.[0]) return stringValue(cur.arguments[0]);
         cur = cur.what;
       } else if (cur.kind === "propertylookup" || cur.kind === "staticlookup") cur = cur.what;
       else return null;
@@ -513,9 +651,8 @@ export class ProcessReader {
       } else if (lname === "can" || lname === "permission" || lname === "ability" || lname === "abilities") {
         const ability = params.split(",")[0]?.trim();
         if (!ability) continue;
-        const role = this.roleFromName(ability) ?? (/^[a-z]+$/i.test(ability) && !/^(view|create|update|delete|edit|manage|access|read|write)$/i.test(ability) ? ability : null);
-        if (role) out.push(this.actor(role, "middleware", mw));
-      } else if (!STANDARD_MIDDLEWARE.test(lname) && !lname.includes("\\")) {
+        out.push(this.ability(ability, "middleware", mw));
+      } else if (!STANDARD_MIDDLEWARE.test(lname) && !lname.includes("\\") && !AUTH_LIKE.test(name)) {
         const stripped = name.replace(/middleware$/i, "").replace(/^(is|check|ensure|only|must|has|role)[-_.]?/i, "").replace(/^(user)?(is)?/i, "");
         const hadPrefix = stripped.length < name.replace(/middleware$/i, "").length;
         const words = splitWords(stripped);
@@ -539,8 +676,22 @@ export class ProcessReader {
 
   actor(name: string, via: ActorRef["via"], detail: string): ActorRef {
     const display = displayRole(name);
-    if (via !== "name") this.knownRoles.add(display.toLowerCase());
-    return { name: display, via, detail };
+    if (via !== "name") for (const w of splitWords(display)) if (!NOT_ROLES.has(w)) this.knownRoles.add(w);
+    return { name: display, via, detail, kind: "role" };
+  }
+
+  /**
+   * can:X / @can('X') / permission:X. Kebab or snake ability names with a role word
+   * (approve-manager) name a role; anything else is a named permission, kept as written
+   * ("Slide Approve"), because that is how the team knows it.
+   */
+  ability(name: string, via: ActorRef["via"], detail: string): ActorRef {
+    if (/^[a-z0-9]+([-_.][a-z0-9]+)+$/.test(name)) {
+      const role = this.roleFromName(name);
+      if (role) return this.actor(role, via, detail);
+    }
+    if (/^[a-z]+$/.test(name) && (ROLE_WORDS.has(name) || this.knownRoles.has(name))) return this.actor(name, via, detail);
+    return { name, via, detail, kind: "permission" };
   }
 }
 
@@ -560,8 +711,7 @@ export function parseViewConditions(conds: string[], reader: ProcessReader, file
     if (directive) {
       const kind = directive[1].toLowerCase();
       if (kind === "can") {
-        const role = reader.roleFromName(directive[2]);
-        if (role) pushActor(actors, reader.actor(role, "view", `@can('${directive[2]}')`));
+        pushActor(actors, reader.ability(directive[2], "view", `@can('${directive[2]}')`));
       } else {
         for (const r of directive[2].split(/[|,]/).map((s) => s.trim()).filter(Boolean)) pushActor(actors, reader.actor(r, "view", `@${kind}('${r}')`));
       }
@@ -629,6 +779,62 @@ function viewSubject(variable: string, column: string, reader: ProcessReader): s
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+interface Locals {
+  values: Map<string, PhpNode[]>;
+  arrays: Map<string, Array<{ key: PhpNode; value: PhpNode }>>;
+}
+
+/** Key/value entries of array literals in an argument, including arrays built in local variables. */
+function entriesOf(arg: PhpNode, locals: Locals): Array<{ key: PhpNode; value: PhpNode }> {
+  const out: Array<{ key: PhpNode; value: PhpNode }> = [];
+  for (const arr of arrays(arg)) for (const it of arr.items ?? []) if (it?.kind === "entry" && it.key) out.push({ key: it.key, value: it.value });
+  const vars: PhpNode[] = [];
+  walk(arg, (n) => {
+    if (n.kind === "variable") vars.push(n);
+  });
+  for (const v of vars) out.push(...(locals.arrays.get(v.name) ?? []));
+  return out;
+}
+
+/** Leading literal part of a concatenated SQL string. */
+function stringPrefix(n: PhpNode): string | null {
+  if (n?.kind === "bin" && n.type === ".") return stringValue(n.left) ?? stringPrefix(n.left);
+  if (n?.kind === "encapsed") return (n.value ?? []).map((p: PhpNode) => (p?.expression?.kind === "string" ? p.expression.value : "?")).join("");
+  return null;
+}
+
+/** Short source-like text of an expression, for reports. */
+export function exprText(n: PhpNode, depth = 0): string {
+  if (!n || depth > 6) return "…";
+  switch (n.kind) {
+    case "variable":
+      return `$${n.name}`;
+    case "string":
+      return `'${n.value}'`;
+    case "number":
+      return String(n.value);
+    case "boolean":
+      return n.value ? "true" : "false";
+    case "propertylookup":
+    case "nullsafepropertylookup":
+      return `${exprText(n.what, depth + 1)}->${n.offset?.name ?? "…"}`;
+    case "staticlookup":
+      return `${n.what?.name ?? exprText(n.what, depth + 1)}::${n.offset?.name ?? "…"}`;
+    case "offsetlookup":
+      return `${exprText(n.what, depth + 1)}[${exprText(n.offset, depth + 1)}]`;
+    case "call":
+      return `${n.what?.kind === "name" ? n.what.name : exprText(n.what, depth + 1)}(${(n.arguments ?? []).map((a: PhpNode) => exprText(a, depth + 1)).join(", ")})`;
+    case "retif":
+      return `${exprText(n.test, depth + 1)} ? ${exprText(n.trueExpr, depth + 1)} : ${exprText(n.falseExpr, depth + 1)}`;
+    case "bin":
+      return `${exprText(n.left, depth + 1)} ${n.type} ${exprText(n.right, depth + 1)}`;
+    case "name":
+      return n.name;
+    default:
+      return n.kind;
+  }
+}
 
 interface Comparison {
   left: PhpNode;
@@ -754,6 +960,13 @@ function unquote(s: string): string {
   return /^'.*'$|^".*"$/.test(s) ? s.slice(1, -1) : s;
 }
 
+function pluralSnake(short: string): string {
+  const sn = snake(short);
+  if (/(s|x|z|ch|sh)$/.test(sn)) return sn + "es";
+  if (/[^aeiou]y$/.test(sn)) return sn.slice(0, -1) + "ies";
+  return sn + "s";
+}
+
 export function splitWords(s: string): string[] {
   return s
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
@@ -781,8 +994,10 @@ function constLabel(name: string): string {
   return humanize(name.replace(/^(STATUS|STATE|STAGE|STEP|APPROVAL)_/i, ""));
 }
 
+/** APPROVED_MANAGER -> "Approved manager", waiting_approval -> "Waiting approval"; "Hold - Perlu Revisi" stays as written. */
 function literalLabel(v: string): string | undefined {
-  return /^[A-Za-z][A-Za-z0-9_ -]*$/.test(v) ? humanize(v) : undefined;
+  if (/^[A-Z0-9]+(_[A-Z0-9]+)*$/.test(v) || /^[a-z0-9]+([_-][a-z0-9]+)*$/.test(v)) return /[A-Za-z]/.test(v) ? humanize(v) : undefined;
+  return /[A-Za-z]/.test(v) && v.length <= 60 ? v.trim() : undefined;
 }
 
 function columnFromHolder(holder: string): string {

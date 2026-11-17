@@ -30,7 +30,7 @@ describe("process view (actors and status)", () => {
   after(() => rmSync(dir, { recursive: true, force: true }));
 
   it("finds one process per status column that the feature changes", () => {
-    assert.deepEqual(map.processes!.map((p) => p.subject).sort(), ["LeaveRequest.status", "PurchaseRequest.status"]);
+    assert.deepEqual(map.processes!.map((p) => p.subject).sort(), ["LeaveRequest.status", "Presentation.status", "PurchaseRequest.status"]);
   });
 
   it("reads status values written as literals, numbers, constants and enums, with labels from the model", () => {
@@ -69,6 +69,23 @@ describe("process view (actors and status)", () => {
     assert.equal(lane(pr, "menu.purchase-requests.store"), "Signed-in user"); // auth only, never guessed
     const lr = proc("LeaveRequest.status");
     assert.equal(lane(lr, "menu.leave-requests.approve"), "Atasan"); // Auth::user()->jabatan == 'Atasan'
+  });
+
+  it("handles apps that use permissions, history tables and many ways of writing a status", () => {
+    const ps = map.processes!.filter((p) => p.feature === "review");
+    assert.equal(ps.length, 1, "history table and raw table name join the model's process");
+    const p = ps[0];
+    assert.equal(p.subject, "Presentation.status"); // DB::table('presentasi') and raw SQL map to $table = 'presentasi'
+    assert.ok(!p.lanes.some((l) => /login/i.test(l.name)), "isLogin is a login check, not a role");
+    assert.equal(lane(p, "review.presentations.approve"), "Menu Presentasi Approve"); // most specific permission
+    assert.equal(lane(p, "review.presentations.delegate"), "Menu Presentasi");
+    assert.equal(label(p, step(p, "review.presentations.store").to[0]), "Revisi - Menunggu Approval"); // $data['status'], kept as written
+    assert.equal(label(p, step(p, "review.presentations.approve").to[0]), "Finished"); // $status variable via DB::connection()->table()
+    assert.equal(label(p, step(p, "review.presentations.hold").to[0]), "Hold - Perlu Revisi"); // raw SQL UPDATE
+    assert.deepEqual(step(p, "review.presentations.decide").to.map((t) => label(p, t)).sort(), ["Finished", "Hold - Perlu Revisi"]); // ternary
+    const reasons = map.skipped.map((x) => x.reason);
+    assert.ok(reasons.some((r) => r === "Status change not readable yet: Presentation.status = $request->status"), reasons.join("\n"));
+    assert.ok(reasons.some((r) => r.startsWith("Calls stored procedure sp_delegate_presentasi")));
   });
 
   it("renames roles and statuses and reassigns steps through builtlore.edits.yaml", () => {

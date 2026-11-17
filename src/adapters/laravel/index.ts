@@ -223,6 +223,19 @@ export const laravelAdapter: Adapter = {
       e.process = p;
     }
 
+    // 5b. What could not be read is reported, not guessed
+    let unresolved = 0;
+    for (const e of entries) {
+      for (const u of e.process?.unresolved ?? []) {
+        unresolved++;
+        skipped.push({ kind: "skipped", reason: `Status change not readable yet: ${u.column} = ${u.code}`, source: u.source });
+      }
+      for (const sp of e.process?.procedures ?? []) {
+        skipped.push({ kind: "skipped", reason: `Calls stored procedure ${sp}: status changes inside it are not visible in the code`, source: e.handler?.file ? { file: e.handler.file, line: e.handler.line } : e.source });
+      }
+    }
+    if (unresolved) notes.push(`Process: ${unresolved} status change${unresolved === 1 ? "" : "s"} could not be read (value comes from input or an expression). See "Skipped" for the exact lines.`);
+
     // 6. Known states of the models involved
     const models = new Set<string>();
     const noteModel = (subject: string) => {

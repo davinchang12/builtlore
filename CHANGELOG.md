@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## 0.2.0-alpha.1 — 2026-11-16
+
+Fixes from the first run of the Process view on a real 145-route app.
+
+### Fixed
+- **Permissions are not roles.** `can:Slide Approve`, `@can('Menu Presentasi Approve')` and other named permissions become lanes named exactly as the permission. Each step gets one lane: the most specific permission (route-level beats group-level), instead of joining every middleware ("Login / Master / Slide").
+- Custom middleware that only checks login (`isLogin`, `checkSession`, `auth.sso`…) is no longer read as a role.
+- History and log tables (`SlideHistory`, `approval_logs`…) no longer show up as a second, duplicate process.
+- Status names written as sentences (`'Hold - Perlu Revisi'`) are kept exactly as written; only `CONSTANT_STYLE` and `snake_case` values are turned into words.
+- "Revisi - Menunggu Approval" is no longer drawn as a rejection.
+- Status labels no longer overlap: one label where an arrow fans out, one where several arrows arrive, wider columns, lane names wrap.
+
+### Added
+- More ways of writing a status are read: values in local variables (`$status = 'Finished'`), ternaries and `match`, arrays built before saving (`$data['status'] = …`), `DB::connection()->table()`, raw SQL (`UPDATE x SET status = '…'`), PascalCase columns (`StatusApproval`).
+- Table names are matched to models (`$table`, or Laravel's plural convention), so `DB::table('presentasi')` and `Presentation` are one process.
+- **Nothing is silently dropped.** Status changes builtlore cannot read yet (e.g. `$x->status = $request->status`) and stored procedure calls (`EXEC sp_…`) are listed under *Skipped* with file and line, plus a summary in the scan notes.
+
 ## 0.2.0-alpha.0 — 2026-11-16
 
 ### Added

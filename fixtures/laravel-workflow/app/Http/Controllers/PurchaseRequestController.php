@@ -4,7 +4,9 @@ namespace App\Http\Controllers;
 
 use App\Http\Requests\StorePurchaseRequestRequest;
 use App\Models\PurchaseRequest;
+use App\Notifications\PurchaseRequestSubmitted;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Http;
 use Yajra\DataTables\Facades\DataTables;
 
 class PurchaseRequestController extends Controller
@@ -26,6 +28,8 @@ class PurchaseRequestController extends Controller
     public function store(StorePurchaseRequestRequest $request)
     {
         $pr = PurchaseRequest::create($request->validated() + ['status' => PurchaseRequest::STATUS_WAITING_MANAGER]);
+        $pr->manager->notify(new PurchaseRequestSubmitted($pr));
+        Http::withToken(config('services.erp.token'))->post(config('services.erp.url') . '/purchase-requests', $pr->toArray());
 
         return redirect()->route('menu.purchase-requests.show', $pr)->with('success', 'Request submitted.');
     }

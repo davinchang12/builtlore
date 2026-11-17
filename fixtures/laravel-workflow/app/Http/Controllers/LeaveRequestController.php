@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\LeaveRequest;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Storage;
 
 class LeaveRequestController extends Controller
 {
@@ -19,7 +20,14 @@ class LeaveRequestController extends Controller
 
     public function store(Request $request)
     {
-        $leave = LeaveRequest::create($request->validate(['from' => 'required|date', 'to' => 'required|date']));
+        $leave = LeaveRequest::create($request->validate([
+            'from' => 'required|date|after_or_equal:today',
+            'to' => 'required|date|after_or_equal:from',
+            'reason' => 'nullable|string|max:500',
+        ]));
+        if ($request->hasFile('attachment')) {
+            Storage::disk('s3')->put('leave/' . $leave->id, $request->file('attachment'));
+        }
 
         return to_route('menu.leave-requests.show', $leave);
     }
