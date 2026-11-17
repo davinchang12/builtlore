@@ -61,6 +61,8 @@ export class ClassLocator {
       }
     }
     if (!this.psr4.length) this.psr4.push(["App\\", "app/"]);
+    // Modular apps often load Modules\ through a composer merge plugin, not the root composer.json
+    if (!this.psr4.some(([ns]) => ns === "Modules\\") && existsSync(join(root, "Modules"))) this.psr4.push(["Modules\\", "Modules/"]);
     this.psr4.sort((a, b) => b[0].length - a[0].length);
   }
 

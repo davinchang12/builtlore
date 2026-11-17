@@ -14,6 +14,8 @@ export interface Config {
   output: string;
   /** PHP executable for Laravel artisan mode. */
   php?: string;
+  /** Opt-in, read-only: read the database schema and lookup tables through the app itself. */
+  database?: boolean;
 }
 
 export const DEFAULT_CONFIG: Config = { mode: "auto", output: "builtlore.json" };
@@ -56,7 +58,7 @@ export async function scanProject(rootArg: string, overrides: Partial<Config> = 
   for (const adapter of adapters) {
     if (!(await adapter.detect({ root }))) continue;
     stacks.push(adapter.id);
-    const res = await adapter.extract({ root }, { mode: config.mode, php: config.php });
+    const res = await adapter.extract({ root }, { mode: config.mode, php: config.php, db: config.database === true });
     facts.push(...res.facts);
     notes.push(...res.notes);
   }

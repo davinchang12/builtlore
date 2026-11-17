@@ -10,6 +10,7 @@
  */
 import type { BuiltMap, DataColumn, DataTable, Integration, MapNode, ProcessState, SourceRef, Validation } from "../core/types.js";
 import { mermaid, stateGraph, type StateGraph } from "./diagram.js";
+import { ERD_MAX_TABLES, erdMermaid, erdModel, type ErdGroup } from "./erd.js";
 import { areaMap, flowMermaid, processFlow, screenFlow, type FlowGraph } from "./flow.js";
 import { byLabel, CRUD_LABEL, endpoint, finalStates, NEGATIVE, processEdges, short, type CrudOp, type DocFeature, type DocModel, type DocProcess, type DocTransition } from "./model.js";
 
@@ -33,6 +34,8 @@ export type Block =
   | { t: "diagram"; graph: StateGraph; title: string; id: string; mermaid: string }
   /** A flowchart: swimlanes of who does what, screens and actions, or areas. */
   | { t: "flow"; graph: FlowGraph; title: string; caption: string; mermaid: string }
+  /** How a group of tables relate (entity-relationship diagram). */
+  | { t: "erd"; group: ErdGroup; title: string; mermaid: string }
   | { t: "mermaid"; code: string }
   /** A block of text to copy, e.g. YAML to paste into builtlore.edits.yaml. */
   | { t: "code"; lang: string; text: string }
@@ -647,31 +650,74 @@ function validationTable(v: Validation): Block[] {
 
 function dataDictionary(m: DocModel): Page {
   const blocks: Block[] = [];
-  const page = (b: Block[]): Page => ({ file: "data-dictionary.md", id: "data", title: "Data", part: "reference", lead: "Database tables and columns, from the migrations.", blocks: b });
-  if (!m.tables.length) return page([{ t: "note", kind: "info", c: ["No migrations found."] }]);
-  blocks.push({
-    t: "table",
-    head: ["Table", "Model", "Columns", "Note"],
-    rows: m.tables.map((t) => [[{ link: t.name, to: tableAnchor(t.name) }], t.model ? [{ code: t.model }] : [DASH], [String(t.columns.length)], [t.comment ?? (t.partial ? "created elsewhere" : DASH)]]),
-    compact: true,
-  });
-  if (m.relations.length) {
-    blocks.push({ t: "h", level: 2, text: "Relationships", id: "relationships" });
-    const known = new Set(m.tables.map((t) => t.name));
-    const er = ["erDiagram"];
-    for (const { table, column } of m.relations) er.push(`  ${erName(column.references!.table)} ||--o{ ${erName(table)} : "${column.name}"`);
-    blocks.push({ t: "mermaid", code: er.join("\n") });
+  const page = (b: Block[]): Page => ({ file: "data-dictionary.md", id: "data", title: "Data", part: "reference", lead: "Database tables, columns and how they relate, from the migrations and the models.", blocks: b });
+  const rels = m.map.data?.relations ?? [];
+  if (!m.tables.length && !rels.length) return page([{ t: "note", kind: "info", c: ["No migrations or model relations found."] }]);
+  // The list of tables, folded: the pictures of how they relate come first
+  const tableList: Block = m.tables.length
+    ? {
+        t: "details",
+        summary: `All tables (${m.tables.length})`,
+        blocks: [
+          {
+            t: "table",
+            head: ["Table", "Model", "Columns", "Note"],
+            rows: m.tables.map((t) => [[{ link: t.name, to: tableAnchor(t.name) }], t.model ? [{ code: t.model }] : [DASH], [String(t.columns.length)], [t.comment ?? (t.partial ? "created elsewhere" : DASH)]]),
+            compact: true,
+          },
+        ],
+      }
+    : { t: "note", kind: "info", c: ["No migrations found: the tables are known from the relations on the models only."] };
+  if (!rels.length) blocks.push(tableList);
+  if (rels.length) {
+    blocks.push({ t: "h", level: 2, text: "How the tables relate", id: "relationships" });
+    const { groups, hubs } = erdModel(m.map);
+    const known = new Set(m.tables.map((t) => t.name.toLowerCase()));
     blocks.push({
-      t: "list",
-      items: m.relations.map(({ table, column }) => [
-        { code: `${table}.${column.name}` },
-        " → ",
-        { code: `${column.references!.table}.${column.references!.column}` },
-        ...(column.references!.onDelete ? [`, on delete ${column.references!.onDelete}`] : []),
-        ...(column.references!.by === "convention" ? [" ", { i: "(by name)" } as Inline] : []),
-        ...(known.has(column.references!.table) ? [] : [" ", { i: "(not in migrations)" } as Inline]),
-      ]),
+      t: "p",
+      c: [
+        { i: `${rels.length} relation${rels.length === 1 ? "" : "s"}. Crow's foot: the "many" side, which holds the key. Dashed: declared only on a model (no foreign key in the migrations).` },
+      ],
     });
+    // Lookup tables many others point at: a list, so the pictures show what belongs together
+    if (hubs.length) {
+      blocks.push({ t: "p", c: [{ b: "Lookup tables" }, " (pointed at by many tables, left out of the pictures below)"] });
+      blocks.push({
+        t: "list",
+        items: hubs.map((h) => {
+          const by = [...new Set(h.usedBy.map((u) => u.table))];
+          const cols = [...new Set(h.usedBy.flatMap((u) => (u.column ? [u.column] : [])))];
+          return [{ code: h.table }, ` ← ${by.length} tables${cols.length ? ` by ${cols.slice(0, 4).join(", ")}${cols.length > 4 ? ", …" : ""}` : ""}: ${by.slice(0, 8).join(", ")}${by.length > 8 ? ", …" : ""}`];
+        }),
+      });
+    }
+    groups.forEach((g, i) => {
+      const title = groups.length > 1 ? `Group ${i + 1}: ${g.tables.slice(0, 3).map((t) => t.name).join(", ")}${g.tables.length > 3 ? ", …" : ""}` : "Tables";
+      if (groups.length > 1) blocks.push({ t: "p", c: [{ b: title }, ` (${g.tables.length} tables)`] });
+      if (g.tables.length > ERD_MAX_TABLES) blocks.push({ t: "note", kind: "info", c: [`${g.tables.length} tables linked together: too many for one picture. The list below has every relation.`] });
+      else blocks.push({ t: "erd", group: g, title, mermaid: erdMermaid(g) });
+    });
+    blocks.push({
+      t: "details",
+      summary: `Every relation (${rels.length})`,
+      blocks: [
+        {
+          t: "table",
+          head: ["From", "To", "Kind", "Found in"],
+          rows: rels.map((r) => [
+            [{ code: r.column ? `${r.from}.${r.column}` : r.from }, ...(known.has(r.from.toLowerCase()) || !m.tables.length ? [] : [" ", { i: "(not in migrations)" } as Inline])],
+            [{ code: r.via ? `${r.to} via ${r.via}` : r.toColumn ? `${r.to}.${r.toColumn}` : r.to }],
+            [r.kind.replace(/-/g, " ")],
+            [
+              r.found.map((f) => (f === "model" ? `model${r.methods?.length ? ` (${r.methods.join(", ")})` : ""}` : f)).join(", "),
+              ...(r.by === "convention" ? [" ", { i: "(key by Laravel's naming rule)" } as Inline] : []),
+            ],
+          ]),
+          compact: true,
+        },
+      ],
+    });
+    blocks.push(tableList);
   }
   const knownValues = statusValuesByColumn(m);
   for (const t of m.tables) {
@@ -683,6 +729,14 @@ function dataDictionary(m: DocModel): Page {
     const keys = t.columns.filter((c) => c.primary || c.references).map((c) => c.name);
     if (keys.length) meta.push(` · keys: ${keys.join(", ")}`);
     blocks.push({ t: "p", c: meta });
+    // Its relations in words
+    const lower = t.name.toLowerCase();
+    const out = rels.filter((r) => r.from.toLowerCase() === lower);
+    const inc = rels.filter((r) => r.to.toLowerCase() === lower && r.from.toLowerCase() !== lower);
+    const rel: Inline[] = [];
+    if (out.length) rel.push({ b: "Points to" }, ": ", out.map((r) => (r.via ? `${r.to} (via ${r.via})` : `${r.to}${r.column ? ` by ${r.column}` : ""}`)).join(", "));
+    if (inc.length) rel.push(...(out.length ? [" · "] : []), { b: "Pointed at by" }, ": ", [...new Set(inc.map((r) => r.from))].join(", "));
+    if (rel.length) blocks.push({ t: "p", c: rel });
     blocks.push({
       t: "details",
       summary: `Columns (${t.columns.length})`,
@@ -690,10 +744,6 @@ function dataDictionary(m: DocModel): Page {
     });
   }
   return page(blocks);
-}
-
-function erName(s: string): string {
-  return s.replace(/[^A-Za-z0-9_-]/g, "_");
 }
 
 function statusValuesByColumn(m: DocModel): Map<string, ProcessState[]> {

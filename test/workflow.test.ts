@@ -40,7 +40,7 @@ describe("internal approval-workflow app", () => {
   it("gives status actions short labels", () => {
     assert.equal(node("menu.purchase-requests.status.approve-manager")?.label, "Approve manager");
     assert.equal(node("menu.leave-requests.approve")?.label, "Approve");
-    assert.equal(map.features.find((f) => f.id === "menu.purchaserequest")?.name, "Menu › Purchase request");
+    assert.equal(map.features.find((f) => f.id === "menu.purchaserequest")?.name, "Menu › Purchase requests", "named as its menu item");
   });
 
   it("classifies JSON reads as data endpoints and exports as downloads", () => {

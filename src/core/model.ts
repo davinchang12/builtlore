@@ -8,19 +8,23 @@ import type {
   BuiltMap,
   CommandFact,
   ConfigFact,
+  DataTable,
   EntryFact,
   Fact,
   Feature,
   Integration,
   IntegrationFact,
   JobFact,
+  LabelFact,
   MapEdge,
   MapNode,
   NavigatesFact,
+  RelationFact,
   ScheduleFact,
   SkippedFact,
   StatesFact,
   TableFact,
+  TableRelation,
 } from "./types.js";
 
 const AUTH_NAMES = /^(login|logout|register|password|verification|two-factor|auth|sanctum)(\.|$)/;
@@ -55,7 +59,9 @@ export function buildMap(input: {
     const node: MapNode = {
       id: e.id,
       type: e.type,
-      label: labelOf(e, feature, display.get(feature) ?? featureName(feature)),
+      // The words people see (menu, page title, button) beat a name made from the route
+      label: e.ui?.text ?? labelOf(e, feature, display.get(feature) ?? featureName(feature)),
+      ...(e.ui ? { labelFrom: { from: e.ui.from, source: e.ui.source } } : {}),
       methods: e.methods,
       uri: e.uri,
       name: e.name,
@@ -105,10 +111,17 @@ export function buildMap(input: {
     if (!byFeature.has(n.feature)) byFeature.set(n.feature, []);
     byFeature.get(n.feature)!.push(n);
   }
+  // A feature reached from exactly one menu item is called what the menu calls it (keeping its area)
+  const menuName = (id: string, ns: MapNode[]): string | null => {
+    const texts = [...new Set(ns.filter((n) => n.labelFrom?.from === "menu").map((n) => n.label))];
+    if (texts.length !== 1) return null;
+    const base = display.get(id) ?? featureName(id);
+    return base.includes(" › ") ? `${base.split(" › ")[0]} › ${texts[0]}` : texts[0];
+  };
   const features: Feature[] = [...byFeature.entries()]
     .map(([id, ns]) => ({
       id,
-      name: display.get(id) ?? featureName(id),
+      name: menuName(id, ns) ?? display.get(id) ?? featureName(id),
       nodes: ns.map((n) => n.id),
       files: [...new Set(ns.flatMap((n) => [n.handler?.file, n.view?.file].filter((f): f is string => Boolean(f))))].sort(),
       provenance: "extracted" as const,
@@ -121,9 +134,11 @@ export function buildMap(input: {
     states: input.facts.filter((f): f is StatesFact => f.kind === "states"),
     nodes,
     features,
+    labels: input.facts.filter((f): f is LabelFact => f.kind === "label"),
   });
 
   const tables = input.facts.filter((f): f is TableFact => f.kind === "table").map((f) => f.table);
+  const relations = tableRelations(tables, input.facts.filter((f): f is RelationFact => f.kind === "relation").map((f) => f.relation));
   const schedule = input.facts.filter((f): f is ScheduleFact => f.kind === "schedule").map((f) => f.task);
   const commands = input.facts.filter((f): f is CommandFact => f.kind === "command").map((f) => f.command);
   const jobs = input.facts.filter((f): f is JobFact => f.kind === "job").map((f) => f.job);
@@ -148,7 +163,7 @@ export function buildMap(input: {
     skipped,
     notes: input.notes,
     ...(processes.length ? { processes } : {}),
-    ...(tables.length ? { data: { tables } } : {}),
+    ...(tables.length || relations.length ? { data: { tables, ...(relations.length ? { relations } : {}) } } : {}),
     ...(schedule.length || commands.length || jobs.length ? { automation: { schedule, commands, jobs } } : {}),
     ...(integrations.length ? { integrations } : {}),
     ...(config.length ? { config } : {}),
@@ -162,6 +177,35 @@ function reachedBy(entries: EntryFact[]): Map<string, Array<{ id: string; dead: 
     for (const r of e.calls ?? []) out.set(r.method, [...(out.get(r.method) ?? []), { id: e.id, dead: new Set(r.dead ?? []) }]);
   }
   return out;
+}
+
+/**
+ * How tables relate: foreign keys from migrations, joined with the relations models declare
+ * (one relation per foreign key, whichever side declares it, with every place it was found).
+ */
+function tableRelations(tables: DataTable[], declared: TableRelation[]): TableRelation[] {
+  const out: TableRelation[] = [];
+  const key = (r: Pick<TableRelation, "from" | "column" | "to" | "via">) =>
+    r.via ? `m2m|${[r.from.toLowerCase(), r.to.toLowerCase()].sort().join("|")}|${r.via.toLowerCase()}` : `${r.from.toLowerCase()}|${(r.column ?? "").toLowerCase()}|${r.to.toLowerCase()}`;
+  const add = (r: TableRelation) => {
+    const same = out.find((x) => key(x) === key(r));
+    if (!same) {
+      out.push({ ...r, found: [...r.found], ...(r.methods ? { methods: [...r.methods] } : {}) });
+      return;
+    }
+    for (const f of r.found) if (!same.found.includes(f)) same.found.push(f);
+    for (const m of r.methods ?? []) if (!(same.methods ??= []).includes(m)) same.methods.push(m);
+    if (r.kind === "one-to-one") same.kind = "one-to-one";
+    if (r.by === "explicit") same.by = "explicit";
+  };
+  for (const t of tables) {
+    for (const c of t.columns) {
+      if (!c.references) continue;
+      add({ from: t.name, column: c.name, to: c.references.table, toColumn: c.references.column, kind: c.unique ? "one-to-one" : "one-to-many", found: ["migration"], by: c.references.by, source: c.source });
+    }
+  }
+  for (const r of declared) add(r);
+  return out.sort((a, b) => a.from.localeCompare(b.from) || a.to.localeCompare(b.to));
 }
 
 /** Steps a person performs: form submits, writes and exports (not pages or data reads). */

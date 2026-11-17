@@ -6,7 +6,7 @@
  * prefix/name/as/middleware/controller chains, and require/include of other
  * route files. Anything that cannot be resolved is reported as skipped.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import type { HttpMethod, SkippedFact } from "../../core/types.js";
 import {
@@ -75,6 +75,20 @@ export function extractRoutesStatic(root: string): StaticRouteResult {
     { path: join(root, "routes/web.php"), kind: "web", ctx: { prefix: "", namePrefix: "", middleware: ["web"] } },
     { path: join(root, "routes/api.php"), kind: "api", ctx: { prefix: "api", namePrefix: "", middleware: ["api"] } },
   ];
+  // Modular apps (nwidart/laravel-modules and similar): Modules/<Name>/Routes|routes/web.php, api.php
+  for (const base of ["Modules", "modules", "app/Modules"]) {
+    const dir = join(root, base);
+    if (!existsSync(dir)) continue;
+    for (const mod of readdirSync(dir).sort()) {
+      if (!statSync(join(dir, mod)).isDirectory()) continue;
+      for (const sub of ["Routes", "routes"]) {
+        const web = join(dir, mod, sub, "web.php");
+        const api = join(dir, mod, sub, "api.php");
+        if (existsSync(web)) entryFiles.push({ path: web, kind: "web", ctx: { prefix: "", namePrefix: "", middleware: ["web"] } });
+        if (existsSync(api)) entryFiles.push({ path: api, kind: "api", ctx: { prefix: "api", namePrefix: "", middleware: ["api"] } });
+      }
+    }
+  }
 
   for (const f of entryFiles) {
     if (existsSync(f.path)) processFile(f.path, f.kind, f.ctx);

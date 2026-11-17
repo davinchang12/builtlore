@@ -40,6 +40,8 @@ export interface EntryFact {
   calls?: Reach[];
   /** Abilities a page handler checks and hands to its view (to show or hide buttons), not enforced. */
   pageAbilities?: string[];
+  /** What people see it called: the menu item, the page title, the submit button. */
+  ui?: { text: string; from: "menu" | "title" | "button"; source: SourceRef };
 }
 
 /** An action the server does not check permissions for, while the page that calls it does. */
@@ -115,6 +117,40 @@ export interface DataTable {
 export interface TableFact {
   kind: "table";
   table: DataTable;
+}
+
+/** How two tables relate: a foreign key, or a relation declared on a model. */
+export interface TableRelation {
+  /** Table holding the foreign key (the "many" side). */
+  from: string;
+  column?: string;
+  to: string;
+  toColumn?: string;
+  kind: "one-to-many" | "one-to-one" | "many-to-many";
+  /** Pivot table of a many-to-many relation. */
+  via?: string;
+  /** Where builtlore read it: a migration's foreign key, a model's relation method, the database itself. */
+  found: Array<"migration" | "model" | "database">;
+  /** "convention": the key was left out and is named by Laravel's rules. */
+  by: "explicit" | "convention";
+  /** Model methods that declare it ("Order::items()"). */
+  methods?: string[];
+  source: SourceRef;
+}
+
+export interface RelationFact {
+  kind: "relation";
+  relation: TableRelation;
+}
+
+/** How a view names a status value: @if ($x->status == 'H') On hold. */
+export interface LabelFact {
+  kind: "label";
+  /** Column as written in the view. */
+  column: string;
+  value: string;
+  label: string;
+  source: SourceRef;
 }
 
 export interface ScheduledTask {
@@ -349,6 +385,8 @@ export type Fact =
   | SkippedFact
   | StatesFact
   | TableFact
+  | RelationFact
+  | LabelFact
   | ScheduleFact
   | CommandFact
   | JobFact
@@ -377,6 +415,8 @@ export interface ExtractOptions {
   mode: "auto" | "static" | "artisan";
   /** PHP executable for artisan mode (default: "php" on PATH). */
   php?: string;
+  /** Opt-in, read-only: boot the app to read the database schema and lookup tables. */
+  db?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +448,8 @@ export interface MapNode {
   who?: ProcessLane;
   /** No permission check on the server, but the page that calls it checks these before showing its buttons. */
   pageOnly?: PageOnlyCheck;
+  /** Where the label comes from when it is the text people see (menu, page title, button); absent: from the route name. */
+  labelFrom?: { from: "menu" | "title" | "button"; source: SourceRef };
   validation?: Validation[];
   inputs?: string[];
   responds?: ResponseKind[];
@@ -455,8 +497,8 @@ export interface BuiltMap {
   glossary?: Record<string, string>;
   /** Business processes: who does each step and how the status changes. */
   processes?: Process[];
-  /** Tables and columns from migrations. */
-  data?: { tables: DataTable[] };
+  /** Tables and columns from migrations; how tables relate (foreign keys and model relations). */
+  data?: { tables: DataTable[]; relations?: TableRelation[] };
   /** Scheduler, console commands and queued jobs. */
   automation?: { schedule: ScheduledTask[]; commands: ConsoleCommand[]; jobs: QueuedJob[] };
   /** External systems the app talks to: HTTP APIs, mail, notifications, file storage. */

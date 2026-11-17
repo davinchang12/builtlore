@@ -365,9 +365,9 @@ Provenance values: `extracted` (from code, deterministic) · `inferred` (from LL
 | `builtlore serve` | Scan and serve the canvas on 127.0.0.1 with editing on; saves to `builtlore.edits.yaml` |
 | `builtlore docs` | Scan and write the documentation: Markdown into `docs/builtlore/` plus a printable `index.html` |
 | `builtlore diff [base] [head]` | Behaviour changes between two versions, in words (steps, who, status flow, rules, integrations, data, automation, configuration). A side is a git ref (scanned in a temporary worktree) or a `builtlore.json`; defaults `HEAD` → working folder; `--md` for pull requests |
-| `builtlore check` | CI mode: exit non-zero if the committed map is out of date |
+| `builtlore check` | CI mode: exit non-zero if the committed map is out of date, or (`--base`, `--fail-on open,page-only,unvalidated`) when a change adds new risks |
 
-Implemented: `init`, `scan`, `view`, `serve`, `docs`, `diff` (0.3), flags `--mode auto|static|artisan`, `--out`, `--open`, `--php <path>`, `--port`, `--md`, `--project`.
+Implemented: `init`, `scan`, `view`, `serve`, `docs`, `diff`, `check` (0.3), flags `--mode auto|static|artisan`, `--out`, `--open`, `--php <path>`, `--port`, `--md`, `--project`, `--base`, `--fail-on`, `--db` (opt-in, read-only database layer through the app's own Laravel boot).
 Planned flags: `--no-ai` (becomes meaningful once the AI pass exists; v0.1 is fully deterministic), `--since <ref>` (incremental), `--provider`, `--model`, `--workspace <file>` (named sets of projects).
 
 ---

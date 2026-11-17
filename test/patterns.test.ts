@@ -1185,6 +1185,263 @@ Route::prefix('master')->name('master.')->middleware('auth')->group(function () 
   });
 });
 
+describe("optional database layer (--db)", () => {
+  const files = {
+    "routes/web.php": `<?php
+use App\\Http\\Controllers\\RequestController;
+use Illuminate\\Support\\Facades\\Route;
+Route::post('/requests/{id}/hold', [RequestController::class, 'hold'])->name('requests.hold');
+`,
+    "app/Models/TRequest.php": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass TRequest extends Model { protected $table = 'T_Request'; public function state() { return $this->belongsTo(MStatus::class, 'Status', 'status'); } }\n",
+    "app/Models/MStatus.php": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass MStatus extends Model { protected $table = 'M_Status'; }\n",
+    "app/Http/Controllers/RequestController.php": `<?php
+namespace App\\Http\\Controllers;
+use Illuminate\\Support\\Facades\\DB;
+class RequestController extends Controller {
+    public function hold($id) { DB::table('T_Request')->where('id', $id)->update(['Status' => 'H']); return back(); }
+}
+`,
+  };
+
+  it("names statuses from the lookup table their column points at, and adds the database's tables and keys", async () => {
+    const dir = project(files);
+    const snap = join(dir, "snapshot.json");
+    writeFileSync(snap, JSON.stringify({
+      driver: "sqlsrv",
+      tables: [
+        { name: "T_Request", columns: [{ name: "id", type: "int", nullable: false }, { name: "Status", type: "varchar", nullable: true }, { name: "SiteId", type: "int", nullable: true }], foreignKeys: [{ columns: ["SiteId"], foreignTable: "M_Site", foreignColumns: ["id"] }] },
+        { name: "M_Status", columns: [{ name: "status", type: "varchar", nullable: false }, { name: "Keterangan", type: "varchar", nullable: true }], foreignKeys: [] },
+        { name: "M_Site", columns: [{ name: "id", type: "int", nullable: false }], foreignKeys: [] },
+      ],
+      lookups: [{ table: "M_Status", key: "status", labelColumn: "Keterangan", rows: [["H", "On hold"], ["A", "Approved"]] }],
+    }));
+    process.env.BUILTLORE_DB_SNAPSHOT = snap;
+    try {
+      const map = (await scanProject(dir, { mode: "static", database: true }, { write: false })).map;
+      const p = map.processes!.find((x) => x.subject === "TRequest.Status")!;
+      assert.equal(p.states.find((s) => s.value === "H")?.label, "On hold");
+      assert.ok(map.data!.tables.some((t) => t.name === "M_Site" && /database/.test(t.comment ?? "")));
+      assert.ok(map.data!.relations!.some((r) => r.from === "T_Request" && r.to === "M_Site" && r.found.includes("database")));
+      assert.ok(map.notes.some((n) => /^Database \(sqlsrv, read-only\)/.test(n)), map.notes.join("\n"));
+    } finally {
+      delete process.env.BUILTLORE_DB_SNAPSHOT;
+    }
+  });
+
+  it("says so and goes on from the code when it cannot read the database", async () => {
+    const map = (await scanProject(project(files), { mode: "static", database: true }, { write: false })).map;
+    assert.ok(map.notes.some((n) => /^Database: not read \(vendor\/ is missing/.test(n)), map.notes.join("\n"));
+    assert.ok(map.processes!.some((x) => x.subject === "TRequest.Status"));
+  });
+});
+
+describe("other ways to build a Laravel app", () => {
+  it("reads routes, controllers, models and views of modules (Modules/<Name>)", async () => {
+    const map = await scan({
+      "Modules/Billing/Routes/web.php": `<?php
+use Modules\\Billing\\Http\\Controllers\\InvoiceController;
+use Illuminate\\Support\\Facades\\Route;
+Route::get('/invoices', [InvoiceController::class, 'index'])->name('billing.invoices.index');
+Route::post('/invoices/{invoice}/pay', [InvoiceController::class, 'pay'])->name('billing.invoices.pay');
+`,
+      "Modules/Billing/Entities/Invoice.php": "<?php\nnamespace Modules\\Billing\\Entities;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass Invoice extends Model {}\n",
+      "Modules/Billing/Http/Controllers/InvoiceController.php": `<?php
+namespace Modules\\Billing\\Http\\Controllers;
+use Illuminate\\Routing\\Controller;
+use Modules\\Billing\\Entities\\Invoice;
+class InvoiceController extends Controller {
+    public function index() { return view('billing::invoices.index'); }
+    public function pay(Invoice $invoice) { $invoice->status = 'paid'; $invoice->save(); return back(); }
+}
+`,
+      "Modules/Billing/Resources/views/invoices/index.blade.php": `<form method="POST" action="{{ route('billing.invoices.pay', 1) }}">@csrf<button>Mark paid</button></form>\n`,
+    });
+    assert.ok(map.nodes.some((n) => n.id === "route:billing.invoices.pay"));
+    assert.ok(map.edges.some((e) => e.from === "route:billing.invoices.index" && e.to === "route:billing.invoices.pay"), "the module's view is read");
+    assert.ok(map.processes!.some((p) => p.subject === "Invoice.status"), map.processes!.map((p) => p.subject).join(", "));
+  });
+
+  it("reads a Livewire page and the methods its view calls as actions", async () => {
+    const map = await scan({
+      "routes/web.php": `<?php
+use App\\Livewire\\Orders\\Board;
+use Illuminate\\Support\\Facades\\Route;
+Route::get('/orders', Board::class)->name('orders.board')->middleware('auth');
+`,
+      "app/Models/Order.php": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass Order extends Model {}\n",
+      "app/Livewire/Orders/Board.php": `<?php
+namespace App\\Livewire\\Orders;
+use App\\Models\\Order;
+use Livewire\\Component;
+class Board extends Component {
+    public Order $order;
+    public function approve() { $this->order->status = 'approved'; $this->order->save(); }
+    public function helper() {}
+    public function render() { return view('livewire.orders.board'); }
+}
+`,
+      "resources/views/livewire/orders/board.blade.php": `<div><button wire:click="approve">Approve</button><button wire:click="$refresh">Reload</button></div>\n`,
+    });
+    const page = map.nodes.find((n) => n.id === "route:orders.board")!;
+    assert.equal(page.type, "page");
+    assert.ok(!map.skipped.some((s) => /Controller not found/.test(s.reason)));
+    const action = map.nodes.find((n) => n.id === "livewire:orders.board.approve")!;
+    assert.ok(action, map.nodes.map((n) => n.id).join(", "));
+    assert.ok(!map.nodes.some((n) => n.id === "livewire:orders.board.helper"), "only methods the view calls");
+    assert.ok(map.edges.some((e) => e.from === page.id && e.to === action.id));
+    assert.deepEqual(map.processes!.find((p) => p.subject === "Order.status")!.steps.find((s) => s.node === action.id)!.to.map((id) => id.split("=")[1]), ["approved"]);
+  });
+
+  it("reads where an Inertia page sends the user (router.post, form.put, Link)", async () => {
+    const map = await scan({
+      "routes/web.php": `<?php
+use App\\Http\\Controllers\\PostController;
+use Illuminate\\Support\\Facades\\Route;
+Route::get('/posts', [PostController::class, 'index'])->name('posts.index');
+Route::get('/posts/{post}', [PostController::class, 'show'])->name('posts.show');
+Route::post('/posts', [PostController::class, 'store'])->name('posts.store');
+`,
+      "app/Http/Controllers/PostController.php": `<?php
+namespace App\\Http\\Controllers;
+use Inertia\\Inertia;
+class PostController extends Controller {
+    public function index() { return Inertia::render('Posts/Index'); }
+    public function show($id) { return Inertia::render('Posts/Show'); }
+    public function store() { return redirect()->route('posts.index'); }
+}
+`,
+      "resources/js/Pages/Posts/Index.vue": `<template><Link :href="route('posts.show', post.id)">Open</Link></template>
+<script setup>
+const form = useForm({ title: '' });
+const save = () => form.post(route('posts.store'));
+</script>
+`,
+    });
+    const e = (to: string) => map.edges.find((x) => x.from === "route:posts.index" && x.to === `route:${to}`);
+    assert.equal(e("posts.show")?.trigger, "link");
+    assert.equal(e("posts.store")?.trigger, "submit");
+  });
+});
+
+describe("names read from what people see", () => {
+  let map: BuiltMap;
+  before(async () => {
+    map = await scan({
+      "routes/web.php": `<?php
+use App\\Http\\Controllers\\TicketController;
+use Illuminate\\Support\\Facades\\Route;
+Route::get('/tickets', [TicketController::class, 'index'])->name('tickets.index');
+Route::get('/tickets/{ticket}', [TicketController::class, 'show'])->name('tickets.show');
+Route::post('/tickets/{ticket}/park', [TicketController::class, 'park'])->name('tickets.park');
+Route::post('/tickets/{ticket}/close', [TicketController::class, 'close'])->name('tickets.close');
+`,
+      "app/Models/Ticket.php": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass Ticket extends Model {}\n",
+      "app/Http/Controllers/TicketController.php": `<?php
+namespace App\\Http\\Controllers;
+use App\\Models\\Ticket;
+class TicketController extends Controller {
+    public function index() { return view('tickets.index'); }
+    public function show(Ticket $ticket) { return view('tickets.show', compact('ticket')); }
+    public function park(Ticket $ticket) { $ticket->status = 'P'; $ticket->save(); return back(); }
+    public function close(Ticket $ticket) { $ticket->status = 'C'; $ticket->save(); return back(); }
+}
+`,
+      "resources/views/layouts/sidebar.blade.php": `<nav><a href="{{ route('tickets.index') }}"><i class="fa fa-ticket"></i> Support tickets</a></nav>\n`,
+      "resources/views/tickets/index.blade.php": `@extends('layouts.app')
+@section('title', 'All tickets')
+<table><tr><td>
+@if ($ticket->status == 'P')
+  <span class="badge">Parked</span>
+@elseif ($ticket->status == 'X')
+  <button>Reopen</button>
+@endif
+</td></tr></table>
+<script>
+function badge(row) {
+  switch (row.status) {
+    case 'C': return '<span class="badge bg-dark">Closed by agent</span>';
+  }
+}
+</script>
+`,
+      "resources/views/tickets/show.blade.php": `<h2>Ticket {{ $ticket->id }}</h2>
+<form method="POST" action="{{ route('tickets.park', $ticket) }}">@csrf<button type="submit">Park ticket</button></form>
+<form method="POST" action="{{ route('tickets.close', $ticket) }}">@csrf<button type="submit">Save</button></form>
+`,
+    });
+  });
+  const node = (id: string) => map.nodes.find((n) => n.id === `route:${id}`)!;
+  const label = (v: string) => map.processes!.find((p) => p.subject === "Ticket.status")!.states.find((s) => s.value === v)?.label;
+
+  it("names status codes the way the views show them (@if branches, script switch)", () => {
+    assert.equal(label("P"), "Parked");
+    assert.equal(label("C"), "Closed by agent");
+  });
+
+  it("names screens by their menu item and actions by their button, not generic words", () => {
+    assert.equal(node("tickets.index").label, "Support tickets");
+    assert.equal(node("tickets.index").labelFrom?.from, "menu");
+    assert.equal(node("tickets.park").label, "Park ticket");
+    assert.equal(node("tickets.close").labelFrom, undefined, "'Save' says nothing about the step");
+    assert.equal(map.features.find((f) => f.nodes.includes("route:tickets.index"))!.name, "Support tickets");
+  });
+});
+
+describe("how tables relate (ERD)", () => {
+  it("joins migration foreign keys with model relations and draws one diagram per group", async () => {
+    const model = (cls: string, body: string, table?: string) =>
+      `<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass ${cls} extends Model {${table ? ` protected $table = '${table}';` : ""}\n${body}\n}\n`;
+    const map = await scan({
+      "database/migrations/2024_01_01_000000_create_orders.php": migration(`
+        Schema::create('customers', function (Blueprint $table) { $table->id(); $table->string('name'); });
+        Schema::create('orders', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('customer_id')->constrained();
+            $table->string('status');
+        });`),
+      "app/Models/Customer.php": model("Customer", "public function orders() { return $this->hasMany(Order::class); }"),
+      "app/Models/Order.php": model("Order", "public function customer() { return $this->belongsTo(Customer::class); }\npublic function items() { return $this->hasMany(OrderItem::class, 'order_no', 'no'); }\npublic function tags() { return $this->belongsToMany(Tag::class); }"),
+      "app/Models/OrderItem.php": model("OrderItem", "", "T_OrderItem"),
+      "app/Models/Tag.php": model("Tag", ""),
+    });
+    const rels = map.data!.relations!;
+    const fk = rels.find((r) => r.from === "orders" && r.to === "customers")!;
+    assert.deepEqual(fk.found.sort(), ["migration", "model"], "the migration's key and both model methods are one relation");
+    assert.deepEqual(fk.methods!.sort(), ["Customer::orders()", "Order::customer()"]);
+    const items = rels.find((r) => r.from === "T_OrderItem")!;
+    assert.equal(items.column, "order_no");
+    assert.equal(items.toColumn, "no");
+    assert.deepEqual(items.found, ["model"]);
+    const m2m = rels.find((r) => r.kind === "many-to-many")!;
+    assert.equal(m2m.via, "order_tag", "pivot named by Laravel's rule");
+    assert.equal(m2m.by, "convention");
+
+    const { renderDocs } = await import("../src/docs/index.js");
+    const docs = await renderDocs(map);
+    const data = docs.markdown.get("data-dictionary.md")!;
+    assert.match(data, /## How the tables relate/);
+    assert.match(data, /```mermaid\nerDiagram[\s\S]*customers \|\|--o\{ orders : "customer_id"/);
+    assert.match(data, /orders }o--o\{ tags : "via order_tag"/);
+    assert.match(data, /\*\*Points to\*\*: customers by customer_id/);
+    assert.match(docs.html, /<svg class="erd/);
+  });
+
+  it("lists lookup tables that many others point at instead of drawing every arrow", async () => {
+    const files: Record<string, string> = {
+      "app/Models/Employee.php": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass Employee extends Model {}\n",
+    };
+    for (const n of ["Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta"]) {
+      files[`app/Models/${n}.php`] = `<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass ${n} extends Model { public function owner() { return $this->belongsTo(Employee::class, 'owner_nik', 'nik'); } }\n`;
+    }
+    const map = await scan(files);
+    const { erdModel } = await import("../src/docs/erd.js");
+    const { groups, hubs } = erdModel(map);
+    assert.equal(hubs[0].table, "employees");
+    assert.equal(hubs[0].usedBy.length, 6);
+    assert.equal(groups.length, 0, "with the lookup listed, nothing is left to draw");
+  });
+});
+
 describe("branches decided by the values passed in", () => {
   let map: BuiltMap;
   before(async () => {

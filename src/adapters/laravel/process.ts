@@ -322,7 +322,7 @@ export class ProcessReader {
         for (const name of readdirSync(dir)) {
           const full = join(dir, name);
           if (statSync(full).isDirectory()) visit(full, `${ns}${name}\\`, depth + 1);
-          else if (name.endsWith(".php")) {
+          else if (name.endsWith(".php") && !name.endsWith(".blade.php")) {
             const s = name.slice(0, -4);
             const list = this.shortIndex!.get(s) ?? [];
             list.push(`${ns}${s}`);
@@ -331,6 +331,8 @@ export class ProcessReader {
         }
       };
       visit(appDir, "App\\", 0);
+      // Modular apps: Modules/Blog/Entities/Post.php -> Modules\Blog\Entities\Post
+      visit(join(this.root, "Modules"), "Modules\\", 0);
     }
     return this.shortIndex.get(short) ?? [];
   }
@@ -361,6 +363,12 @@ export class ProcessReader {
     if (info?.table) return info.table;
     const short = fqcn.split("\\").pop();
     return short ? pluralSnake(short) : null;
+  }
+
+  /** Every Eloquent model class under app/. */
+  allModels(): string[] {
+    this.findShort("__index__");
+    return [...(this.shortIndex?.values() ?? [])].flat().filter((fq) => this.classInfo(fq)?.isModel).sort();
   }
 
   modelFor(short: string): string | null {

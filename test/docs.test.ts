@@ -221,7 +221,7 @@ describe("builtlore docs output", () => {
   it("draws the status lifecycle with Mermaid, including changes made by jobs", () => {
     const pr = read("features/menu-purchaserequest.md");
     assert.ok(pr.includes("```mermaid\nstateDiagram-v2"));
-    assert.ok(pr.includes("[*] --> s0 : Save purchase request (Signed-in user)"));
+    assert.ok(pr.includes("[*] --> s0 : Submit request (Signed-in user)"), "named by the form's button");
     assert.ok(pr.includes("s0 : Waiting for manager"));
     const leave = read("features/menu-leaverequest.md");
     assert.match(leave, /--> s\d : Job ExpireLeaveRequests \(every hour\)/);
@@ -272,23 +272,23 @@ describe("builtlore docs output", () => {
 
   it("starts with the main processes and who uses the system, in plain words", () => {
     const readme = read("README.md");
-    assert.ok(readme.includes("[Menu › Purchase request](features/menu-purchaserequest.md): **Waiting for manager** → **Approved by manager** → **Approved by procurement**"));
-    assert.ok(readme.includes("[Manager](roles.md#role-manager): Approve manager, Hold manager"));
+    assert.ok(readme.includes("[Menu › Purchase requests](features/menu-purchaserequest.md): **Waiting for manager** → **Approved by manager** → **Approved by procurement**"));
+    assert.ok(readme.includes("[Manager](roles.md#role-manager): Approve manager, Hold"));
     assert.ok(readme.includes("**Understand the system**") && readme.includes("**Reference**") && readme.includes("**Health**"));
   });
 
   it("tells each process as numbered steps, then the other paths", () => {
     const pr = read("features/menu-purchaserequest.md");
-    assert.ok(pr.includes("1. **Signed-in user**: Save purchase request → **Waiting for manager**"));
+    assert.ok(pr.includes("1. **Signed-in user**: Submit request → **Waiting for manager**"));
     assert.ok(pr.includes("2. **Manager**: Approve manager → **Approved by manager**"));
     assert.ok(pr.includes("3. **Procurement**: Approve → **Approved by procurement**"));
-    assert.ok(pr.includes("- **Manager**: Hold manager when **Waiting for manager** → **On hold**"));
+    assert.ok(pr.includes("- **Manager**: Hold when **Waiting for manager** → **On hold**"));
     assert.ok(read("features/menu-leaverequest.md").includes("- **Automatic**: Job ExpireLeaveRequests, every hour when **Pending** → **Rejected**"));
   });
 
   it("folds developer details away and lists each role's actions", () => {
     assert.ok(read("features/menu-purchaserequest.md").includes("<summary>For developers: routes, screens, files</summary>"));
-    assert.ok(read("roles.md").includes("- **Menu › Purchase request**: Approve manager, Hold manager"));
+    assert.match(read("roles.md"), /- \*\*Menu › Purchase requests\*\*: Approve manager, Hold/, "the feature is named as its menu item");
     const html = read("index.html");
     assert.ok(html.includes('<input id="q" type="search"'), "search box");
     assert.ok(html.includes('addEventListener("beforeprint"'), "folded sections open when printing");

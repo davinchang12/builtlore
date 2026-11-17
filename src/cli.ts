@@ -6,6 +6,7 @@ import { parseArgs } from "node:util";
 import { adapters } from "./adapters/index.js";
 import { detectStacks, scanProject, writeHtml, DEFAULT_CONFIG, loadConfig, type ScanResult } from "./core/scan.js";
 import { serveProject } from "./core/serve.js";
+import { CHECK_RULES, checkMarkdown, checkText, runCheck, type CheckRule } from "./core/check.js";
 import { diffMaps, diffMarkdown, diffText, loadSide } from "./core/diff.js";
 import { missingText } from "./docs/content.js";
 import { DEFAULT_DOCS_DIR, writeDocs } from "./docs/index.js";
@@ -29,12 +30,16 @@ Usage
                                         integrations, data, automation, configuration.
                                         base/head: a git ref (scanned in a temporary worktree) or a
                                         builtlore.json file. Defaults: base HEAD, head = working folder.
+  builtlore check [path]                For CI: fail when the committed builtlore.json is out of date,
+                                        or (with --base and --fail-on) when a change adds new risks.
 
 Scan options
   --mode <auto|static|artisan>         Laravel: artisan (exact, needs PHP + vendor/), static (no PHP), auto (default)
   --out <file>                         Output JSON path relative to the project (default: builtlore.json)
   --php <path>                         PHP executable for artisan mode (default: php on PATH; or set BUILTLORE_PHP)
   --open                               Open the canvas after scanning (single project only)
+  --db                                 Opt-in, read-only: boot the app to read its database schema and status lookup
+                                       tables (needs PHP and vendor/; Laravel reads .env, builtlore never does)
 
 Docs options
   --out <dir>                          Docs folder relative to the project (default: docs/builtlore)
@@ -46,12 +51,19 @@ Diff options
   --md <file>                          Also write the report as Markdown (for a pull request)
   (both sides are scanned in static mode unless --mode is given)
 
+Check options
+  --base <ref|file>                    What to compare with (default: the committed builtlore.json)
+  --fail-on <rules>                    Comma list: changes (default), open, page-only, unvalidated.
+                                       open/page-only/unvalidated fail only on findings the base did not have
+  --md <file>                          Also write the report as Markdown (for a pull request comment)
+
 Examples
   builtlore scan
   builtlore scan ~/work/project-1 ~/work/project-2
   builtlore view ~/work/project-1
   builtlore docs --open
   builtlore diff main --md builtlore-diff.md
+  builtlore check --base origin/main --fail-on open,page-only --md builtlore-check.md
 
 Supported stacks: ${adapters.map((a) => a.name).join(", ")} (Go, Next.js and Flutter are planned)
 `;
@@ -67,6 +79,9 @@ async function main(argv: string[]): Promise<number> {
       port: { type: "string" },
       md: { type: "string" },
       project: { type: "string" },
+      base: { type: "string" },
+      "fail-on": { type: "string" },
+      db: { type: "boolean", default: false },
       open: { type: "boolean", default: false },
       "no-open": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -93,6 +108,7 @@ async function main(argv: string[]): Promise<number> {
         out: values.out,
         php: values.php,
         open: values.open,
+        db: values.db,
       });
     case "view":
       return view(paths[0] ?? ".", !values["no-open"]);
@@ -102,9 +118,12 @@ async function main(argv: string[]): Promise<number> {
         out: values.out,
         php: values.php,
         open: values.open,
+        db: values.db,
       });
     case "diff":
       return diff(values.project ?? ".", paths[0], paths[1], { mode: values.mode as "auto" | "static" | "artisan" | undefined, md: values.md });
+    case "check":
+      return check(paths[0] ?? values.project ?? ".", { base: values.base, failOn: values["fail-on"], md: values.md, mode: values.mode as "auto" | "static" | "artisan" | undefined });
     case "serve":
       return serve(paths[0] ?? ".", {
         mode: values.mode as "auto" | "static" | "artisan" | undefined,
@@ -151,13 +170,13 @@ output: ${DEFAULT_CONFIG.output}
   return 0;
 }
 
-async function scan(paths: string[], opts: { mode?: "auto" | "static" | "artisan"; out?: string; php?: string; open: boolean }): Promise<number> {
+async function scan(paths: string[], opts: { mode?: "auto" | "static" | "artisan"; out?: string; php?: string; open: boolean; db?: boolean }): Promise<number> {
   let failures = 0;
   const done: string[] = [];
   for (const p of paths) {
     const started = Date.now();
     try {
-      const res = await scanProject(p, { mode: opts.mode, output: opts.out, php: opts.php });
+      const res = await scanProject(p, { mode: opts.mode, output: opts.out, php: opts.php, database: opts.db || undefined });
       printScan(res, started);
       done.push(res.htmlPath);
     } catch (err) {
@@ -196,10 +215,10 @@ async function view(pathArg: string, open: boolean): Promise<number> {
   return 0;
 }
 
-async function docs(pathArg: string, opts: { mode?: "auto" | "static" | "artisan"; out?: string; php?: string; open: boolean }): Promise<number> {
+async function docs(pathArg: string, opts: { mode?: "auto" | "static" | "artisan"; out?: string; php?: string; open: boolean; db?: boolean }): Promise<number> {
   const started = Date.now();
   try {
-    const res = await scanProject(pathArg, { mode: opts.mode, php: opts.php });
+    const res = await scanProject(pathArg, { mode: opts.mode, php: opts.php, database: opts.db || undefined });
     printScan(res, started);
     const written = await writeDocs(res.root, res.map, opts.out ?? DEFAULT_DOCS_DIR);
     const m = res.map;
@@ -253,6 +272,39 @@ async function diff(project: string, base: string | undefined, head: string | un
   } catch (err) {
     console.error(`✖ ${(err as Error).message}`);
     return 1;
+  }
+}
+
+async function check(project: string, opts: { base?: string; failOn?: string; md?: string; mode?: "auto" | "static" | "artisan" }): Promise<number> {
+  try {
+    const root = resolve(project);
+    const failOn = (opts.failOn ?? "changes").split(",").map((s) => s.trim()).filter(Boolean) as CheckRule[];
+    const unknown = failOn.filter((r) => !CHECK_RULES.includes(r));
+    if (unknown.length) {
+      console.error(`✖ Unknown --fail-on rule: ${unknown.join(", ")}. Use ${CHECK_RULES.join(", ")}.`);
+      return 2;
+    }
+    // Default base: the map committed with the code
+    let baseSpec = opts.base;
+    if (!baseSpec) {
+      const committed = join(root, loadConfig(root).output);
+      if (!existsSync(committed)) {
+        console.error(`✖ No ${loadConfig(root).output} to compare with. Run builtlore scan and commit it, or pass --base <git ref>.`);
+        return 2;
+      }
+      baseSpec = committed;
+    }
+    const mode = opts.mode ?? "static";
+    const b = await loadSide(root, baseSpec, mode);
+    const h = await loadSide(root, undefined, mode);
+    const result = runCheck(b.map, h.map, failOn);
+    console.log(checkText(result, b.label, h.label));
+    if (result.failed.includes("changes") && !opts.base) console.log("  The committed map is out of date: run builtlore scan and commit builtlore.json.");
+    if (opts.md) writeFileSync(resolve(opts.md), checkMarkdown(result, b.label, h.label));
+    return result.failed.length ? 1 : 0;
+  } catch (err) {
+    console.error(`✖ ${(err as Error).message}`);
+    return 2;
   }
 }
 

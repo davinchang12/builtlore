@@ -104,6 +104,8 @@ function block(b: Block, ctx: Ctx): string[] {
       return ["```mermaid", b.mermaid, "```"];
     case "flow":
       return ["```mermaid", b.mermaid, "```", "", `*${b.caption}*`];
+    case "erd":
+      return ["```mermaid", b.mermaid, "```"];
     case "mermaid":
       return ["```mermaid", b.code, "```"];
     case "code":
@@ -142,6 +144,8 @@ function inline(parts: Inline[], ctx: Ctx): string {
       }
       if ("src" in p) {
         const label = p.src.line ? `${p.src.file}:${p.src.line}` : p.src.file;
+        // Not a file in the repository (read from the database): no link
+        if (p.src.file.startsWith("(")) return codeSpan(label);
         const href = `${ctx.repo}${p.src.file}${p.src.line ? `#L${p.src.line}` : ""}`.replace(/ /g, "%20");
         return `[${codeSpan(label)}](${href})`;
       }

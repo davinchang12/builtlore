@@ -177,7 +177,7 @@ builtlore docs --out handover --open
 | Who uses it | Each role and what it can do (plus the full role × action matrix) | Middleware, handler checks, Blade conditions (same as the Process view) |
 | Features | Per feature: what you can do there, how it works as numbered steps, a *who does what* swimlane flowchart, the status diagram, and a *screens and actions* flowchart (Mermaid / SVG); routes and files folded for developers. Features that only add, edit, delete, import or export (master data) get one table of operations instead, and a *Data management overview* sums them all up | Process layer, jobs that change a status, routes and views |
 | Business rules | Per form: each field's rules as written and in plain English; when each step is allowed | `validate()`, `Validator::make()`, FormRequest `rules()`, status guards |
-| Data dictionary | Tables, columns, types, defaults, keys, relationships, known status values | `database/migrations` (oldest first), models |
+| Data dictionary | How the tables relate (one entity-relationship diagram per group, lookup tables listed), then tables, columns, types, defaults, keys, known status values | `database/migrations` (oldest first), model relations (`belongsTo`, `hasMany`…), and the database with `--db` |
 | Integrations | HTTP APIs, email, notifications and channels, file storage, and which step calls them | `Http::`, `Mail::`, `notify()`, `Notification::send()`, `Storage::`, `->store()` |
 | Automation | Schedule in plain English, commands, jobs, the statuses they change | `routes/console.php`, `app/Console/Kernel.php`, `app/Console/Commands`, `app/Jobs` |
 | API reference | API, data (JSON) and file endpoints: access, parameters, validation, response | Routes, handlers, validation |
@@ -187,6 +187,23 @@ builtlore docs --out handover --open
 | To write | What only people can write and nobody has yet, as YAML to paste into `builtlore.edits.yaml` | Scan + `builtlore.edits.yaml` |
 
 The Markdown pages link every fact to its file and line, and render on GitHub and GitLab (diagrams included). `index.html` is a single offline file with a folding table of contents (business processes first, master data and other screens folded, grouped by area) and the canvas embedded; print it from the browser to get a PDF. `builtlore docs` also does everything `builtlore scan` does, so one command is enough. builtlore only replaces files it wrote, and refuses to overwrite anything else.
+
+### In CI
+
+```bash
+builtlore check                                          # fail when the committed builtlore.json is out of date
+builtlore check --base origin/main --fail-on open,page-only,unvalidated --md builtlore-check.md
+```
+
+The second form fails a pull request only when it adds something new: a write anyone can call, an action whose permission is checked only in the page, or a write without validation. Findings that were already there do not fail it. Exit codes: 0 passed, 1 failed, 2 could not run.
+
+### Reading the database (optional)
+
+```bash
+builtlore docs --db          # or database: true in builtlore.config.yaml
+```
+
+Off by default, read-only, and only when you ask. builtlore runs a small PHP script that boots your app (needs PHP and `vendor/`), so **Laravel reads its own `.env`; builtlore never opens it and never sees credentials**. It reads the schema (tables, columns, foreign keys, views) and the lookup tables a status column points at (`T_Request.Status → M_Status`), to name statuses the code only knows by value. Point it at a development database: it connects wherever the app's `.env` says.
 
 ### What changed between two versions
 
@@ -235,12 +252,16 @@ It compares steps, who can do them, status flows, validation, integrations, tabl
 | `Http::`, `Mail::`, notifications, `Storage::` | Integrations, and the step, command or job that uses each one (also when sent from a service, a listener or an observer) |
 | `app/Providers`, `app/Listeners`, `app/Observers`, `app/Policies` | Event listeners (`$listen`, `Event::listen`, subscribers, discovery), observers (`::observe()`, `#[ObservedBy]`), policies (`$policies`, `Gate::policy`, `#[UsePolicy]`, naming convention) and `Gate::define` / `Gate::before` |
 | `config/*.php`, `env()`, `.env.example` | Environment key names (never values) |
-
-Inertia and Livewire pages are detected; following their navigation is planned.
+| Model relations (`belongsTo`, `hasMany`, `hasOne`, `belongsToMany`) | How tables relate, joined with the migrations' foreign keys |
+| Status shown in views (`@if ($x->status == 'H') On hold`, script `switch`) | Names for status codes the code leaves bare |
+| Menus, page titles, buttons | What people call each screen and action |
+| `Modules/*` (laravel-modules) | Routes, controllers, models and views of each module |
+| Livewire components | Full-page components as pages; methods their views call (`wire:click`, `wire:submit`) as actions |
+| Inertia pages (`resources/js/Pages`) | Links and form calls (`router.post(route('…'))`, `form.put`, `<Link :href>`) |
 
 ## Privacy
 
-builtlore runs entirely on your machine. It does not use AI and makes no network calls (`builtlore serve` listens on `127.0.0.1` only). It reads code only: it never opens `.env`, reads only the key names of `.env.example`, does not copy defaults written next to `env()`, and does not connect to your database. (Optional AI naming and a read-only database layer are planned, and will be opt-in; see the design document.)
+builtlore runs entirely on your machine. It does not use AI and makes no network calls (`builtlore serve` listens on `127.0.0.1` only). By default it reads code only: it never opens `.env`, reads only the key names of `.env.example`, does not copy defaults written next to `env()`, and does not connect to your database. The database layer runs only with `--db`: it is read-only and goes through your app's own Laravel boot, so credentials stay with Laravel. (Optional AI naming is planned and will be opt-in; see the design document.)
 
 ## Roadmap
 

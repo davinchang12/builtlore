@@ -11,6 +11,7 @@ import type {
   ActorRef,
   EntryFact,
   Feature,
+  LabelFact,
   MapNode,
   NavigatesFact,
   Process,
@@ -125,7 +126,11 @@ export function buildProcesses(input: {
   states: StatesFact[];
   nodes: MapNode[];
   features: Feature[];
+  /** How views name status values, by column (lowercase) and value. */
+  labels?: LabelFact[];
 }): Process[] {
+  const viewLabel = new Map<string, string>();
+  for (const l of input.labels ?? []) viewLabel.set(`${l.column.toLowerCase()}|${l.value}`, l.label);
   const entryById = new Map(input.entries.map((e) => [e.id, e]));
   const nodeById = new Map(input.nodes.map((n) => [n.id, n]));
   const catalog = new Map(input.states.map((s) => [s.subject, s]));
@@ -187,7 +192,11 @@ export function buildProcesses(input: {
         if (seen?.named === "raw" && v.label) Object.assign(seen, { label: v.label, code: v.code, named: "code" });
         if (!states.has(id)) {
           const fromCatalog = known?.values.find((k) => k.value === v.value);
-          const best = fromCatalog?.label ? fromCatalog : v;
+          let best = fromCatalog?.label ? fromCatalog : v;
+          // Not named by the code (a bare 'H' or 3): the name the views show for it
+          const shown = viewLabel.get(`${column.toLowerCase()}|${v.value}`);
+          const codeLike = /^-?\d+$/.test(v.value) || v.value.length <= 3 || /^[A-Z0-9_]+$/.test(v.value);
+          if (shown && (!best.label || (best.labelFrom === "literal" && codeLike))) best = { ...best, label: shown, labelFrom: "labels" };
           states.set(id, {
             id,
             value: v.value,

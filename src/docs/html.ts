@@ -5,6 +5,7 @@
  */
 import { PARTS, type Block, type Inline, type Page, type Part } from "./content.js";
 import { stateSvg } from "./diagram.js";
+import { erdSvg } from "./erd.js";
 import { flowSvg } from "./flow.js";
 import type { DocModel } from "./model.js";
 
@@ -212,6 +213,10 @@ async function block(b: Block, shift: number, nextId: () => number): Promise<str
       const svg = await flowSvg(b.graph, b.title, `f${nextId()}`);
       return `<figure class="diagram flow-fig"><div class="zoom">${svg}</div><figcaption>${esc(b.caption)}</figcaption></figure>`;
     }
+    case "erd": {
+      const svg = await erdSvg(b.group, b.title, `r${nextId()}`);
+      return `<figure class="diagram flow-fig"><div class="zoom">${svg}</div><figcaption>Crow's foot: the "many" side, which holds the key · dashed: declared only on a model · hover a table for its model</figcaption></figure>`;
+    }
     case "mermaid":
       return ""; // Markdown only (the HTML shows the same information as a table)
     case "code":
@@ -362,6 +367,18 @@ svg .node-sub{font-size:10px;fill:var(--muted)}
 svg .edge.ajax{stroke-dasharray:2 3}
 figure.flow-fig .zoom{overflow-x:auto}
 figure.flow-fig svg.wide{max-width:none}
+svg.erd text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}
+svg .erd-box{fill:var(--bg);stroke:var(--state-line);stroke-width:1.2}
+svg .erd-head{fill:var(--soft);stroke:var(--state-line);stroke-width:1.2}
+svg .erd-table.unknown .erd-box,svg .erd-table.unknown .erd-head{stroke-dasharray:4 3}
+svg .erd-name{font-size:12.5px;font-weight:650;fill:var(--fg)}
+svg .erd-col{font-size:11.5px;fill:var(--fg)} svg .erd-col.key{font-weight:600}
+svg .erd-key{font-size:9.5px;font-weight:700;fill:var(--accent)}
+svg .erd-type{font-size:10.5px;fill:var(--muted)}
+svg .erd-more{font-size:10.5px;fill:var(--muted);font-style:italic}
+svg .erd-edge{fill:none;stroke:var(--edge);stroke-width:1.3} svg .erd-edge.model-only{stroke-dasharray:5 4} svg .erd-edge.m2m{stroke:var(--auto)}
+svg .erd-mark{fill:none;stroke:var(--edge);stroke-width:1.3}
+svg .erd-label{font-size:10.5px;fill:var(--muted)}
 @media print{figure.flow-fig svg.wide{max-width:100%}}
 footer{margin-top:56px;padding-top:16px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}
 @media (max-width:860px){

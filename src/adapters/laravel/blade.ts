@@ -4,7 +4,7 @@
  * @include are part of the page; layouts pulled in with @extends are shared
  * navigation and are counted separately so they do not flood every flow.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 export type BladeTarget =
@@ -33,11 +33,30 @@ export interface BladeAnalysis {
 const VIEW_ROOT = "resources/views";
 
 export function viewFile(root: string, name: string): string | null {
-  if (name.includes("::")) return null; // package / namespaced views
+  if (name.includes("::")) return moduleViewFile(root, name); // module views; package views stay unknown
   const base = name.split(".").join("/");
   for (const ext of [".blade.php", ".php"]) {
     const rel = `${VIEW_ROOT}/${base}${ext}`;
     if (existsSync(join(root, rel))) return rel;
+  }
+  return null;
+}
+
+/** blog::posts.index -> Modules/Blog/Resources/views/posts/index.blade.php (or resources/views). */
+function moduleViewFile(root: string, name: string): string | null {
+  const [ns, rest] = name.split("::");
+  const base = rest.split(".").join("/");
+  for (const top of ["Modules", "modules", "app/Modules"]) {
+    const dir = join(root, top);
+    if (!existsSync(dir)) continue;
+    const mod = readdirSync(dir).find((d) => d.toLowerCase() === ns.toLowerCase().replace(/[-_]/g, "") || d.toLowerCase() === ns.toLowerCase());
+    if (!mod) continue;
+    for (const views of ["Resources/views", "resources/views"]) {
+      for (const ext of [".blade.php", ".php"]) {
+        const rel = `${top}/${mod}/${views}/${base}${ext}`;
+        if (existsSync(join(root, rel))) return rel;
+      }
+    }
   }
   return null;
 }

@@ -21,6 +21,12 @@ import { analyzeClosure, analyzeControllerMethod, ClassLocator, findMethod, type
 import { PhpCache } from "./files.js";
 import { readIntegrations } from "./integrations.js";
 import { readMigrations } from "./migrations.js";
+import { readModelRelations } from "./relations.js";
+import { readViewLabels } from "./labels.js";
+import { readUiNames } from "./ui.js";
+import { embeddedComponents, readLivewire } from "./livewire.js";
+import { inertiaLinks } from "./inertia.js";
+import { databaseFacts, readDatabase } from "./database.js";
 import { parseViewConditions, ProcessReader } from "./process.js";
 import { readRequest, type RequestReading } from "./validation.js";
 import { lineOf, shortClass, type PhpNode } from "./php.js";
@@ -76,6 +82,7 @@ export const laravelAdapter: Adapter = {
     const locator = new ClassLocator(repo.root);
     const blade = new BladeReader(repo.root);
     const reader = new ProcessReader(repo.root, locator);
+    const livewire = readLivewire(repo.root, locator);
     const entries: EntryFact[] = [];
     const analyses = new Map<string, HandlerAnalysis | null>();
     const usedIds = new Set<string>();
@@ -104,7 +111,12 @@ export const laravelAdapter: Adapter = {
       let request: RequestReading | null = null;
       let paramModels = new Map<string, string>();
       let pageAbilities: string[] = [];
-      if (r.action.kind === "controller") {
+      const component = r.action.kind === "controller" ? livewire.get(r.action.class) : undefined;
+      if (component) {
+        // Full-page Livewire component: a page whose view is the component's; its methods become actions below
+        analysis = { views: component.view ? [{ engine: "blade", name: component.view }] : [], redirects: [], validates: false, file: component.file };
+        handler = { kind: "controller", class: component.fqcn, method: "render", file: component.file };
+      } else if (r.action.kind === "controller") {
         analysis = analyzeControllerMethod(locator, r.action.class, r.action.method);
         const m = findMethod(locator, r.action.class, r.action.method);
         if (m) {
@@ -177,9 +189,56 @@ export const laravelAdapter: Adapter = {
       if (process.statusVars) viewVars.set(id, process.statusVars);
     }
 
+    // 2b. Livewire: the methods a component's view calls are actions on the pages that show it
+    const livewireEdges: NavigatesFact[] = [];
+    if (livewire.size) {
+      const byAlias = new Map([...livewire.values()].map((c) => [c.alias, c]));
+      const hosts: Array<{ host: EntryFact; comp: (typeof byAlias extends Map<string, infer C> ? C : never) }> = [];
+      for (const e of [...entries]) {
+        const full = e.handler?.kind === "controller" ? livewire.get(e.handler.class ?? "") : undefined;
+        if (full && e.type === "page") hosts.push({ host: e, comp: full });
+        const file = e.view?.file;
+        if (file && e.type === "page" && existsSync(join(repo.root, file))) {
+          for (const alias of embeddedComponents(readFileSync(join(repo.root, file), "utf8"))) {
+            const comp = byAlias.get(alias);
+            if (comp && comp !== full) hosts.push({ host: e, comp });
+          }
+        }
+      }
+      for (const { host, comp } of hosts) {
+        for (const a of comp.actions) {
+          const id = `livewire:${comp.alias}.${a.method}`;
+          if (!entries.some((x) => x.id === id)) {
+            const seedTypes = new Map<string, string>();
+            for (const [prop, cls] of comp.props) {
+              const short = cls.split("\\").pop()!;
+              if (reader.modelFor(short)) seedTypes.set(`this->${prop}`, short);
+            }
+            const process = reader.analyzeHandler(a.node, comp.names, comp.file, comp.fqcn, { seedTypes });
+            for (const act of reader.actorsFromMiddleware(host.middleware)) if (!process.actors.some((x) => x.name === act.name)) process.actors.push(act);
+            entries.push({
+              kind: "entry",
+              id,
+              type: "action",
+              methods: ["POST"],
+              uri: `livewire/${comp.alias}/${a.method}`,
+              name: `${host.name ?? comp.alias}.${a.method}`,
+              middleware: host.middleware,
+              handler: { kind: "controller", class: comp.fqcn, method: a.method, file: comp.file, line: a.line },
+              source: { file: comp.file, line: a.line },
+              process,
+              ...(process.calls?.length ? { calls: process.calls } : {}),
+            });
+          }
+          livewireEdges.push({ kind: "navigates", from: host.id, to: id, trigger: "submit", source: { file: comp.viewPath ?? comp.file } });
+        }
+      }
+      notes.push(`Livewire: ${livewire.size} component${livewire.size === 1 ? "" : "s"}; the methods their views call (wire:click, wire:submit) are actions on the pages that show them.`);
+    }
+
     // 3. Navigation edges
     const resolver = new TargetResolver(entries);
-    const edges: NavigatesFact[] = [];
+    const edges: NavigatesFact[] = [...livewireEdges];
     let layoutLinks = 0;
     let inertiaViews = 0;
     const countedLayouts = new Set<string>();
@@ -212,6 +271,11 @@ export const laravelAdapter: Adapter = {
         }
       } else if (e.view?.engine === "inertia") {
         inertiaViews++;
+        // The page component: route('x') with the call around it (router.post, form.put, <Link :href>)
+        for (const link of inertiaLinks(repo.root, e.view.name)) {
+          const to = resolver.resolve({ kind: "name", name: link.route }, link.method);
+          if (to && to !== e.id) edges.push({ kind: "navigates", from: e.id, to, trigger: link.method === "GET" ? "link" : "submit", source: { file: link.file, line: link.line } });
+        }
       }
       // b) Handler -> redirect
       for (const red of analysis?.redirects ?? []) {
@@ -254,7 +318,7 @@ export const laravelAdapter: Adapter = {
     }
 
     if (layoutLinks) notes.push(`Ignored ${layoutLinks} links from shared layouts (menus/navbars) to keep flows readable.`);
-    if (inertiaViews) notes.push(`${inertiaViews} Inertia pages detected; Inertia navigation edges are planned for a later release.`);
+    if (inertiaViews) notes.push(`${inertiaViews} Inertia page${inertiaViews === 1 ? "" : "s"}: links and form calls read from resources/js/Pages (route('…') with router/form/Link).`);
 
     // 5. Actors from names (approve-manager), only for role words: known in the app or common ones
     for (const e of entries) {
@@ -266,6 +330,22 @@ export const laravelAdapter: Adapter = {
       const p = e.process ?? { actors: [], writes: [], requires: [], creates: [] };
       p.actors.push(reader.actor(role, "name", e.name ?? e.handler?.method ?? e.uri));
       e.process = p;
+    }
+
+    // 5a. The words people see: menu items and page titles for screens, buttons for actions
+    const ui = readUiNames(repo.root);
+    for (const e of entries) {
+      if (!e.name) continue;
+      if (e.type === "page") {
+        const menuText = ui.menu.get(e.name);
+        const viewPath = e.view?.engine === "blade" ? viewFile(repo.root, e.view.name) : null;
+        const titleText = viewPath ? ui.title(viewPath) : null;
+        if (menuText) e.ui = { ...menuText, from: "menu" };
+        else if (titleText) e.ui = { ...titleText, from: "title" };
+      } else if (!e.methods.every((m) => m === "GET")) {
+        const b = ui.button.get(e.name);
+        if (b) e.ui = { ...b, from: "button" };
+      }
     }
 
     // 5b. What could not be read is reported, not guessed
@@ -312,6 +392,35 @@ export const laravelAdapter: Adapter = {
     });
     skipped.push(...migrations.skipped);
     for (const table of migrations.tables) docs.push({ kind: "table", table });
+    // How the views name status values (@if ($x->status == 'H') On hold)
+    for (const l of readViewLabels(repo.root)) docs.push({ kind: "label", column: l.column, value: l.value, label: l.label, source: l.source });
+    // Relations declared on models (belongsTo, hasMany…): many apps have them only there
+    const modelRelations = readModelRelations(reader, locator);
+    skipped.push(...modelRelations.skipped);
+    for (const r of modelRelations.relations) {
+      docs.push({ kind: "relation", relation: { from: r.from, ...(r.column ? { column: r.column } : {}), to: r.to, ...(r.toColumn ? { toColumn: r.toColumn } : {}), kind: r.kind, ...(r.via ? { via: r.via } : {}), found: ["model"], by: r.by, methods: [r.method], source: r.source } });
+    }
+    // Opt-in, read-only database layer: schema, foreign keys, names of statuses kept in lookup tables
+    if (options.db) {
+      const statusRelations = modelRelations.relations
+        .filter((r) => r.column && /(^|_)(status|state|stage)(_id)?$|^id_status$/i.test(r.column) && r.toColumn)
+        .map((r) => ({ from: r.from, column: r.column!, to: r.to, toColumn: r.toColumn! }));
+      for (const t of migrations.tables) {
+        for (const c of t.columns) {
+          if (c.references && /(^|_)(status|state|stage)(_id)?$/i.test(c.name)) statusRelations.push({ from: t.name, column: c.name, to: c.references.table, toColumn: c.references.column });
+        }
+      }
+      const lookups = [...new Map(statusRelations.map((r) => [`${r.to}|${r.toColumn}`, { table: r.to, key: r.toColumn }])).values()];
+      const snap = readDatabase(repo.root, options.php ?? process.env.BUILTLORE_PHP ?? "php", lookups);
+      if (snap.error && !snap.tables.length) notes.push(`Database: not read (${snap.error}). The docs come from the code only.`);
+      else {
+        const fromDb = databaseFacts(snap, migrations.tables, statusRelations, (t) => reader.modelForTable(t));
+        for (const table of fromDb.tables) docs.push({ kind: "table", table });
+        for (const relation of fromDb.relations) docs.push({ kind: "relation", relation });
+        docs.push(...fromDb.labels);
+        notes.push(`Database (${snap.driver}, read-only): ${snap.tables.length} tables and views, ${fromDb.relations.length} foreign keys${fromDb.labels.length ? `, ${fromDb.labels.length} status names from lookup tables` : ""}.${snap.error ? ` Partly: ${snap.error}` : ""}`);
+      }
+    }
     const config = readConfig(repo.root, php);
     skipped.push(...config.skipped);
     docs.push(...config.keys);

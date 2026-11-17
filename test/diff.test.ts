@@ -139,6 +139,19 @@ describe("builtlore diff", { skip: !hasGit && "git is not installed" }, () => {
     assert.match(md, /- \*\*Added:\*\*/);
   });
 
+  it("check fails on changes, and on new open writes only (not the ones already there)", async () => {
+    const { runCheck } = await import("../src/core/check.js");
+    const base = await loadSide(dir, "HEAD");
+    const head = await loadSide(dir, undefined);
+    const r = runCheck(base.map, head.map, ["changes", "open"]);
+    assert.ok(r.failed.includes("changes"));
+    const open = r.added.find((a) => a.rule === "open")!;
+    assert.ok(open.items.some((i) => /cancel/.test(i)), open.items.join("\n"));
+    assert.ok(!open.items.some((i) => /\/orders\b(?!\/)/.test(i) && /POST/.test(i) && !/cancel/.test(i)), "the store route was already open in the base");
+    const same = runCheck(head.map, head.map, ["changes", "open", "page-only", "unvalidated"]);
+    assert.deepEqual(same.failed, []);
+  });
+
   it("leaves no worktree behind", () => {
     const list = spawnSync("git", ["worktree", "list"], { cwd: dir, encoding: "utf8" }).stdout.trim().split("\n");
     assert.equal(list.length, 1, list.join("\n"));
