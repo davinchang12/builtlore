@@ -713,7 +713,8 @@ function inputsOf(n: MapNode): string {
 }
 
 function accessOf(n: MapNode): string {
-  if (n.middleware.some((x) => /^auth(:|$)|^auth\.|sanctum/i.test(x))) return "Signed-in user";
+  // auth, sanctum, or the app's own login check (isLogin, checkSession, auth.sso…)
+  if (n.middleware.some((x) => /^auth(:|$)|^auth\.|sanctum/i.test(x) || (!x.includes(":") && /login|logged|session|sso|token|jwt/i.test(x)))) return "Signed-in user";
   // web / api are Laravel's route groups, not access checks
   const checks = n.middleware.filter((x) => !/^(web|api|throttle(:.*)?|bindings|substituteBindings)$/i.test(x));
   return checks.length ? checks.join(", ") : "Anyone";

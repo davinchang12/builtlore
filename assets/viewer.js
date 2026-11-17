@@ -454,7 +454,20 @@
   function stateOf(p, id) { return p.states.find(function (s) { return s.id === id; }) || { label: id, value: id, code: id }; }
   function laneById(p, id) { return p.lanes.find(function (l) { return l.id === id; }) || { name: id, evidence: [] }; }
 
-  /** Columns: creation first, then each step after the step that produces the status it needs. */
+  /** Statuses a step can start from: its own check, or the checks of its branches (if ($latest == X)). */
+  function fromsOf(s) {
+    var out = s.from.slice();
+    (s.pathInfo || []).forEach(function (i) { (i.from || []).forEach(function (f) { if (out.indexOf(f) < 0) out.push(f); }); });
+    return out;
+  }
+
+  /** A step the code lets run in any status (no check found): drawn in its own column. */
+  function anyStatus(s) { return !s.creates && !fromsOf(s).length; }
+
+  /**
+   * Columns: creation first, then each step after the step that produces the status it needs.
+   * Steps with no status check go in a last column, "At any status".
+   */
   function processColumns(p) {
     var col = {}, level = {};
     var queue = [];
@@ -469,7 +482,7 @@
         });
       });
       p.steps.forEach(function (s) {
-        var lv = s.from.map(function (f) { return level[f]; }).filter(function (x) { return x !== undefined; });
+        var lv = fromsOf(s).map(function (f) { return level[f]; }).filter(function (x) { return x !== undefined; });
         if (lv.length) {
           var c = Math.min.apply(null, lv);
           if (col[s.node] === undefined || (col[s.node] > c && !s.creates)) { col[s.node] = c; changed = true; }
@@ -477,7 +490,14 @@
       });
     }
     var base = p.steps.some(function (s) { return s.creates; }) ? 1 : 0;
-    p.steps.forEach(function (s) { if (col[s.node] === undefined) col[s.node] = base; });
+    var last = base;
+    p.steps.forEach(function (s) { if (col[s.node] !== undefined) last = Math.max(last, col[s.node]); });
+    var anyCol = p.steps.some(function (s) { return col[s.node] !== undefined; }) ? last + 1 : base;
+    p.steps.forEach(function (s) {
+      if (col[s.node] !== undefined) return;
+      col[s.node] = anyStatus(s) ? anyCol : base;
+    });
+    col.__any = p.steps.some(function (s) { return anyStatus(s) && col[s.node] === anyCol; }) ? anyCol : -1;
     return col;
   }
 
@@ -546,6 +566,15 @@
         groupLayer.appendChild(lt);
       });
 
+      // Column of steps the code lets run in any status (drawn over the lane bands)
+      if (col.__any >= 0) {
+        var ax = LABEL_W + col.__any * COL_W;
+        groupLayer.appendChild(el("rect", { x: ax - 14, y: top + 4, width: CARD_W + 28, height: cy - top - 8, rx: 10, "class": "any-col" }));
+        var at = el("text", { x: ax + CARD_W / 2, y: top - 8, "text-anchor": "middle", "class": "any-col-title" });
+        at.textContent = "At any status (no check in code)";
+        groupLayer.appendChild(at);
+      }
+
       var box = {};
       steps.forEach(function (s) {
         var ly = laneY[s.lane];
@@ -565,7 +594,7 @@
         if (n.review) g.appendChild(el("circle", { cx: CARD_W - 10, cy: 10, r: 4.5, "class": "review-dot" }));
         else if (n.description) g.appendChild(el("circle", { cx: CARD_W - 10, cy: 10, r: 3.5, "class": "note-dot" }));
         var tip = el("title", {});
-        tip.textContent = n.label + "\n" + laneById(p, s.lane).name + (s.from.length ? "\nwhen: " + s.from.map(function (f) { return stateOf(p, f).label; }).join(" or ") : "") + (n.description ? "\n\n" + n.description : "");
+        tip.textContent = n.label + "\n" + laneById(p, s.lane).name + (fromsOf(s).length ? "\nwhen: " + fromsOf(s).map(function (f) { return stateOf(p, f).label; }).join(" or ") : anyStatus(s) ? "\nat any status (no check in code)" : "") + (n.description ? "\n\n" + n.description : "");
         g.appendChild(tip);
         g.addEventListener("click", function (ev) { ev.stopPropagation(); select(s.node); });
         nodeLayer.appendChild(g);
@@ -686,7 +715,7 @@
   }
 
   function consumers(p, stateId) {
-    return p.steps.filter(function (s) { return s.from.indexOf(stateId) >= 0; });
+    return p.steps.filter(function (s) { return fromsOf(s).indexOf(stateId) >= 0; });
   }
 
   function renderProcessList() {
@@ -864,7 +893,15 @@
       var dl = h("dl");
       var lane = laneById(p, s.lane);
       row(dl, "Who", lane.name);
-      row(dl, "When", s.from.length ? s.from.map(function (f) { return stateOf(p, f).label; }).join(" or ") + " (" + { guard: "checked in code", view: "button shown only then", page: "page shown only then" }[s.fromVia] + ")" : "not restricted in code");
+      row(dl, "When", s.from.length
+        ? s.from.map(function (f) { return stateOf(p, f).label; }).join(" or ") + " (" + { guard: "checked in code", view: "button shown only then", page: "page shown only then" }[s.fromVia] + ")"
+        : fromsOf(s).length ? fromsOf(s).map(function (f) { return stateOf(p, f).label; }).join(" or ") + " (depends on the branch)" : "any status (no check in code)");
+      (s.paths || []).forEach(function (path, i) {
+        var info = (s.pathInfo || [])[i] || {};
+        var text = (info.from && info.from.length ? "from " + info.from.map(function (f) { return stateOf(p, f).label; }).join(" or ") + ": " : "") +
+          path.map(function (t) { return stateOf(p, t).label; }).join(" → ") + (info.when && info.when.length ? "  (if " + info.when.join(", ") + ")" : "");
+        row(dl, i ? "" : "Paths", text);
+      });
       row(dl, "Result", s.to.length ? s.to.map(function (t) { return stateOf(p, t).label; }).join(" or ") : s.creates ? "creates the record" : "status unchanged");
       d.appendChild(dl);
       var ev = h("ul", "evidence");

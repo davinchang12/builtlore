@@ -65,6 +65,8 @@ export function readAutomation(root: string, php: PhpCache, reader: ProcessReade
         const closure = chain.steps[0].args[1];
         const writes = closure ? backgroundWrites(closure, names, file, reader) : [];
         const cmd: ConsoleCommand = { name: commandName(sig), signature: sig, description: purpose ? stringValue(purpose.args[0]) ?? undefined : undefined, writes, source: src };
+        // The sample command every new Laravel app ships with
+        if (cmd.name === "inspire" && /inspiring quote/i.test(cmd.description ?? "")) return false;
         commands.push(cmd);
         const schedIdx = chain.steps.findIndex((s) => s.name === "schedule");
         if (schedIdx >= 0) schedule.push(task({ kind: "command", name: cmd.name }, chain.steps.slice(schedIdx + 1), src));

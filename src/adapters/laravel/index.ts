@@ -157,6 +157,7 @@ export const laravelAdapter: Adapter = {
         ...(request?.validation.length ? { validation: request.validation } : {}),
         ...(request?.inputs.length ? { inputs: request.inputs } : {}),
         ...(analysis ? { responds: respondsOf(analysis) } : {}),
+        ...(process.calls?.length ? { calls: process.calls } : {}),
       });
       // The page's view may check these: @if ($latestStatus == 4)
       if (process.statusVars) viewVars.set(id, process.statusVars);

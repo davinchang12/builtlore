@@ -369,7 +369,9 @@ Route::middleware('auth')->group(function () {
     Route::post('/orders/{order}/ship', [OrderStatusController::class, 'ship'])->name('orders.ship');
     Route::post('/orders/{order}/decide', [OrderStatusController::class, 'decide'])->name('orders.decide');
     Route::post('/orders/{order}/check', [OrderStatusController::class, 'check'])->name('orders.check');
+    Route::post('/orders/{order}/rereview', [OrderStatusController::class, 'rereview'])->name('orders.rereview');
     Route::get('/orders/{order}', [OrderController::class, 'show'])->name('orders.show');
+    Route::get('/orders-data', [OrderController::class, 'data'])->name('orders.data')->withoutMiddleware('auth')->middleware('isLogin');
 });
 `,
       "app/Support/Constants.php": `<?php
@@ -385,14 +387,25 @@ class Constants {
 `,
       "app/Models/Order.php": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass Order extends Model { public function statuses() { return $this->hasMany(OrderStatus::class); } }\n",
       "app/Models/OrderStatus.php": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass OrderStatus extends Model {}\n",
+      "app/Models/OrderHistory.php": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass OrderHistory extends Model {}\n",
+      "app/Mail/OrderRejected.php": "<?php\nnamespace App\\Mail;\nclass OrderRejected {}\n",
+      "app/Mail/OrderReviewed.php": "<?php\nnamespace App\\Mail;\nclass OrderReviewed {}\n",
+      "routes/console.php": "<?php\nuse Illuminate\\Support\\Facades\\Artisan;\nArtisan::command('inspire', function () {})->purpose('Display an inspiring quote');\n",
       "app/Services/OrderWorkflow.php": `<?php
 namespace App\\Services;
+use App\\Mail\\OrderRejected;
+use App\\Mail\\OrderReviewed;
+use App\\Models\\OrderHistory;
 use App\\Models\\OrderStatus;
 use App\\Support\\Constants;
+use Illuminate\\Support\\Facades\\Mail;
 class OrderWorkflow {
     public function submit($order) { $this->addStatus($order, Constants::STATUS_SUBMITTED); $this->review($order, 'pass'); }
     public function review($order, $mode = 'normal') {
-        if ($mode != 'pass') { $this->addStatus($order, Constants::STATUS_APPROVED); }
+        if ($mode != 'pass') {
+            $this->addStatus($order, Constants::STATUS_APPROVED);
+            Mail::to('reviewer@example.test')->send(new OrderReviewed);
+        }
         $this->addStatus($order, Constants::STATUS_WAITING_REVIEW);
     }
     public function hold($order) { $this->addStatus($order, Constants::STATUS_ON_HOLD); }
@@ -404,8 +417,12 @@ class OrderWorkflow {
     public function loop($order) { $this->loop($order); }
     public function reject($order) {
         OrderStatus::create(['order_id' => $order->id, 'status_id' => Constants::STATUS_REJECTED]);
+        Mail::to('buyer@example.test')->send(new OrderRejected);
     }
-    public function ship($order) { $order->statuses()->create(['status_id' => Constants::STATUS_SHIPPED]); }
+    public function ship($order) {
+        $order->statuses()->create(['status_id' => Constants::STATUS_SHIPPED]);
+        OrderHistory::create(['order_id' => $order->id, 'status' => 'Shipped by courier']);
+    }
     private function addStatus($order, $status) { $order->statuses()->create(['status_id' => $status]); }
 }
 `,
@@ -420,6 +437,7 @@ class OrderController extends Controller {
         (new OrderWorkflow)->submit($order);
         return back();
     }
+    public function data() { return response()->json([]); }
     public function show(Order $order) {
         $latestStatus = OrderStatus::where('order_id', $order->id)->orderByDesc('id')->value('status_id');
         return view('orders.show', compact('order', 'latestStatus'));
@@ -437,6 +455,7 @@ class OrderStatusController extends Controller {
     public function approve(Order $order) { $this->workflow->approve($order); return back(); }
     public function reject(Order $order) { $this->flow->reject($order); return back(); }
     public function ship(Order $order) { app(OrderWorkflow::class)->ship($order); return back(); }
+    public function rereview(Order $order) { $this->flow->review($order); return back(); }
     public function check(Order $order) {
         if (Gate::allows('manager') && !Gate::allows('auditor')) { $this->flow->hold($order); }
         if (Gate::allows('auditor')) { $this->flow->reject($order); }
@@ -537,6 +556,39 @@ describe("current status: history queries, Blade and Gate branches", () => {
     const s = p.states.find((x) => x.value === "4")!;
     assert.equal(s.label, "Shipped");
     assert.equal(s.named, "code");
+  });
+});
+
+describe("links and labels for readers", () => {
+  let map: BuiltMap;
+  before(async () => {
+    map = (await scanProject(dirs.find((d) => existsSync(join(d, "app/Services/OrderWorkflow.php")))!, { mode: "static" })).map;
+  });
+
+  it("does not read a history/log table as the record's status", () => {
+    const p = map.processes!.find((x) => x.subject === "Order.status_id")!;
+    assert.ok(!map.processes!.some((x) => x.subject === "Order.status"), "OrderHistory.status is a log, not Order.status");
+    assert.deepEqual(p.steps.find((s) => s.node === "route:orders.ship")!.to.map((id) => id.split("=")[1]), ["4"]);
+  });
+
+  it("links mail sent in a service to the steps that call it", () => {
+    const mail = map.integrations!.find((i) => i.id === "mail:App\\Mail\\OrderRejected")!;
+    assert.deepEqual(mail.usages[0].by.sort(), ["route:orders.check", "route:orders.decide", "route:orders.reject"]);
+  });
+
+  it("does not link mail in a branch that cannot run with the arguments a step passes", () => {
+    const mail = map.integrations!.find((i) => i.id === "mail:App\\Mail\\OrderReviewed")!;
+    assert.deepEqual(mail.usages[0].by, ["route:orders.rereview"], "store calls review($order, 'pass'), which skips the mail");
+  });
+
+  it("calls a custom login-only middleware a signed-in user in the API table", async () => {
+    const { renderDocs } = await import("../src/docs/index.js");
+    const api = (await renderDocs(map)).markdown.get("api.md")!;
+    assert.match(api, /`GET \/orders-data` \| Data \| Signed-in user \|/);
+  });
+
+  it("leaves out Laravel's sample inspire command", () => {
+    assert.ok(!(map.automation?.commands ?? []).some((c) => c.name === "inspire"));
   });
 });
 

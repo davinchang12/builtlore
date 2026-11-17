@@ -86,6 +86,7 @@ The canvas opens on **Process** when builtlore finds steps that change a record'
 | Arrow with a status | The record moves on in that status; the next step only runs in that status. That rule comes from a guard in code (`if ($pr->status != X) return back()`), an `@if` around the button, or the page the form is on. |
 | Red dashed | Hold, reject, return, cancel. |
 | Green pill | A status nothing follows. |
+| Dashed column *At any status* | Steps the code lets run whatever the status is (no check found). Their arrows go back to the steps that use the status they leave. |
 
 Statuses are read however your team writes them: `'APPROVED'`, `3`, `PurchaseRequest::STATUS_HOLD`, `LeaveStatus::Approved`, `$attributes` defaults, and label arrays or `match` maps on the model (`3 => 'Approved by procurement'`). A number with no label shows as `status = 3` until someone names it: click it in `builtlore serve`.
 

@@ -120,6 +120,7 @@ export function buildMap(input: {
     nodes,
     commands.map((c) => ({ id: `command:${c.name}`, class: c.class })),
     jobs.map((j) => ({ id: `job:${j.class}`, class: j.class })),
+    reachedBy(entries),
   );
 
   return {
@@ -141,6 +142,15 @@ export function buildMap(input: {
   };
 }
 
+/** "App\Services\Approval@hold" -> the steps whose handler reaches it. */
+function reachedBy(entries: EntryFact[]): Map<string, Array<{ id: string; dead: Set<number> }>> {
+  const out = new Map<string, Array<{ id: string; dead: Set<number> }>>();
+  for (const e of entries) {
+    for (const r of e.calls ?? []) out.set(r.method, [...(out.get(r.method) ?? []), { id: e.id, dead: new Set(r.dead ?? []) }]);
+  }
+  return out;
+}
+
 /** Steps a person performs: form submits, writes and exports (not pages or data reads). */
 export function isAction(e: Pick<EntryFact, "type" | "methods">): boolean {
   if (e.type === "action" || e.type === "download") return true;
@@ -156,6 +166,7 @@ function groupIntegrations(
   nodes: MapNode[],
   commands: Array<{ id: string; class?: string }>,
   jobs: Array<{ id: string; class: string }>,
+  reach: Map<string, Array<{ id: string; dead: Set<number> }>> = new Map(),
 ): Integration[] {
   const byTarget = new Map<string, Integration>();
   for (const { usage: u } of facts) {
@@ -175,6 +186,14 @@ function groupIntegrations(
         for (const n of nodes) if (n.handler?.class === inn.class && n.handler.method === inn.method) by.push(n.id);
         for (const c of commands) if (c.class === inn.class) by.push(c.id);
         for (const j of jobs) if (j.class === inn.class) by.push(j.id);
+        // Made in a service: the steps whose handler reaches that method
+        // …unless the call sits in a branch that cannot run with the arguments that step passes
+        if (!by.length) {
+          for (const r of reach.get(`${inn.class}@${inn.method ?? ""}`) ?? []) {
+            if (u.source.line !== undefined && r.dead.has(u.source.line)) continue;
+            if (!by.includes(r.id)) by.push(r.id);
+          }
+        }
       }
     }
     g.usages.push({

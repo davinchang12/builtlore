@@ -13,7 +13,7 @@
  */
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import type { ActorRef, ProcessInfo, StatesFact, StatusCondition, StatusValue, StatusWrite, Subject } from "../../core/types.js";
+import type { ActorRef, ProcessInfo, Reach, StatesFact, StatusCondition, StatusValue, StatusWrite, Subject } from "../../core/types.js";
 import { ClassLocator } from "./controllers.js";
 import { flattenChain, lineOf, resolveName, stringValue, walk, type NameContext, type PhpNode } from "./php.js";
 
@@ -21,9 +21,9 @@ import { flattenChain, lineOf, resolveName, stringValue, walk, type NameContext,
 const STATUS_COLUMN_RE = /^(status|state|stage|step|phase|approval|approval_status|approval_state|workflow_status|status_[a-z0-9_]+|[a-z0-9_]+_status|(?:[a-z0-9]+_)*status_id|is_approved?|approved?|flag_approval|approval_flag)$/i;
 
 /** Relations that hold a record's status history: $request->status()->create([...]). */
-const STATUS_RELATION = /^(status|statuses|state|states|approval|approvals|histor(y|ies)|logs?|tracking|progress)$/i;
-/** Models that are rows of another record's status history (TStatusRequest, ApprovalHistory…). */
-const STATUS_MODEL = /(Status|State|History|Histories|Approval|Log|Tracking)/;
+const STATUS_RELATION = /^(status|statuses|state|states|latest_?status|status_?histor(y|ies))$/i;
+/** Models whose rows ARE the status (TStatusRequest); History/Log tables only record what happened. */
+const STATUS_MODEL = /(Status|State)(?!.*(History|Histories|Log|Logs|Audit))/;
 
 /** How deep builtlore follows calls into services (controller → service → service). */
 const MAX_CALL_DEPTH = 3;
@@ -457,6 +457,14 @@ export class ProcessReader {
       w.branch = [...(branches.get(at.node) ?? []), ...(at.alt !== undefined ? [`v${offsetOf(at.node)}:${at.alt}`] : [])];
     }
     info.writes = info.writes.filter((w) => !w.branch?.includes("dead:1"));
+    const dead = new Set<number>();
+    walk(body, (n) => {
+      if (branches.get(n)?.includes("dead:1")) {
+        const l = lineOf(n);
+        if (l !== undefined) dead.add(l);
+      }
+    });
+    if (dead.size) info.deadLines = [...dead].sort((a, b) => a - b);
 
     // Status changes made in services the handler calls ($this->approval->hold($request))
     this.followCalls(body, names, selfClass, types, locals, info, opts.depth ?? 0, opts.stack ?? new Set(), branches);
@@ -662,6 +670,12 @@ export class ProcessReader {
       if (!sub) {
         sub = this.analyzeHandler(found.node, found.names, found.file, found.cls, { seedTypes: seed, seedValues, depth: depth + 1, stack: new Set([...stack, key]) });
         this.callCache.set(cacheKey, sub);
+      }
+      // Remember what this step reaches, and which lines there cannot run with these arguments
+      const reached: Reach[] = [{ method: key, ...(sub.deadLines?.length ? { dead: sub.deadLines } : {}) }, ...(sub.calls ?? [])];
+      for (const r of reached) {
+        const sig = `${r.method}|${(r.dead ?? []).join(",")}`;
+        if (!(info.calls ?? []).some((x) => `${x.method}|${(x.dead ?? []).join(",")}` === sig)) (info.calls ??= []).push(r);
       }
       // The callee's writes happen at the call: in its place in the sequence and in its branch
       const callOrder = offsetOf(n);

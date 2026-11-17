@@ -36,6 +36,8 @@ export interface EntryFact {
   inputs?: string[];
   /** What the handler returns, when the code says. */
   responds?: ResponseKind[];
+  /** Methods of the app's own classes the handler reaches (services, helpers), to link what they do to this step. */
+  calls?: Reach[];
 }
 
 export type ResponseKind = "view" | "redirect" | "json" | "file";
@@ -264,6 +266,15 @@ export interface ProcessInfo {
   procedures?: string[];
   /** Variables holding a record's current status ($latestStatus = TStatusX::where(…)->latest()->value('status_id')), for the view. */
   statusVars?: Record<string, Subject>;
+  /** Methods of the app's own classes this handler reaches ("App\Services\Approval@hold"), with the lines that cannot run there given the values passed in. */
+  calls?: Reach[];
+  /** Lines of this body in branches that cannot run with the values passed in. */
+  deadLines?: number[];
+}
+
+export interface Reach {
+  method: string;
+  dead?: number[];
 }
 
 /** Known values of a status column: constants, enum cases, label arrays, defaults. */
