@@ -260,6 +260,9 @@ export class ProcessReader {
     const lit = literal(node);
     if (lit !== null) {
       const raw = node.kind === "string" ? `'${lit}'` : lit;
+      // 'A' or 3 written as is, while the app names it elsewhere (Constant::STATUS_APPROVAL = 'A'): use that name
+      const named = /^\d+$/.test(lit) || lit.length <= 3 ? this.statusConstantFor(lit) : null;
+      if (named) return { value: lit, code: raw, label: named.label, labelFrom: "constant" };
       return { value: lit, code: raw, label: node.kind === "string" ? literalLabel(lit) : undefined, labelFrom: node.kind === "string" ? "literal" : undefined };
     }
     if (node.kind === "staticlookup" && node.what?.kind === "name") {
@@ -269,6 +272,27 @@ export class ProcessReader {
       return cls ? this.member(cls, member) : null;
     }
     return null;
+  }
+
+  private statusConstants: Map<string, StatusValue[]> | null = null;
+
+  /** The one STATUS_* / STATE_* constant in the app's classes with this value, if there is exactly one name for it. */
+  private statusConstantFor(value: string): StatusValue | null {
+    if (!this.statusConstants) {
+      this.statusConstants = new Map();
+      this.findShort("__index__");
+      for (const fq of [...(this.shortIndex?.values() ?? [])].flat()) {
+        const info = this.classInfo(fq);
+        for (const c of info?.constants.values() ?? []) {
+          if (!/^(STATUS|STATE)_/i.test(c.code.split("::")[1] ?? "")) continue;
+          const list = this.statusConstants.get(c.value) ?? [];
+          if (!list.some((x) => x.label === c.label)) list.push(c);
+          this.statusConstants.set(c.value, list);
+        }
+      }
+    }
+    const found = this.statusConstants.get(value);
+    return found?.length === 1 ? found[0] : null;
   }
 
   /** Class::MEMBER by class name as written in a view: FQCN or short name. */

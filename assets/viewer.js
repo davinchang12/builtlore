@@ -473,6 +473,10 @@
     var queue = [];
     p.steps.forEach(function (s) { if (s.creates) { col[s.node] = 0; queue.push(s); } });
     if (!queue.length && p.initial) level[p.initial] = 0;
+    // No step creates the record and no first status is known (made elsewhere, or with an empty status):
+    // the steps that set a status without checking one start the flow
+    var entry = !queue.length && !p.initial;
+    if (entry) p.steps.forEach(function (s) { if (!fromsOf(s).length && s.to.length) { col[s.node] = 0; queue.push(s); } });
     var changed = true, guard = 0;
     while (changed && guard++ < 50) {
       changed = false;

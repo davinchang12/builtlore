@@ -1197,7 +1197,7 @@ Route::post('/memos/hold', [MemoController::class, 'hold'])->name('memos.hold');
 Route::post('/memos/revise', [MemoController::class, 'revise'])->name('memos.revise');
 `,
       "app/Models/Memo.php": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass Memo extends Model { protected $table = 'memos'; }\n",
-      "app/Support/Constant.php": "<?php\nnamespace App\\Support;\nclass Constant { const SUBMIT = 'S'; const APPROVE = 'A'; const HOLD = 'H'; const REVISE = 'REV'; }\n",
+      "app/Support/Constant.php": "<?php\nnamespace App\\Support;\nclass Constant { const SUBMIT = 'S'; const APPROVE = 'A'; const HOLD = 'H'; const REVISE = 'REV'; const STATUS_CLOSED = 'C'; }\n",
       "app/Services/MemoFlow.php": `<?php
 namespace App\\Services;
 use Illuminate\\Support\\Facades\\DB;
@@ -1241,6 +1241,11 @@ class MemoController extends Controller {
   it("follows only the branch in_array(...) and || pick for the value passed in", () => {
     assert.deepEqual(vals(step("memos.hold").to), ["H"]);
     assert.deepEqual(vals(step("memos.revise").to), ["S"]);
+  });
+
+  it("names a short literal ('C') after the one status constant with that value", () => {
+    const p = map.processes!.find((x) => x.subject === "Memo.status")!;
+    assert.equal(p.states.find((s) => s.value === "C")?.label, "Closed");
   });
 
   it("does not chain writes in branches on different values of the same variable", () => {
