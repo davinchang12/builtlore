@@ -1,11 +1,12 @@
 /**
- * builtlore docs: write the documentation folder (Markdown + one HTML file).
+ * builtlore docs: write the documentation folder (Markdown, index.html, and the canvas).
  * Files builtlore wrote before are replaced; files it did not write are never
  * overwritten or deleted.
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import type { BuiltMap } from "../core/types.js";
+import { renderHtml } from "../render/html.js";
 import { buildPages } from "./content.js";
 import { renderDocsHtml } from "./html.js";
 import { GENERATED_MARK, renderMarkdown } from "./markdown.js";
@@ -13,6 +14,7 @@ import { buildDocModel } from "./model.js";
 
 export const DEFAULT_DOCS_DIR = "docs/builtlore";
 const HTML_FILE = "index.html";
+export const CANVAS_FILE = "canvas.html";
 const HTML_MARK = '<meta name="generator" content="builtlore';
 
 export interface DocsOutput {
@@ -21,11 +23,15 @@ export interface DocsOutput {
 }
 
 /** Render the documentation in memory. `repoPrefix` is the path from the docs folder to the repository root. */
-export async function renderDocs(map: BuiltMap, repoPrefix = "../../"): Promise<DocsOutput> {
+/**
+ * Render the documentation in memory. `repoPrefix` is the path from the docs folder to the
+ * repository root; `canvasHref` where the canvas is (canvas.html next to the docs, or "/" in serve).
+ */
+export async function renderDocs(map: BuiltMap, repoPrefix = "../../", canvasHref: string | undefined = CANVAS_FILE): Promise<DocsOutput> {
   const model = buildDocModel(map);
-  const pages = buildPages(model);
+  const pages = buildPages(model, { canvasHref });
   const markdown = renderMarkdown(pages, { generator: map.generator, repoPrefix });
-  const html = await renderDocsHtml(model, pages);
+  const html = await renderDocsHtml(model, pages, { canvasHref });
   return { markdown, html };
 }
 
@@ -33,6 +39,7 @@ export interface DocsResult {
   dir: string;
   files: string[];
   html: string;
+  canvas: string;
   removed: string[];
 }
 
@@ -44,7 +51,8 @@ export async function writeDocs(root: string, map: BuiltMap, outDir = DEFAULT_DO
   // Look before overwriting: only replace files builtlore generated.
   const targets = [...out.markdown.keys()].map((f) => join(dir, f));
   const htmlPath = join(dir, HTML_FILE);
-  for (const path of [...targets, htmlPath]) {
+  const canvasPath = join(dir, CANVAS_FILE);
+  for (const path of [...targets, htmlPath, canvasPath]) {
     if (!existsSync(path)) continue;
     const head = readFileSync(path, "utf8").slice(0, 600);
     if (!head.includes(GENERATED_MARK) && !head.includes(HTML_MARK)) {
@@ -76,5 +84,6 @@ export async function writeDocs(root: string, map: BuiltMap, outDir = DEFAULT_DO
   }
   mkdirSync(dir, { recursive: true });
   writeFileSync(htmlPath, out.html);
-  return { dir, files, html: htmlPath, removed };
+  writeFileSync(canvasPath, renderHtml(map));
+  return { dir, files, html: htmlPath, canvas: canvasPath, removed };
 }

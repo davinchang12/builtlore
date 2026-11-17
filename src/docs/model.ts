@@ -260,7 +260,7 @@ function findings(m: DocModel, featureById: Map<string, Feature>): Finding[] {
   if (dup.length) {
     out.push({
       title: "Duplicate routes",
-      why: "Laravel keeps only the last definition, so the earlier ones are dead code or a copy-paste mistake.",
+      why: "Laravel uses only the last one.",
       items: dup.map((text) => ({ text: text.replace(/^Warning:\s*/, "") })),
     });
   }
@@ -271,7 +271,7 @@ function findings(m: DocModel, featureById: Map<string, Feature>): Finding[] {
   if (unvalidated.length) {
     out.push({
       title: "Writes without validation",
-      why: "These actions read request fields but no validation rules were found (no validate(), Validator or FormRequest).",
+      why: "Reads request fields, no validation found.",
       items: unvalidated.map((n) => ({ text: `${nodeLabel(n)} reads ${n.inputs!.map((i) => (i === "*" ? "all fields" : i)).join(", ")}`, source: n.handler?.file ? { file: n.handler.file, line: n.handler.line } : n.source })),
     });
   }
@@ -279,8 +279,8 @@ function findings(m: DocModel, featureById: Map<string, Feature>): Finding[] {
   const envOutside = map.config?.flatMap((c) => c.uses.filter((u) => !u.source.file.startsWith("config/")).map((u) => ({ key: c.key, u }))) ?? [];
   if (envOutside.length) {
     out.push({
-      title: "env() outside config files",
-      why: "After php artisan config:cache, env() returns null outside config/. Read these through config() instead.",
+      title: "env() outside config",
+      why: "Returns null after config:cache. Use config().",
       items: envOutside.map(({ key, u }) => ({ text: `env('${key}')`, source: u.source })),
     });
   }
@@ -289,8 +289,8 @@ function findings(m: DocModel, featureById: Map<string, Feature>): Finding[] {
   const hasExample = map.config?.some((c) => c.inExample) ?? false;
   if (missing.length && hasExample) {
     out.push({
-      title: "Environment keys missing from .env.example",
-      why: "The code reads these keys, but a new installation would not know they exist.",
+      title: "Missing from .env.example",
+      why: "Read by the code, not listed for new installs.",
       items: missing.map((c) => ({ text: c.key, source: c.uses[0]?.source })),
     });
   }
@@ -300,7 +300,7 @@ function findings(m: DocModel, featureById: Map<string, Feature>): Finding[] {
   if (unreachable.length) {
     out.push({
       title: "Pages nothing leads to",
-      why: "No link, form, redirect or script found in the code leads to these pages (they may only be opened from outside, or be left over).",
+      why: "No link, form or redirect leads here. Opened from outside, or left over.",
       items: unreachable.map((n) => ({ text: nodeLabel(n), source: n.source })),
     });
   }
@@ -309,23 +309,27 @@ function findings(m: DocModel, featureById: Map<string, Feature>): Finding[] {
   if (review.length) {
     out.push({
       title: "Descriptions to check",
-      why: "The code behind these steps changed after a person described them.",
+      why: "Code changed after the description was written.",
       items: review.map((n) => ({ text: nodeLabel(n), source: n.source })),
     });
   }
 
   const orphans = map.notes.filter((n) => n.startsWith("Kept "));
   if (orphans.length) {
-    out.push({ title: "Edits for things no longer in the code", why: "Kept in builtlore.edits.yaml until someone removes them.", items: orphans.map((text) => ({ text })) });
+    out.push({ title: "Edits for removed code", why: "Still in builtlore.edits.yaml.", items: orphans.map((text) => ({ text })) });
   }
 
   if (map.skipped.length) {
     out.push({
       title: "Not read by builtlore",
-      why: "builtlore does not guess. These lines were seen but could not be read, so what they do is not in this documentation.",
+      why: "builtlore does not guess: these lines are not in the docs.",
       items: map.skipped.map((s) => ({ text: s.reason, source: s.source })),
     });
   }
+
+  // How the scan ran (mode, counts, what was left out on purpose): the same notes `builtlore scan` prints.
+  const info = map.notes.filter((n) => !n.startsWith("Warning:") && !n.startsWith("Kept "));
+  if (info.length) out.push({ title: "Scan notes", why: "", items: info.map((text) => ({ text })) });
   return out;
 }
 

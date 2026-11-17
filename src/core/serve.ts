@@ -40,7 +40,7 @@ export async function serveProject(path: string, opts: Partial<Config> & { port?
       }
       if (req.method === "GET" && url.pathname === "/docs") {
         // The documentation as `builtlore docs` would write it now, with the latest edits.
-        const docs = await renderDocs(map);
+        const docs = await renderDocs(map, "../../", "/");
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
         res.end(docs.html);
         return;

@@ -180,7 +180,7 @@ describe("documentation facts from the approval-workflow app", () => {
       assert.ok(unvalidated.some((t) => t.includes("Reassign") && t.includes("pic_nik")));
       assert.ok(unvalidated.some((t) => t.includes("Update department")));
       assert.ok(!unvalidated.some((t) => t.includes("Save purchase request")), "FormRequest counts as validation");
-      assert.deepEqual(titled("env() outside config files")!.items[0].source, { file: "app/Http/Controllers/LoginController.php", line: 12 });
+      assert.deepEqual(titled("env() outside config")!.items[0].source, { file: "app/Http/Controllers/LoginController.php", line: 12 });
       assert.ok(titled("Duplicate routes"));
       assert.equal(titled("Not read by builtlore")!.items.length, map.skipped.length);
     });
@@ -206,7 +206,7 @@ describe("builtlore docs output", () => {
   after(() => rmSync(dir, { recursive: true, force: true }));
 
   it("writes a Markdown folder and one HTML file", () => {
-    for (const f of ["README.md", "roles.md", "business-rules.md", "data-dictionary.md", "integrations.md", "automation.md", "api.md", "configuration.md", "glossary.md", "findings.md", "index.html", "features/menu-purchaserequest.md"]) {
+    for (const f of ["README.md", "roles.md", "business-rules.md", "data-dictionary.md", "integrations.md", "automation.md", "api.md", "configuration.md", "glossary.md", "findings.md", "index.html", "canvas.html", "features/menu-purchaserequest.md"]) {
       assert.ok(existsSync(join(dir, out, f)), f);
     }
   });
@@ -226,7 +226,7 @@ describe("builtlore docs output", () => {
     assert.ok(pr.includes("s0 : Waiting for manager"));
     const leave = read("features/menu-leaverequest.md");
     assert.match(leave, /--> s\d : Job ExpireLeaveRequests \(every hour\)/);
-    assert.ok(leave.includes('state "Any status (not checked in code)" as any'), "a step with no status check starts from any status");
+    assert.ok(leave.includes('state "Any status (no check in code)" as any'), "a step with no status check starts from any status");
   });
 
   it("links facts to the file and line they come from", () => {
@@ -243,6 +243,41 @@ describe("builtlore docs output", () => {
     for (const id of ["overview", "roles", "features", "business-rules", "data", "integrations", "automation", "api", "configuration", "glossary", "findings"]) {
       assert.ok(html.includes(`id="${id}"`), id);
     }
+  });
+
+  it("includes the canvas: embedded in the HTML, linked from the Markdown", () => {
+    assert.ok(read("index.html").includes('<iframe class="canvas-frame" src="canvas.html"'));
+    assert.ok(read("README.md").includes("[Open the canvas](canvas.html)"));
+    assert.ok(read("canvas.html").includes('id="builtlore-data"'));
+  });
+
+  it("starts with the main processes and who uses the system, in plain words", () => {
+    const readme = read("README.md");
+    assert.ok(readme.includes("[Menu › Purchase request](features/menu-purchaserequest.md): **Waiting for manager** → **Approved by manager** → **Approved by procurement**"));
+    assert.ok(readme.includes("[Manager](roles.md#role-manager): Approve manager, Hold manager"));
+    assert.ok(readme.includes("**Understand the system**") && readme.includes("**Reference**") && readme.includes("**Health**"));
+  });
+
+  it("tells each process as numbered steps, then the other paths", () => {
+    const pr = read("features/menu-purchaserequest.md");
+    assert.ok(pr.includes("1. **Signed-in user**: Save purchase request → **Waiting for manager**"));
+    assert.ok(pr.includes("2. **Manager**: Approve manager → **Approved by manager**"));
+    assert.ok(pr.includes("3. **Procurement**: Approve → **Approved by procurement**"));
+    assert.ok(pr.includes("- **Manager**: Hold manager when **Waiting for manager** → **On hold**"));
+    assert.ok(read("features/menu-leaverequest.md").includes("- **Automatic**: Job ExpireLeaveRequests, every hour when **Pending** → **Rejected**"));
+  });
+
+  it("folds developer details away and lists each role's actions", () => {
+    assert.ok(read("features/menu-purchaserequest.md").includes("<summary>For developers: routes, screens, files</summary>"));
+    assert.ok(read("roles.md").includes("- **Menu › Purchase request**: Approve manager, Hold manager"));
+    const html = read("index.html");
+    assert.ok(html.includes('<input id="q" type="search"'), "search box");
+    assert.ok(html.includes('addEventListener("beforeprint"'), "folded sections open when printing");
+  });
+
+  it("lists the scan notes under Findings", () => {
+    assert.ok(read("findings.md").includes("## Scan notes"));
+    assert.ok(read("findings.md").includes("static mode, no PHP needed"));
   });
 
   it("shows env key names but no values", async () => {
@@ -279,6 +314,7 @@ describe("builtlore docs output", () => {
       assert.equal(res.status, 200);
       const html = await res.text();
       assert.ok(html.includes("Procurement portal"));
+      assert.ok(html.includes('<iframe class="canvas-frame" src="/"'), "in serve the docs embed the live canvas");
     } finally {
       h.server.close();
     }

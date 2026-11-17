@@ -1,9 +1,9 @@
-﻿/**
+/**
  * Status lifecycle of a process as a graph, rendered two ways:
  *   - Mermaid stateDiagram-v2 for the Markdown docs (GitHub/GitLab render it)
  *   - static SVG laid out with ELK for the HTML docs (offline, prints well)
  * Only transitions found in code are drawn. A step whose starting status the
- * code does not check starts from "Any status (not checked in code)".
+ * code does not check starts from "Any status (no check in code)".
  */
 import { createRequire } from "node:module";
 import { NEGATIVE, type DocProcess } from "./model.js";
@@ -75,7 +75,7 @@ export function stateGraph(p: DocProcess): StateGraph {
     for (const to of b.to) for (const s of sources) push({ from: s, to: stateNode(to.id, to.label), label, who: "automatic", negative: false, background: true });
   }
   if (start) nodes.unshift({ id: "start", label: "", kind: "start" });
-  if (any) nodes.push({ id: "any", label: "Any status (not checked in code)", kind: "any" });
+  if (any) nodes.push({ id: "any", label: "Any status (no check in code)", kind: "any" });
   const hasOut = new Set(edges.map((e) => e.from));
   for (const n of nodes) if (n.kind === "state" && !hasOut.has(n.id)) n.final = true;
   return { nodes, edges };

@@ -3,42 +3,50 @@
  * contents on screen, clean pages when printed (File → Print → Save as PDF).
  * No scripts are needed to read it; diagrams are static SVG laid out by ELK.
  */
-import type { Block, Inline, Page } from "./content.js";
+import { PARTS, type Block, type Inline, type Page, type Part } from "./content.js";
 import { stateSvg } from "./diagram.js";
 import type { DocModel } from "./model.js";
 
-export async function renderDocsHtml(m: DocModel, pages: Page[]): Promise<string> {
+export async function renderDocsHtml(m: DocModel, pages: Page[], opts: { canvasHref?: string } = {}): Promise<string> {
   const body: string[] = [];
   const toc: string[] = [];
   let openGroup: string | null = null;
+  let part: Part | null = null;
   let svgCount = 0;
+  const next = () => ++svgCount;
 
   for (const page of pages) {
     const grouped = Boolean(page.group);
-    if (page.group && openGroup !== page.group.id) {
-      openGroup = page.group.id;
-      body.push(`<section class="page group-head" id="${page.group.id}"><h2>${esc(page.group.title)}</h2>`);
-      for (const b of page.group.intro) body.push(await block(b, 2, () => ++svgCount));
-      body.push("</section>");
-      toc.push(`<li><a href="#${page.group.id}">${esc(page.group.title)}</a><ul>`);
-    } else if (!page.group && openGroup) {
+    if (openGroup && page.group?.id !== openGroup) {
       openGroup = null;
       toc.push("</ul></li>");
     }
-    toc.push(`<li><a href="#${page.id}">${esc(page.title)}</a></li>`);
+    if (page.part !== part) {
+      if (part) toc.push("</ul></li>");
+      part = page.part;
+      toc.push(`<li class="part"><div class="part-title">${esc(PARTS[part].title)}</div><ul>`);
+    }
+    if (page.group && openGroup !== page.group.id) {
+      openGroup = page.group.id;
+      body.push(`<section class="page group-head" id="${page.group.id}"><h2>${esc(page.group.title)}</h2><p class="lead">${esc(page.group.lead)}</p></section>`);
+      toc.push(`<li><a href="#${page.group.id}">${esc(page.group.title)}</a><ul>`);
+    }
+    toc.push(`<li><a href="#${page.id}">${esc(page.file === "README.md" ? "Start here" : page.title)}</a></li>`);
 
     if (page.file === "README.md") {
       body.push(`<header class="cover" id="${page.id}"><div class="kicker">System documentation</div><h1>${esc(page.title)}</h1>`);
-      for (const b of page.blocks) body.push(await block(b, 1, () => ++svgCount));
+      for (const b of page.blocks) body.push(await block(b, 1, next));
       body.push("</header>");
       continue;
     }
     const shift = grouped ? 2 : 1;
     body.push(`<section class="page${grouped ? " sub" : ""}" id="${page.id}"><h${1 + shift}>${esc(page.title)}</h${1 + shift}>`);
-    for (const b of page.blocks) body.push(await block(b, shift, () => ++svgCount));
+    if (page.lead) body.push(`<p class="lead">${esc(page.lead)}</p>`);
+    for (const b of page.blocks) body.push(await block(b, shift, next));
     body.push("</section>");
   }
   if (openGroup) toc.push("</ul></li>");
+  if (part) toc.push("</ul></li>");
 
   const map = m.map;
   const meta = [`Generated ${map.generatedAt.slice(0, 10)}`, map.project.commit ? `commit ${map.project.commit}` : "", map.generator].filter(Boolean).join(" · ");
@@ -55,17 +63,59 @@ export async function renderDocsHtml(m: DocModel, pages: Page[]): Promise<string
 <nav class="toc" aria-label="Contents">
   <div class="toc-title">${esc(m.title)}</div>
   <div class="toc-meta">${esc(meta)}</div>
-  <ul>${toc.join("")}</ul>
-  <button type="button" class="print" onclick="window.print()">Print or save as PDF</button>
+  <div class="search">
+    <input id="q" type="search" placeholder="Search…  ( / )" autocomplete="off" aria-label="Search the documentation">
+    <ul id="results" hidden></ul>
+  </div>
+  <ul class="toc-list">${toc.join("")}</ul>
+  ${opts.canvasHref ? `<a class="side-button" href="${esc(opts.canvasHref)}" target="_blank" rel="noopener">Open canvas</a>` : ""}
+  <button type="button" class="side-button" onclick="window.print()">Print / save as PDF</button>
 </nav>
 <main>
 ${body.join("\n")}
-<footer>${esc(meta)}. Generated from the code and builtlore.edits.yaml; rerun <code>builtlore docs</code> to update.</footer>
+<footer>${esc(meta)} · from the code and builtlore.edits.yaml · update with <code>builtlore docs</code></footer>
 </main>
+<script>${SCRIPT}</script>
 </body>
 </html>
 `;
 }
+
+/**
+ * Search (headings, table rows, list items; jumps to the section) and printing
+ * with every folded section open. The page reads fine without it.
+ */
+const SCRIPT = `(function(){
+  var q=document.getElementById("q"),out=document.getElementById("results");
+  var index=[],head=null;
+  document.querySelectorAll("main h1[id],main h2[id],main h3[id],main h4[id],main tr,main li,main p").forEach(function(el){
+    if(/^H/.test(el.tagName)){head={id:el.id,title:el.textContent};index.push({text:el.textContent,el:el,title:el.textContent,heading:true});return;}
+    if(!head)return;
+    var t=el.textContent.replace(/\\s+/g," ").trim();
+    if(t&&t.length<400)index.push({text:t,el:el,title:head.title,heading:false});
+  });
+  function show(){
+    var v=q.value.trim().toLowerCase();out.innerHTML="";
+    if(v.length<2){out.hidden=true;return;}
+    var hits=index.filter(function(x){return x.text.toLowerCase().indexOf(v)>=0;});
+    hits.sort(function(a,b){return (b.heading?1:0)-(a.heading?1:0);});
+    hits.slice(0,12).forEach(function(x){
+      var li=document.createElement("li"),a=document.createElement("a");
+      a.href="#";a.textContent=x.heading?x.text:x.text.slice(0,90);
+      if(!x.heading){var s=document.createElement("span");s.textContent=x.title;a.appendChild(s);}
+      a.onclick=function(e){e.preventDefault();var d=x.el.closest("details");if(d)d.open=true;x.el.scrollIntoView({block:"center"});x.el.classList.add("hit");setTimeout(function(){x.el.classList.remove("hit");},1600);};
+      li.appendChild(a);out.appendChild(li);
+    });
+    if(!hits.length){var li=document.createElement("li");li.className="none";li.textContent="No results";out.appendChild(li);}
+    out.hidden=false;
+  }
+  q.addEventListener("input",show);
+  q.addEventListener("keydown",function(e){if(e.key==="Enter"){var a=out.querySelector("a");if(a)a.click();}if(e.key==="Escape"){q.value="";show();}});
+  document.addEventListener("keydown",function(e){if(e.key==="/"&&document.activeElement!==q){e.preventDefault();q.focus();}});
+  var closed=[];
+  window.addEventListener("beforeprint",function(){closed=[];document.querySelectorAll("details:not([open])").forEach(function(d){closed.push(d);d.open=true;});});
+  window.addEventListener("afterprint",function(){closed.forEach(function(d){d.open=false;});});
+})();`;
 
 async function block(b: Block, shift: number, nextId: () => number): Promise<string> {
   switch (b.t) {
@@ -79,6 +129,13 @@ async function block(b: Block, shift: number, nextId: () => number): Promise<str
       return `<p class="note ${b.kind}">${inline(b.c)}</p>`;
     case "list":
       return `<ul>${b.items.map((it) => `<li>${inline(it)}</li>`).join("")}</ul>`;
+    case "steps":
+      return `<ol class="steps">${b.items.map((it) => `<li>${inline(it)}</li>`).join("")}</ol>`;
+    case "details": {
+      const inner: string[] = [];
+      for (const x of b.blocks) inner.push(await block(x, shift, nextId));
+      return `<details><summary>${esc(b.summary)}</summary><div class="details-body">${inner.join("")}</div></details>`;
+    }
     case "table": {
       if (!b.rows.length) return "";
       const head = b.head.some(Boolean) ? `<thead><tr>${b.head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead>` : "";
@@ -87,10 +144,12 @@ async function block(b: Block, shift: number, nextId: () => number): Promise<str
     }
     case "diagram": {
       const svg = await stateSvg(b.graph, b.title, `d${nextId()}`);
-      return `<figure class="diagram">${svg}<figcaption>${esc(b.title)}. Arrows are steps found in the code; red dashed: hold, reject or cancel; purple dotted: done automatically by a job or command.</figcaption></figure>`;
+      return `<figure class="diagram">${svg}<figcaption>Red dashed: hold / reject / cancel · purple dotted: automatic (job or command)</figcaption></figure>`;
     }
     case "mermaid":
       return ""; // Markdown only (the HTML shows the same information as a table)
+    case "canvas":
+      return `<div class="canvas-wrap"><iframe class="canvas-frame" src="${esc(b.href)}" title="Canvas" loading="lazy"></iframe><p class="canvas-actions"><a href="${esc(b.href)}" target="_blank" rel="noopener">Open full screen</a> · drag to move, scroll to zoom, click a step for details</p><p class="print-only">Interactive canvas: open ${esc(b.href)} in a browser.</p></div>`;
   }
 }
 
@@ -131,12 +190,35 @@ body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,B
 .toc-title{font-weight:650;font-size:15px;line-height:1.3}
 .toc-meta{color:var(--muted);font-size:12px;margin:4px 0 16px}
 .toc ul{list-style:none;margin:0;padding:0}
+.toc .part{margin-top:14px}
+.part-title{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);font-weight:650;padding:0 8px 4px}
+.search{position:relative;margin-bottom:6px}
+.search input{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+.search input:focus{outline:2px solid var(--accent);outline-offset:-1px}
+#results{position:absolute;left:0;right:0;top:40px;z-index:5;background:var(--bg);border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.12);max-height:60vh;overflow:auto;padding:4px}
+#results a{display:block;padding:6px 8px;border-radius:6px;line-height:1.35}
+#results a span{display:block;font-size:11.5px;color:var(--muted)}
+#results .none{padding:8px;color:var(--muted)}
+.hit{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+.lead{color:var(--muted);font-size:16px;margin:-6px 0 18px}
+ol.steps{padding-left:0;list-style:none;counter-reset:s;margin:4px 0 16px}
+ol.steps li{counter-increment:s;position:relative;padding:8px 12px 8px 44px;margin:6px 0;border:1px solid var(--line);border-radius:8px;background:var(--soft)}
+ol.steps li::before{content:counter(s);position:absolute;left:12px;top:8px;width:22px;height:22px;border-radius:50%;background:var(--accent);color:#fff;font-size:12px;font-weight:700;display:grid;place-items:center}
+details{margin:12px 0 18px;border:1px solid var(--line);border-radius:8px}
+details>summary{cursor:pointer;padding:9px 12px;color:var(--muted);font-size:14px;list-style-position:inside}
+details>summary:hover{color:var(--accent)}
+details[open]>summary{border-bottom:1px solid var(--line)}
+.details-body{padding:12px 14px 2px}
 .toc ul ul{padding-left:12px;margin:2px 0 6px;border-left:1px solid var(--line)}
 .toc li{margin:1px 0}
 .toc a{color:var(--fg);text-decoration:none;display:block;padding:3px 8px;border-radius:6px}
 .toc a:hover{background:var(--soft);color:var(--accent)}
-.print{margin-top:20px;width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit;cursor:pointer}
-.print:hover{border-color:var(--accent);color:var(--accent)}
+.side-button{display:block;box-sizing:border-box;text-align:center;text-decoration:none;margin-top:10px;width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit;cursor:pointer}
+.toc ul + .side-button{margin-top:20px}
+.side-button:hover{border-color:var(--accent);color:var(--accent)}
+.canvas-frame{display:block;width:100%;height:560px;border:1px solid var(--line);border-radius:10px;background:#fff}
+.canvas-actions{font-size:12.5px;color:var(--muted);margin-top:6px}
+.print-only{display:none}
 main{flex:1;min-width:0;max-width:960px;padding:40px 48px 80px}
 .cover{padding-bottom:12px}
 .kicker{text-transform:uppercase;letter-spacing:.08em;font-size:12px;color:var(--muted);font-weight:600}
@@ -201,6 +283,12 @@ footer{margin-top:56px;padding-top:16px;border-top:1px solid var(--line);color:v
   @page{size:A4;margin:16mm 14mm}
   body{display:block;font-size:10.5pt;line-height:1.5}
   .toc{display:none}
+  details{border:0}
+  details>summary{display:none}
+  .details-body{padding:0}
+  ol.steps li{background:none}
+  .canvas-frame,.canvas-actions{display:none}
+  .print-only{display:block;color:var(--muted)}
   main{max-width:none;padding:0}
   .cover{min-height:40vh}
   .page{break-before:page;border-top:0;margin-top:0;padding-top:0}

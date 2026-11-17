@@ -4,7 +4,7 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 import { join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { adapters } from "./adapters/index.js";
-import { detectStacks, scanProject, writeHtml, DEFAULT_CONFIG, loadConfig } from "./core/scan.js";
+import { detectStacks, scanProject, writeHtml, DEFAULT_CONFIG, loadConfig, type ScanResult } from "./core/scan.js";
 import { serveProject } from "./core/serve.js";
 import { DEFAULT_DOCS_DIR, writeDocs } from "./docs/index.js";
 import type { BuiltMap } from "./core/types.js";
@@ -142,13 +142,7 @@ async function scan(paths: string[], opts: { mode?: "auto" | "static" | "artisan
     const started = Date.now();
     try {
       const res = await scanProject(p, { mode: opts.mode, output: opts.out, php: opts.php });
-      const m = res.map;
-      const secs = ((Date.now() - started) / 1000).toFixed(1);
-      console.log(`\n✔ ${m.project.name}  (${m.stacks.join(", ")}, ${secs}s)`);
-      console.log(`  ${m.features.length} features · ${m.nodes.length} steps · ${m.edges.length} transitions · ${m.skipped.length} skipped`);
-      for (const n of m.notes) console.log(`  · ${n}`);
-      console.log(`  map:    ${rel(res.jsonPath)}`);
-      console.log(`  canvas: ${rel(res.htmlPath)}`);
+      printScan(res, started);
       done.push(res.htmlPath);
     } catch (err) {
       failures++;
@@ -158,6 +152,17 @@ async function scan(paths: string[], opts: { mode?: "auto" | "static" | "artisan
   if (opts.open && done.length === 1) openFile(done[0]);
   if (paths.length > 1) console.log(`\nScanned ${paths.length - failures}/${paths.length} projects.`);
   return failures ? 1 : 0;
+}
+
+/** What `builtlore scan` prints; `builtlore docs` prints the same before its own lines. */
+function printScan(res: ScanResult, started: number): void {
+  const m = res.map;
+  const secs = ((Date.now() - started) / 1000).toFixed(1);
+  console.log(`\n✔ ${m.project.title ?? m.project.name}  (${m.stacks.join(", ")}, ${secs}s)`);
+  console.log(`  ${m.features.length} features · ${m.nodes.length} steps · ${m.edges.length} transitions · ${m.skipped.length} skipped`);
+  for (const n of m.notes) console.log(`  · ${n}`);
+  console.log(`  map:    ${rel(res.jsonPath)}`);
+  console.log(`  canvas: ${rel(res.htmlPath)}`);
 }
 
 async function view(pathArg: string, open: boolean): Promise<number> {
@@ -179,15 +184,14 @@ async function docs(pathArg: string, opts: { mode?: "auto" | "static" | "artisan
   const started = Date.now();
   try {
     const res = await scanProject(pathArg, { mode: opts.mode, php: opts.php });
+    printScan(res, started);
     const written = await writeDocs(res.root, res.map, opts.out ?? DEFAULT_DOCS_DIR);
     const m = res.map;
-    const secs = ((Date.now() - started) / 1000).toFixed(1);
-    console.log(`\n✔ ${m.project.title ?? m.project.name}  (${secs}s)`);
-    console.log(`  ${written.files.length} Markdown files and one HTML file in ${rel(written.dir)}`);
-    if (written.removed.length) console.log(`  removed ${written.removed.length} page${written.removed.length === 1 ? "" : "s"} for features no longer in the code`);
-    if (!m.project.summary) console.log("  · No project summary yet: add one in builtlore serve (Project) or project.summary in builtlore.edits.yaml.");
-    if (m.skipped.length) console.log(`  · ${m.skipped.length} thing${m.skipped.length === 1 ? "" : "s"} builtlore could not read: see Findings.`);
-    console.log(`  html:   ${rel(written.html)}  (print it to PDF from the browser)`);
+    console.log(`\n✔ Docs  ${rel(written.dir)}`);
+    console.log(`  ${written.files.length} Markdown pages · index.html (print to PDF) · canvas.html`);
+    if (written.removed.length) console.log(`  · removed ${written.removed.length} page${written.removed.length === 1 ? "" : "s"} of features no longer in the code`);
+    if (!m.project.summary) console.log("  · No project summary yet: builtlore serve → Project");
+    console.log(`  html:   ${rel(written.html)}`);
     console.log(`  start:  ${rel(join(written.dir, "README.md"))}`);
     if (opts.open) openFile(written.html);
     return 0;
