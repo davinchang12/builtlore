@@ -3,7 +3,7 @@
  * a tiny generated Laravel project.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -350,6 +350,210 @@ class ShopController extends Controller {
     assert.ok(!keys.includes("SHOP_SECRET"));
     assert.ok(!JSON.stringify(map).includes("do-not-read-me"));
     assert.ok(map.skipped.some((s) => s.reason.startsWith("Environment key not readable")));
+  });
+});
+
+describe("status changes made in services and status-history tables", () => {
+  let map: BuiltMap;
+  let dir: string;
+  before(async () => {
+    dir = project({
+      "routes/web.php": `<?php
+use App\\Http\\Controllers\\OrderController;
+use App\\Http\\Controllers\\OrderStatusController;
+use Illuminate\\Support\\Facades\\Route;
+Route::middleware('auth')->group(function () {
+    Route::post('/orders', [OrderController::class, 'store'])->name('orders.store');
+    Route::post('/orders/{order}/approve', [OrderStatusController::class, 'approve'])->name('orders.approve')->middleware('can:Order Approve');
+    Route::post('/orders/{order}/reject', [OrderStatusController::class, 'reject'])->name('orders.reject')->middleware('role:supervisor');
+    Route::post('/orders/{order}/ship', [OrderStatusController::class, 'ship'])->name('orders.ship');
+    Route::post('/orders/{order}/decide', [OrderStatusController::class, 'decide'])->name('orders.decide');
+    Route::post('/orders/{order}/check', [OrderStatusController::class, 'check'])->name('orders.check');
+    Route::get('/orders/{order}', [OrderController::class, 'show'])->name('orders.show');
+});
+`,
+      "app/Support/Constants.php": `<?php
+namespace App\\Support;
+class Constants {
+    const STATUS_SUBMITTED = 1;
+    const STATUS_APPROVED = 2;
+    const STATUS_REJECTED = 3;
+    const STATUS_SHIPPED = 4;
+    const STATUS_WAITING_REVIEW = 5;
+    const STATUS_ON_HOLD = 6;
+}
+`,
+      "app/Models/Order.php": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass Order extends Model { public function statuses() { return $this->hasMany(OrderStatus::class); } }\n",
+      "app/Models/OrderStatus.php": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass OrderStatus extends Model {}\n",
+      "app/Services/OrderWorkflow.php": `<?php
+namespace App\\Services;
+use App\\Models\\OrderStatus;
+use App\\Support\\Constants;
+class OrderWorkflow {
+    public function submit($order) { $this->addStatus($order, Constants::STATUS_SUBMITTED); $this->review($order, 'pass'); }
+    public function review($order, $mode = 'normal') {
+        if ($mode != 'pass') { $this->addStatus($order, Constants::STATUS_APPROVED); }
+        $this->addStatus($order, Constants::STATUS_WAITING_REVIEW);
+    }
+    public function hold($order) { $this->addStatus($order, Constants::STATUS_ON_HOLD); }
+    public function approve($order) {
+        $latest = OrderStatus::where('order_id', $order->id)->latest()->value('status_id');
+        if ($latest == Constants::STATUS_WAITING_REVIEW) { $this->addStatus($order, Constants::STATUS_APPROVED); }
+        $this->loop($order);
+    }
+    public function loop($order) { $this->loop($order); }
+    public function reject($order) {
+        OrderStatus::create(['order_id' => $order->id, 'status_id' => Constants::STATUS_REJECTED]);
+    }
+    public function ship($order) { $order->statuses()->create(['status_id' => Constants::STATUS_SHIPPED]); }
+    private function addStatus($order, $status) { $order->statuses()->create(['status_id' => $status]); }
+}
+`,
+      "app/Http/Controllers/OrderController.php": `<?php
+namespace App\\Http\\Controllers;
+use App\\Models\\Order;
+use App\\Services\\OrderWorkflow;
+use Illuminate\\Http\\Request;
+class OrderController extends Controller {
+    public function store(Request $request) {
+        $order = Order::create($request->validate(['title' => 'required']));
+        (new OrderWorkflow)->submit($order);
+        return back();
+    }
+    public function show(Order $order) {
+        $latestStatus = OrderStatus::where('order_id', $order->id)->orderByDesc('id')->value('status_id');
+        return view('orders.show', compact('order', 'latestStatus'));
+    }
+}
+`,
+      "app/Http/Controllers/OrderStatusController.php": `<?php
+namespace App\\Http\\Controllers;
+use App\\Models\\Order;
+use App\\Services\\OrderWorkflow;
+use Illuminate\\Support\\Facades\\Gate;
+class OrderStatusController extends Controller {
+    private $workflow;
+    public function __construct(private OrderWorkflow $flow) { $this->workflow = new OrderWorkflow; }
+    public function approve(Order $order) { $this->workflow->approve($order); return back(); }
+    public function reject(Order $order) { $this->flow->reject($order); return back(); }
+    public function ship(Order $order) { app(OrderWorkflow::class)->ship($order); return back(); }
+    public function check(Order $order) {
+        if (Gate::allows('manager') && !Gate::allows('auditor')) { $this->flow->hold($order); }
+        if (Gate::allows('auditor')) { $this->flow->reject($order); }
+        return back();
+    }
+    public function decide(\Illuminate\Http\Request $request, Order $order) {
+        if ($request->type == 'hold') { $this->flow->hold($order); return back(); }
+        $this->flow->reject($order);
+        return back();
+    }
+}
+`,
+      "resources/views/orders/show.blade.php": `@if (in_array($latestStatus, [5, 4]))
+<form method="POST" action="{{ route('orders.approve', $order) }}">@csrf</form>
+@endif
+@if ($latestStatus == 1 || $isAdmin)
+<form method="POST" action="{{ route('orders.ship', $order) }}">@csrf</form>
+@endif
+`,
+      ".env.example": "APP_KEY=\nREDIS_HOST=\n",
+      "config/services.php": "<?php\nreturn ['shop' => ['key' => env('SHOP_KEY')], 'redis' => env('REDIS_PASSWORD')];\n",
+    });
+    map = (await scanProject(dir, { mode: "static" })).map;
+  });
+  const proc = () => map.processes!.find((p) => p.subject === "Order.status_id")!;
+  const step = (id: string) => proc().steps.find((s) => s.node === `route:${id}`)!;
+  const value = (stateId: string) => proc().states.find((s) => s.id === stateId)?.value;
+
+  it("follows calls into services: (new X), $this->prop set in the constructor, promoted properties, app(X::class)", () => {
+    assert.ok(proc(), `processes: ${map.processes?.map((p) => p.subject).join(", ")}`);
+    assert.deepEqual(step("orders.approve").to.map(value), ["2"]);
+    assert.deepEqual(step("orders.reject").to.map(value), ["3"]);
+    assert.deepEqual(step("orders.ship").to.map(value), ["4"]);
+  });
+
+  it("carries status values passed as arguments into helper methods", () => {
+    assert.deepEqual(step("orders.store").paths?.map((p) => p.map(value)), [["1", "5"]], "addStatus($order, Constants::STATUS_SUBMITTED), then review()");
+    assert.deepEqual(step("orders.store").to.map(value), ["5"], "the step ends at the last status it writes");
+    assert.equal(proc().states.find((s) => s.value === "2")?.label, "Approved", "named from the constant");
+  });
+
+  it("treats status-history rows as a status change of the record, not a new record", () => {
+    assert.equal(step("orders.store").creates, true, "Order::create is the record");
+    assert.ok(!map.processes!.some((p) => p.subject.startsWith("OrderStatus.")), "OrderStatus rows belong to Order");
+    assert.equal(proc().name, "Orders", "a status_id column needs no suffix in the name");
+  });
+
+  it("tells permissions from roles, in lanes and in the docs", async () => {
+    assert.equal(map.nodes.find((n) => n.id === "route:orders.approve")!.who?.kind, "permission");
+    assert.equal(map.nodes.find((n) => n.id === "route:orders.reject")!.who?.kind, "role");
+    const { renderDocs } = await import("../src/docs/index.js");
+    const docs = await renderDocs(map);
+    const roles = docs.markdown.get("roles.md")!;
+    assert.ok(roles.includes("## Permissions") && roles.includes("| **Order Approve** |"));
+    assert.ok(roles.includes("## Supervisor"));
+    assert.ok(docs.markdown.get("README.md")!.includes("**1 permission**"));
+  });
+
+  it("separates Laravel's own env keys from the app's", async () => {
+    const key = (k: string) => map.config!.find((c) => c.key === k)!;
+    assert.equal(key("REDIS_PASSWORD").framework, true);
+    assert.equal(key("SHOP_KEY").framework, undefined);
+    const { buildDocModel } = await import("../src/docs/model.js");
+    const missing = buildDocModel(map).findings.find((f) => f.title === "Missing from .env.example")!;
+    assert.deepEqual(missing.items.map((i) => i.text), ["SHOP_KEY"]);
+  });
+});
+
+describe("current status: history queries, Blade and Gate branches", () => {
+  let p: NonNullable<BuiltMap["processes"]>[number];
+  before(async () => {
+    const map = (await scanProject(dirs.find((d) => existsSync(join(d, "app/Services/OrderWorkflow.php")))!, { mode: "static" })).map;
+    p = map.processes!.find((x) => x.subject === "Order.status_id")!;
+  });
+  const step = (id: string) => p.steps.find((s) => s.node === `route:${id}`)!;
+  const values = (ids: string[]) => ids.map((id) => id.split("=")[1]).sort();
+
+  it("reads the status a branch starts from: if ($latest == X) after a latest-status query", () => {
+    assert.deepEqual(step("orders.approve").pathInfo?.[0].from?.map((id) => id.split("=")[1]), ["5"]);
+  });
+
+  it("reads @if ($latestStatus == …) in the view, with $latestStatus set by the page's handler", () => {
+    assert.deepEqual(values(step("orders.approve").from), ["4", "5"]);
+    assert.equal(step("orders.approve").fromVia, "view");
+  });
+
+  it("does not take a status in A || B as a requirement", () => {
+    assert.deepEqual(step("orders.ship").from, []);
+  });
+
+  it("keeps Gate::allows('x') and !Gate::allows('x') branches apart, and says who each is for", () => {
+    const check = step("orders.check");
+    assert.deepEqual(values(check.to), ["3", "6"]);
+    assert.deepEqual(check.pathInfo?.map((i) => i.when), [["manager", "not auditor"], ["auditor"]]);
+  });
+
+  it("names a status first seen as a bare number once the code names it", () => {
+    const s = p.states.find((x) => x.value === "4")!;
+    assert.equal(s.label, "Shipped");
+    assert.equal(s.named, "code");
+  });
+});
+
+describe("status sequences and branches", () => {
+  it("skips a branch that cannot run with the values passed in (review($order, 'pass'))", async () => {
+    const map = (await scanProject(dirs.find((d) => existsSync(join(d, "app/Services/OrderWorkflow.php")))!, { mode: "static" })).map;
+    const p = map.processes!.find((x) => x.subject === "Order.status_id")!;
+    const store = p.steps.find((s) => s.node === "route:orders.store")!;
+    assert.ok(!store.paths!.flat().some((id) => id.endsWith("=2")), "Approved is not written when mode is pass");
+  });
+
+  it("reads if (…) { …; return; } as a branch: hold or reject, not hold then reject", async () => {
+    const map = (await scanProject(dirs.find((d) => existsSync(join(d, "app/Services/OrderWorkflow.php")))!, { mode: "static" })).map;
+    const p = map.processes!.find((x) => x.subject === "Order.status_id")!;
+    const decide = p.steps.find((s) => s.node === "route:orders.decide")!;
+    assert.deepEqual(decide.to.map((id) => id.split("=")[1]).sort(), ["3", "6"]);
+    assert.equal(decide.paths, undefined, "each branch writes one status");
   });
 });
 

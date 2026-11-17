@@ -19,6 +19,7 @@ import type {
   StatesFact,
   StatusCondition,
   StatusValue,
+  StatusWrite,
   Subject,
 } from "./types.js";
 
@@ -56,6 +57,42 @@ export function stepConditions(entries: EntryFact[], navs: NavigatesFact[]): Con
     }
     return { requires: viaPage, via: viaPage.length ? "page" : undefined, actors };
   };
+}
+
+function compatible(a: string[] = [], b: string[] = []): boolean {
+  const seen = new Map(a.map((x) => [x.slice(0, x.lastIndexOf(":")), x.slice(x.lastIndexOf(":") + 1)]));
+  return b.every((x) => {
+    const k = x.slice(0, x.lastIndexOf(":"));
+    return !seen.has(k) || seen.get(k) === x.slice(x.lastIndexOf(":") + 1);
+  });
+}
+
+function compareOrder(a: number[] = [], b: number[] = []): number {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i] ?? -1;
+    const y = b[i] ?? -1;
+    if (x !== y) return x - y;
+  }
+  return 0;
+}
+
+/**
+ * Group a step's writes into sequences, one per branch: each sequence ends at a
+ * write that no later write in a compatible branch follows.
+ */
+export function writeChains(writes: StatusWrite[]): StatusWrite[][] {
+  if (writes.length <= 1) return writes.map((w) => [w]);
+  if (writes.some((w) => !w.order)) return writes.map((w) => [w]);
+  const sorted = [...writes].sort((x, y) => compareOrder(x.order, y.order));
+  const finals = sorted.filter((w, i) => !sorted.slice(i + 1).some((l) => compareOrder(l.order, w.order) > 0 && compatible(w.branch, l.branch)));
+  return finals.map((f) => {
+    const chain: StatusWrite[] = [];
+    for (const w of sorted) {
+      if (compareOrder(w.order, f.order) > 0) break;
+      if (compatible(w.branch, f.branch) && chain.every((c) => compatible(c.branch, w.branch))) chain.push(w);
+    }
+    return chain;
+  });
 }
 
 /** Who does a step: the lane the Process view would put it in. */
@@ -101,6 +138,9 @@ export function buildProcesses(input: {
       const known = catalog.get(subject);
       const stateId = (v: StatusValue): string => {
         const id = `${subject}=${v.value}`;
+        // Seen first as a bare number (@if ($latest == 11)), named later by the code (Constant::STATUS_DONE)
+        const seen = states.get(id);
+        if (seen?.named === "raw" && v.label) Object.assign(seen, { label: v.label, code: v.code, named: "code" });
         if (!states.has(id)) {
           const fromCatalog = known?.values.find((k) => k.value === v.value);
           const best = fromCatalog?.label ? fromCatalog : v;
@@ -124,19 +164,62 @@ export function buildProcesses(input: {
         const cond = conditionsOf(n.id);
         const writes = (p?.writes ?? []).filter((w) => resolve(w.subject) === subject);
         const requires = cond.requires.filter((r) => resolve(r.subject) === subject || (r.subject.startsWith(".") && subject.endsWith(r.subject)));
-        const creates = Boolean(model && p?.creates.includes(model));
+        // A route that already names the record (/orders/{order}/hold) does not create it, even if it creates other rows
+        const creates = Boolean(model && p?.creates.includes(model)) && !n.uri.includes("{");
         const explicitActors = cond.actors.filter((a) => a.via !== "name");
         if (!writes.length && !requires.length && !creates && !explicitActors.length) continue;
 
-        const to = [...new Set(writes.map((w) => stateId(w.to)))];
+        // Writes in sequence (a status history: "submitted", then "waiting for review") end at the last one;
+        // writes in different if/else branches are alternatives.
+        const chains: string[][] = [];
+        const info: Array<{ from?: string[]; when?: string[] }> = [];
+        for (const c of writeChains(writes)) {
+          const ids = c.map((w) => stateId(w.to)).filter((s, i, a) => i === 0 || a[i - 1] !== s);
+          // What the branch of the last write says: if ($latest == X) / if (Gate::allows('x'))
+          const pathFrom: string[] = [];
+          const when: string[] = [];
+          for (const atom of c[c.length - 1].branch ?? []) {
+            const at = atom.lastIndexOf(":");
+            const key = atom.slice(0, at);
+            const val = atom.slice(at + 1);
+            if (key.startsWith("st·")) {
+              const s = key.slice(3);
+              if (s === subject || resolve(s) === subject || (s.startsWith(".") && subject.endsWith(s))) pathFrom.push(stateId({ value: val, code: val }));
+            } else if (key.startsWith("gate·") || key.startsWith("role·")) when.push(val === "1" ? key.slice(5) : `not ${key.slice(5)}`);
+          }
+          const entry = { ...(pathFrom.length ? { from: [...new Set(pathFrom)] } : {}), ...(when.length ? { when: [...new Set(when)] } : {}) };
+          const sig = `${ids.join(">")}|${JSON.stringify(entry)}`;
+          if (chains.some((x, i) => `${x.join(">")}|${JSON.stringify(info[i])}` === sig)) continue;
+          chains.push(ids);
+          info.push(entry);
+        }
+        const to = [...new Set(chains.map((c) => c[c.length - 1]))];
+        const hasInfo = info.some((x) => x.from || x.when);
+        const paths = chains.some((c) => c.length > 1) || hasInfo ? chains : undefined;
         if (creates && !to.length && known?.initial) to.push(stateId(known.initial));
-        if (creates && to.length && !initial) initial = to[0];
-        const from = [...new Set(requires.flatMap((r) => r.values.map(stateId)))];
+        // A new record starts in the first status it is given (a history may move on right away)
+        if (creates && to.length && !initial) initial = chains.length ? chains[0][0] : to[0];
+        let from = [...new Set(requires.flatMap((r) => r.values.map(stateId)))];
+        let fromVia = from.length ? cond.via : undefined;
+        // No check on the step itself, but every branch starts from a known status: that is where it starts
+        if (!from.length && chains.length && info.every((x) => x.from)) {
+          from = [...new Set(info.flatMap((x) => x.from!))];
+          fromVia = "guard";
+        }
 
         const lane = pickLane(cond.actors, entryById.get(n.id));
         if (!laneOf.has(lane.id)) laneOf.set(lane.id, lane);
         else for (const ev of lane.evidence) if (!laneOf.get(lane.id)!.evidence.includes(ev)) laneOf.get(lane.id)!.evidence.push(ev);
-        steps.push({ node: n.id, lane: lane.id, from, fromVia: from.length ? cond.via : undefined, to, creates: creates || undefined });
+        steps.push({
+          node: n.id,
+          lane: lane.id,
+          from,
+          fromVia,
+          to,
+          creates: creates || undefined,
+          ...(paths ? { paths } : {}),
+          ...(paths && hasInfo ? { pathInfo: info } : {}),
+        });
       }
       if (!steps.some((s) => s.to.length)) continue;
       if (!initial && known?.initial) initial = stateId(known.initial);
@@ -146,7 +229,10 @@ export function buildProcesses(input: {
       processes.push({
         id: `${feature.id}:${subject}`,
         feature: feature.id,
-        name: subjects.length > 1 || column !== "status" ? `${feature.name} · ${column}` : feature.name,
+        // Two tables with the same status column in one feature: name both by table
+        name: subjects.filter((s) => s.split(".").slice(1).join(".") === column).length > 1
+          ? `${feature.name} · ${subject}`
+          : subjects.length > 1 || !/^(m_)?status(_id)?$/.test(column) ? `${feature.name} · ${column}` : feature.name,
         subject,
         states: [...states.values()],
         initial,
@@ -173,6 +259,7 @@ function pickLane(actors: ActorRef[], entry: EntryFact | undefined): ProcessLane
     return {
       id: laneKey(name),
       name,
+      kind: chosen.every((a) => a.kind === "permission") ? "permission" : "role",
       evidence: chosen.map((a) => describe(a)),
       provenance: via === "name" ? "inferred" : "extracted",
     };

@@ -10,7 +10,7 @@
  */
 import type { DataColumn, DataTable, Integration, MapNode, ProcessState, SourceRef, Validation } from "../core/types.js";
 import { mermaid, stateGraph, type StateGraph } from "./diagram.js";
-import { byLabel, endpoint, NEGATIVE, short, type DocFeature, type DocModel, type DocProcess, type DocTransition } from "./model.js";
+import { byLabel, endpoint, finalStates, NEGATIVE, processEdges, short, type DocFeature, type DocModel, type DocProcess, type DocTransition } from "./model.js";
 
 export type Inline =
   | string
@@ -104,13 +104,16 @@ function overview(m: DocModel, opts: PageOptions): Page {
   blocks.push({ t: "p", c: [{ i: counts.join(" · ") }] });
 
   // Main processes, one line each: the usual path from the first status to the last
-  const processes = m.features.flatMap((f) => f.processes.map((p) => ({ f, p })));
+  // One line per feature: its main process (the one with the most statuses)
+  const processes = m.features
+    .filter((f) => f.processes.length)
+    .map((f) => ({ f, p: [...f.processes].sort((a, b) => b.process.states.length - a.process.states.length)[0] }));
   if (processes.length) {
     blocks.push({ t: "h", level: 2, text: "Main processes", id: "main-processes" });
     blocks.push({
       t: "list",
       items: processes.map(({ f, p }) => {
-        const path = happyPath(p);
+        const path = happyPath(p).states;
         const line: Inline[] = [{ link: f.feature.name, to: featureAnchor(f) }, ": "];
         path.forEach((s, i) => {
           if (i) line.push(" → ");
@@ -122,19 +125,34 @@ function overview(m: DocModel, opts: PageOptions): Page {
     });
   }
 
-  // Who uses it
+  // Who uses it: roles in full, named permissions in one line
   const cols = m.roles.columns;
   if (cols.length) {
     blocks.push({ t: "h", level: 2, text: "Who uses it", id: "who-uses-it" });
-    blocks.push({
-      t: "list",
-      items: cols.map((col) => {
-        const actions = m.roles.rows.filter((r) => r.node.who!.id === col.id).map((r) => r.node.label);
-        const shown = [...new Set(actions)].slice(0, 4).join(", ");
-        const more = new Set(actions).size > 4 ? ` +${new Set(actions).size - 4} more` : "";
-        return [{ link: col.name, to: roleAnchor(col.id) }, `: ${shown}${more}`];
-      }),
-    });
+    const roleCols = cols.filter((c) => !c.permission);
+    const permCols = cols.filter((c) => c.permission);
+    if (roleCols.length) {
+      blocks.push({
+        t: "list",
+        items: roleCols.map((col) => {
+          const actions = [...new Set(m.roles.rows.filter((r) => r.node.who!.id === col.id).map((r) => r.node.label))];
+          const more = actions.length > 4 ? ` +${actions.length - 4} more` : "";
+          return [{ link: col.name, to: roleAnchor(col.id) }, `: ${actions.slice(0, 4).join(", ")}${more}`];
+        }),
+      });
+    }
+    if (permCols.length) {
+      const names = permCols.slice(0, 6).map((c) => c.name).join(", ");
+      blocks.push({
+        t: "p",
+        c: [
+          { b: `${permCols.length} permission${permCols.length === 1 ? "" : "s"}` },
+          ` (named access checks such as ${names}${permCols.length > 6 ? ", …" : ""}). Who holds them is set in the app's data. `,
+          { link: "Which actions need which permission", to: "permissions" },
+          ".",
+        ],
+      });
+    }
   }
 
   blocks.push({ t: "h", level: 2, text: "Modules", id: "modules" });
@@ -192,29 +210,57 @@ function roles(m: DocModel): Page {
   const page = (b: Block[]): Page => ({ file: "roles.md", id: "roles", title: "Who uses it", part: "understand", lead: "Each role and what it can do.", blocks: b });
   if (!m.roles.rows.length) return page([{ t: "note", kind: "info", c: ["No actions found."] }]);
 
-  for (const col of cols) {
+  const actionsOf = (id: string) => {
+    const byFeature = new Map<string, string[]>();
+    for (const r of m.roles.rows) {
+      if (r.node.who!.id !== id) continue;
+      byFeature.set(r.feature.name, [...(byFeature.get(r.feature.name) ?? []), r.node.label]);
+    }
+    return byFeature;
+  };
+  const permCols = cols.filter((c) => c.permission);
+  for (const col of cols.filter((c) => !c.permission)) {
     blocks.push({ t: "h", level: 2, text: col.name, id: roleAnchor(col.id) });
     if (col.id === "signed-in-user") blocks.push({ t: "p", c: [{ i: "Anyone who is logged in (no role check found)." }] });
     else if (col.id === "anyone") blocks.push({ t: "p", c: [{ i: "No login or role check found." }] });
-    const byFeature = new Map<string, string[]>();
-    for (const r of m.roles.rows) {
-      if (r.node.who!.id !== col.id) continue;
-      const list = byFeature.get(r.feature.name) ?? [];
-      list.push(r.node.label);
-      byFeature.set(r.feature.name, list);
-    }
-    blocks.push({ t: "list", items: [...byFeature].map(([f, actions]) => [{ b: f }, `: ${actions.join(", ")}`]) });
-    if (col.evidence.length) blocks.push({ t: "p", c: [{ i: `Found in ${col.evidence.slice(0, 2).join("; ")}` }, ...(col.human ? [" ", { badge: "person", kind: "human" } as Inline] : [])] });
+    blocks.push({ t: "list", items: [...actionsOf(col.id)].map(([f, actions]) => [{ b: f }, `: ${actions.join(", ")}`]) });
+    if (col.evidence.length && !col.fallback) blocks.push({ t: "p", c: [{ i: `Found in ${col.evidence.slice(0, 2).join("; ")}` }, ...(col.human ? [" ", { badge: "person", kind: "human" } as Inline] : [])] });
   }
 
+  // Named permissions: one table, not one section each
+  if (permCols.length) {
+    blocks.push({ t: "h", level: 2, text: "Permissions", id: "permissions" });
+    blocks.push({ t: "p", c: [{ i: "Named access checks (can:…, @can, Gate::allows). Who holds each one is set in the app's data, not in the code." }] });
+    blocks.push({
+      t: "table",
+      head: ["Permission", "Actions"],
+      rows: permCols.map((c) => [
+        [{ b: c.name }, ...(c.human ? [" ", { badge: "person", kind: "human" } as Inline] : [])],
+        [[...actionsOf(c.id)].map(([f, actions]) => `${f}: ${actions.join(", ")}`).join("; ")],
+      ]),
+    });
+  }
+
+  // The matrix: roles as columns, the permission (if any) as text
+  const roleCols = cols.filter((c) => !c.permission);
   const rows: Inline[][][] = [];
   let lastFeature = "";
   for (const r of m.roles.rows) {
     const fname = r.feature.name !== lastFeature ? r.feature.name : "";
     lastFeature = r.feature.name;
-    rows.push([[fname ? { b: fname } : ""], [r.node.label], ...cols.map((c): Inline[] => (r.node.who!.id === c.id ? [{ badge: "●", kind: "role" }] : [""]))]);
+    const perm = permCols.find((c) => c.id === r.node.who!.id);
+    rows.push([
+      [fname ? { b: fname } : ""],
+      [r.node.label],
+      ...roleCols.map((c): Inline[] => (r.node.who!.id === c.id ? [{ badge: "●", kind: "role" }] : [""])),
+      ...(permCols.length ? [perm ? [perm.name] : [""]] : []),
+    ]);
   }
-  blocks.push({ t: "details", summary: "Role × action matrix", blocks: [{ t: "table", head: ["Feature", "Action", ...cols.map((c) => c.name)], rows, compact: true }] });
+  blocks.push({
+    t: "details",
+    summary: "All actions in one table",
+    blocks: [{ t: "table", head: ["Feature", "Action", ...roleCols.map((c) => c.name), ...(permCols.length ? ["Permission"] : [])], rows, compact: true }],
+  });
   return page(blocks);
 }
 
@@ -290,6 +336,7 @@ function states(list: ProcessState[]): Inline[] {
 
 /** Steps in reading order: creation first, then by how far their starting status is from the start. */
 function storyOrder(p: DocProcess): DocTransition[] {
+  const edges = processEdges(p);
   const dist = new Map<string, number>();
   const queue: string[] = [];
   const seed = (id: string) => {
@@ -298,41 +345,60 @@ function storyOrder(p: DocProcess): DocTransition[] {
       queue.push(id);
     }
   };
-  if (p.initial) seed(p.initial.id);
-  for (const t of p.transitions) if (t.step.creates) t.to.forEach((s) => seed(s.id));
+  const starts = edges.filter((e) => e.from === "start");
+  for (const e of starts.filter((x) => !x.transition?.node.uri.includes("{"))) seed(e.to.id);
+  if (!dist.size) for (const e of starts) seed(e.to.id);
+  if (p.initial && !dist.size) seed(p.initial.id);
   while (queue.length) {
     const s = queue.shift()!;
-    for (const t of p.transitions) {
-      if (!t.from.some((x) => x.id === s)) continue;
-      for (const to of t.to) {
-        if (!dist.has(to.id)) {
-          dist.set(to.id, dist.get(s)! + 1);
-          queue.push(to.id);
-        }
-      }
+    for (const e of edges) {
+      if (typeof e.from === "string" || e.from.id !== s || dist.has(e.to.id)) continue;
+      dist.set(e.to.id, dist.get(s)! + 1);
+      queue.push(e.to.id);
     }
   }
-  const rank = (t: DocTransition) => (t.step.creates ? -1 : t.from.length ? Math.min(...t.from.map((s) => dist.get(s.id) ?? 500)) : 1000);
+  // A new record comes from a form with no record in its URL (POST /orders), not from /orders/{order}/...
+  const fromOf = (t: DocTransition) => (t.from.length ? t.from : t.pathFrom.flat());
+  const rank = (t: DocTransition) => (t.step.creates ? (t.node.uri.includes("{") ? -1 : -2) : fromOf(t).length ? Math.min(...fromOf(t).map((s) => dist.get(s.id) ?? 500)) : 1000);
   return [...p.transitions].sort((a, b) => rank(a) - rank(b) || Number(NEGATIVE.test(a.node.label)) - Number(NEGATIVE.test(b.node.label)));
 }
 
-/** The usual path: from the first status, follow steps that are not hold/reject/cancel. */
-function happyPath(p: DocProcess): ProcessState[] {
+/** The usual path: from the first status, follow arrows that are not hold/reject/cancel. Also returns the steps taken. */
+function happyPath(p: DocProcess): { states: ProcessState[]; steps: DocTransition[] } {
+  const edges = processEdges(p).filter((e) => !e.background);
   const order = storyOrder(p);
-  const start = p.initial ?? order.find((t) => t.step.creates)?.to[0];
-  if (!start) return [];
-  const path = [start];
+  const rank = (e: (typeof edges)[number]) => (e.transition ? order.indexOf(e.transition) : 999);
+  const first = edges.filter((e) => e.from === "start").sort((a, b) => rank(a) - rank(b))[0];
+  const start = first?.to ?? p.initial;
+  if (!start) return { states: [], steps: [] };
+  const states = [start];
+  const steps: DocTransition[] = first?.transition ? [first.transition] : [];
   const seen = new Set([start.id]);
   let cur = start;
   for (;;) {
-    const next = order.find((t) => t.from.some((s) => s.id === cur.id) && !NEGATIVE.test(t.node.label) && t.to.some((s) => !seen.has(s.id) && !NEGATIVE.test(s.label)));
-    const to = next?.to.find((s) => !seen.has(s.id) && !NEGATIVE.test(s.label));
-    if (!to) break;
-    path.push(to);
-    seen.add(to.id);
-    cur = to;
+    const next = edges
+      .filter((e) => typeof e.from !== "string" && e.from.id === cur.id && !e.negative && !seen.has(e.to.id))
+      .sort((a, b) => Number(a.transition !== steps[steps.length - 1]) - Number(b.transition !== steps[steps.length - 1]) || rank(a) - rank(b))[0];
+    if (!next) break;
+    states.push(next.to);
+    seen.add(next.to.id);
+    if (next.transition && !steps.includes(next.transition)) steps.push(next.transition);
+    cur = next.to;
   }
-  return path;
+  return { states, steps };
+}
+
+/** "→ A → B, or (when X) → C": the statuses a step writes, in sequence, per branch. */
+function pathsText(t: DocTransition): Inline[] {
+  const out: Inline[] = [];
+  t.paths.forEach((path, i) => {
+    if (i) out.push(";", " or");
+    const from = !t.from.length ? t.pathFrom[i] ?? [] : [];
+    if (from.length) out.push(" when ", ...states(from));
+    path.forEach((s) => out.push(" → ", stateText(s)));
+    if (t.pathWhen[i]?.length) out.push(" ", { i: `(if ${t.pathWhen[i].join(", ")})` });
+  });
+  return out;
 }
 
 function processBlocks(f: DocFeature, p: DocProcess): Block[] {
@@ -342,18 +408,14 @@ function processBlocks(f: DocFeature, p: DocProcess): Block[] {
 
   // The usual path as numbered steps, then the other paths (hold, reject, edit, automatic)
   const order = storyOrder(p);
-  const path = happyPath(p);
-  const main: DocTransition[] = order.filter((t) => t.step.creates);
-  for (let i = 0; i + 1 < path.length; i++) {
-    const t = order.find((x) => !main.includes(x) && x.from.some((s) => s.id === path[i].id) && x.to.some((s) => s.id === path[i + 1].id));
-    if (t) main.push(t);
-  }
+  const main = happyPath(p).steps;
   const usual = main.length ? main : order;
   const rest = order.filter((t) => !usual.includes(t));
   const line = (t: DocTransition, withFrom: boolean): Inline[] => {
     const out: Inline[] = [{ b: t.lane.name }, `: ${t.node.label}`];
-    if (withFrom && !t.step.creates) out.push(" when ", ...(t.from.length ? states(t.from) : [{ i: "any status" } as Inline]));
-    out.push(" → ", ...states(t.to));
+    const branchFrom = t.pathFrom.some((x) => x.length);
+    if (withFrom && !t.step.creates && (t.from.length || !branchFrom)) out.push(" when ", ...(t.from.length ? states(t.from) : [{ i: "any status" } as Inline]));
+    out.push(...pathsText(t));
     return out;
   };
   blocks.push({ t: "steps", items: usual.map((t) => line(t, false)) });
@@ -368,10 +430,9 @@ function processBlocks(f: DocFeature, p: DocProcess): Block[] {
     blocks.push({ t: "p", c: [{ b: "Other paths" }] });
     blocks.push({ t: "list", items: others });
   }
-  const finals = p.process.states.filter((s) => !p.transitions.some((t) => t.from.some((x) => x.id === s.id)) && [...p.transitions, ...p.background].some((t) => t.to.some((x) => x.id === s.id)));
-  if (finals.length) blocks.push({ t: "p", c: ["Ends as ", ...states(finals), "."] });
+  const finals = finalStates(p);
+  if (finals.length) blocks.push({ t: "p", c: ["Can end as ", ...states(finals), "."] });
   if (p.other.length) blocks.push({ t: "p", c: [{ i: `Also: ${p.other.map((t) => `${t.node.label} (${t.lane.name})`).join(", ")}. Status unchanged.` }] });
-
   const graph = stateGraph(p);
   if (graph.edges.length) blocks.push({ t: "diagram", graph, title: `${f.feature.name}: status flow`, id, mermaid: mermaid(graph) });
 
@@ -480,8 +541,14 @@ function dataDictionary(m: DocModel): Page {
     if (t.model) meta.push({ code: t.model }, " · ");
     if (t.partial) meta.push("created elsewhere · ");
     meta.push(`${t.migrations.length} migration${t.migrations.length === 1 ? "" : "s"}`);
+    const keys = t.columns.filter((c) => c.primary || c.references).map((c) => c.name);
+    if (keys.length) meta.push(` · keys: ${keys.join(", ")}`);
     blocks.push({ t: "p", c: meta });
-    blocks.push({ t: "table", head: ["Column", "Type", "Null", "Default", "Key", "Note"], rows: t.columns.map((c) => columnRow(t, c, knownValues)), compact: true });
+    blocks.push({
+      t: "details",
+      summary: `Columns (${t.columns.length})`,
+      blocks: [{ t: "table", head: ["Column", "Type", "Null", "Default", "Key", "Note"], rows: t.columns.map((c) => columnRow(t, c, knownValues)), compact: true }],
+    });
   }
   return page(blocks);
 }
@@ -657,21 +724,27 @@ function accessOf(n: MapNode): string {
 function configuration(m: DocModel): Page {
   const blocks: Block[] = [];
   const used = m.config.filter((c) => c.uses.length);
+  const own = used.filter((c) => !c.framework);
+  const framework = used.filter((c) => c.framework);
   const unused = m.config.filter((c) => !c.uses.length && c.inExample);
+  const table = (list: typeof used): Block => ({
+    t: "table",
+    head: ["Key", "Config", "Read in", "Default", ".env.example"],
+    rows: list.map((c) => [
+      [{ code: c.key }],
+      [[...new Set(c.uses.map((u) => u.config).filter(Boolean))].join(", ") || DASH],
+      c.uses.flatMap((u, i): Inline[] => [...(i ? ["; "] : []), { src: u.source }]),
+      [c.uses.some((u) => u.hasDefault) ? "yes" : "no"],
+      [c.inExample ? "yes" : c.framework ? "no" : { badge: "missing", kind: "warn" }],
+    ]),
+  });
   blocks.push({ t: "p", c: [{ i: "Names only. Values are never read." }] });
   if (!used.length) blocks.push({ t: "note", kind: "info", c: ["No env() calls found."] });
-  else
-    blocks.push({
-      t: "table",
-      head: ["Key", "Config", "Read in", "Default", ".env.example"],
-      rows: used.map((c) => [
-        [{ code: c.key }],
-        [[...new Set(c.uses.map((u) => u.config).filter(Boolean))].join(", ") || DASH],
-        c.uses.flatMap((u, i): Inline[] => [...(i ? ["; "] : []), { src: u.source }]),
-        [c.uses.some((u) => u.hasDefault) ? "yes" : "no"],
-        [c.inExample ? "yes" : { badge: "missing", kind: "warn" }],
-      ]),
-    });
+  if (own.length) {
+    blocks.push({ t: "h", level: 2, text: "Keys this app adds", id: "config-app" });
+    blocks.push(table(own));
+  }
+  if (framework.length) blocks.push({ t: "details", summary: `Laravel's own keys (${framework.length})`, blocks: [table(framework)] });
   if (unused.length) {
     blocks.push({ t: "p", c: [{ b: "Only in .env.example" }, " (used by Laravel or packages): ", ...unused.flatMap((c, i): Inline[] => [...(i ? [", "] : []), { code: c.key }])] });
   }

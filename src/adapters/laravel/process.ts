@@ -13,12 +13,29 @@
  */
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import type { ActorRef, ProcessInfo, StatesFact, StatusCondition, StatusValue, StatusWrite } from "../../core/types.js";
+import type { ActorRef, ProcessInfo, StatesFact, StatusCondition, StatusValue, StatusWrite, Subject } from "../../core/types.js";
 import { ClassLocator } from "./controllers.js";
-import { lineOf, resolveName, stringValue, walk, type NameContext, type PhpNode } from "./php.js";
+import { flattenChain, lineOf, resolveName, stringValue, walk, type NameContext, type PhpNode } from "./php.js";
 
 /** Columns that hold a workflow state (tested on the snake_case form, so StatusApproval works too). */
-const STATUS_COLUMN_RE = /^(status|state|stage|step|phase|approval|approval_status|approval_state|workflow_status|status_[a-z0-9_]+|[a-z0-9_]+_status|is_approved?|approved?|flag_approval|approval_flag)$/i;
+const STATUS_COLUMN_RE = /^(status|state|stage|step|phase|approval|approval_status|approval_state|workflow_status|status_[a-z0-9_]+|[a-z0-9_]+_status|(?:[a-z0-9]+_)*status_id|is_approved?|approved?|flag_approval|approval_flag)$/i;
+
+/** Relations that hold a record's status history: $request->status()->create([...]). */
+const STATUS_RELATION = /^(status|statuses|state|states|approval|approvals|histor(y|ies)|logs?|tracking|progress)$/i;
+/** Models that are rows of another record's status history (TStatusRequest, ApprovalHistory…). */
+const STATUS_MODEL = /(Status|State|History|Histories|Approval|Log|Tracking)/;
+
+/** How deep builtlore follows calls into services (controller → service → service). */
+const MAX_CALL_DEPTH = 3;
+
+interface AnalyzeOptions {
+  /** Types of parameters passed in by the caller (service methods are often untyped). */
+  seedTypes?: Map<string, string>;
+  /** Status values of parameters passed in by the caller. */
+  seedValues?: Map<string, StatusValue[]>;
+  depth?: number;
+  stack?: Set<string>;
+}
 export const STATUS_COLUMN = { test: (c: string): boolean => STATUS_COLUMN_RE.test(snake(c)) };
 
 function snake(s: string): string {
@@ -346,9 +363,9 @@ export class ProcessReader {
   // ----- handlers ---------------------------------------------------------
 
   /** Actors, status writes and guards in a controller method or closure body. */
-  analyzeHandler(body: PhpNode, names: NameContext, file: string, selfClass?: string): ProcessInfo {
+  analyzeHandler(body: PhpNode, names: NameContext, file: string, selfClass?: string, opts: AnalyzeOptions = {}): ProcessInfo {
     const info: ProcessInfo = { actors: [], writes: [], requires: [], creates: [] };
-    const types = new Map<string, string>(); // variable -> model short name
+    const types = new Map<string, string>(opts.seedTypes ?? []); // variable -> model short name
     const userVars = new Set<string>(["user", "authUser", "currentUser", "me"]);
 
     // Parameter types: (PurchaseRequest $purchaseRequest)
@@ -361,12 +378,17 @@ export class ProcessReader {
       }
     }
 
-    const locals: Locals = { values: new Map(), arrays: new Map() };
+    const locals: Locals = { values: new Map(), arrays: new Map(), seeded: opts.seedValues };
+    const statusVars = new Map<string, Subject>(); // $latestStatus -> Request.status_id
     walk(body, (n) => {
       // $x = Model::find(...) / new Model / auth()->user()
       if (n.kind === "assign" && n.left?.kind === "variable" && typeof n.left.name === "string") {
         const model = this.modelOfExpr(n.right, names, types);
         if (model) types.set(n.left.name, model);
+        if (n.right?.kind === "variable" && types.has(n.right.name)) types.set(n.left.name, types.get(n.right.name)!);
+        // $latestStatus = TStatusX::where('x_id', $x->id)->latest()->value('status_id')
+        const current = this.currentStatusOf(n.right, names, types);
+        if (current) statusVars.set(n.left.name, current);
         if (isCurrentUser(n.right, userVars)) userVars.add(n.left.name);
         // $status = 'Approved' / $data = ['status' => ...]
         const list = locals.values.get(n.left.name) ?? [];
@@ -392,7 +414,7 @@ export class ProcessReader {
         const col = n.left.offset?.name;
         if (col && STATUS_COLUMN.test(col) && n.operator === "=") {
           const subj = subjectOf(n.left.what, types, col);
-          if (subj) this.recordWrite(info, subj, col, n.right, names, selfClass, locals, { file, line: lineOf(n) });
+          if (subj) this.recordWrite(info, subj, col, n.right, names, selfClass, locals, { file, line: lineOf(n) }, n);
         }
       }
       if (n.kind === "call" || n.kind === "new") {
@@ -400,11 +422,15 @@ export class ProcessReader {
       }
       if (n.kind === "if" && n.test && exits(n.body)) {
         // if (status != V) return / abort: the step requires V
-        for (const c of comparisons(n.test)) this.readGuard(c, names, types, file, info, selfClass, lineOf(n), true);
+        for (const c of comparisons(n.test)) {
+          this.readGuard(c, names, types, file, info, selfClass, lineOf(n), true);
+          this.readVarGuard(c, statusVars, names, selfClass, file, info, lineOf(n));
+        }
         for (const a of this.actorsInExpr(n.test, userVars, names, types)) pushActor(info.actors, a);
       }
       return undefined;
     });
+    if (statusVars.size) info.statusVars = Object.fromEntries(statusVars);
 
     // Ability checks: $this->authorize('approve-manager'), Gate::authorize('x')
     walk(body, (n) => {
@@ -417,7 +443,321 @@ export class ProcessReader {
         }
       }
     });
+
+    // Where each write sits: its position, and which if/else branch it is in
+    const branches = branchPaths(
+      body,
+      (test) => decideWithSeeds(test, opts.seedValues),
+      (test) => this.branchAtoms(test, statusVars, names, selfClass, types),
+    );
+    for (const w of info.writes) {
+      const at = this.writeAt.get(w);
+      if (!at || w.order) continue;
+      w.order = [offsetOf(at.node)];
+      w.branch = [...(branches.get(at.node) ?? []), ...(at.alt !== undefined ? [`v${offsetOf(at.node)}:${at.alt}`] : [])];
+    }
+    info.writes = info.writes.filter((w) => !w.branch?.includes("dead:1"));
+
+    // Status changes made in services the handler calls ($this->approval->hold($request))
+    this.followCalls(body, names, selfClass, types, locals, info, opts.depth ?? 0, opts.stack ?? new Set(), branches);
     return info;
+  }
+
+  /** The AST node of each write recorded in this scan, to place it in order and in its branch. */
+  private writeAt = new WeakMap<StatusWrite, { node: PhpNode; alt?: number }>();
+
+  // ----- current status and branch conditions -----------------------------
+
+  /**
+   * An expression that reads a record's current status:
+   *   TStatusX::where('x_id', $x->id)->latest()->value('status_id')   (history table)
+   *   $x->statuses()->latest()->value('status_id') · $x->latestStatus->status_id
+   *   TStatusX::where('x_id', $x->id)->orderByDesc('id')->first()->status_id
+   * Returns the subject ("X.status_id"), or null.
+   */
+  currentStatusOf(expr: PhpNode, names: NameContext, types: Map<string, string>): Subject | null {
+    let node = expr;
+    if (node?.kind === "cast" || node?.kind === "parenthesis") node = node.what ?? node.expr ?? node.inner;
+    let column: string | null = null;
+    let chainNode: PhpNode = null;
+    if ((node?.kind === "propertylookup" || node?.kind === "nullsafepropertylookup") && STATUS_COLUMN.test(node.offset?.name ?? "")) {
+      column = node.offset.name;
+      chainNode = node.what;
+      // $x->latestStatus->status_id
+      if ((chainNode?.kind === "propertylookup" || chainNode?.kind === "nullsafepropertylookup") && chainNode.what?.kind === "variable" && /status/i.test(chainNode.offset?.name ?? "")) {
+        const model = types.get(chainNode.what.name);
+        return model ? `${model}.${column}` : null;
+      }
+    } else if (node?.kind === "call") chainNode = node;
+    const chain = chainNode?.kind === "call" ? flattenChain(chainNode) : null;
+    if (!chain) return null;
+    if (!column) {
+      const pick = chain.steps.find((s) => s.name === "value" || s.name === "pluck");
+      const col = pick ? stringValue(pick.args[0]) : null;
+      if (!col || !STATUS_COLUMN.test(col)) return null;
+      column = col;
+    }
+    // Only reads that take one record's latest row (latest / orderByDesc / first / last)
+    if (!chain.steps.some((s) => /^(latest|orderByDesc|orderBy|first|last|value|pluck|sole)$/.test(s.name))) return null;
+    // History table queried by the owner's id
+    if (chain.root.type === "static") {
+      const model = this.modelName(chain.root.class, names);
+      const where = chain.steps.find((s) => s.name === "where" && s.args.length === 2 && /_id$/.test(stringValue(s.args[0]) ?? "") && s.args[1]?.kind === "propertylookup" && s.args[1].offset?.name === "id" && s.args[1].what?.kind === "variable");
+      const owner = where ? types.get(where.args[1].what.name) : undefined;
+      if (owner && owner !== model) return `${owner}.${column}`;
+      return model ? `${model}.${column}` : null;
+    }
+    // $x->statuses()->latest()->value(...)
+    const base = chain.steps.length ? baseVariableOf(chainNode) : null;
+    const model = base ? types.get(base) : undefined;
+    return model ? `${model}.${column}` : null;
+  }
+
+  /** if ($latestStatus != X) return …: the step requires X. */
+  private readVarGuard(c: Comparison, statusVars: Map<string, Subject>, names: NameContext, selfClass: string | undefined, file: string, info: ProcessInfo, line: number | undefined): void {
+    const varOf = (n: PhpNode) => (n?.kind === "variable" && statusVars.has(n.name) ? statusVars.get(n.name)! : null);
+    const requiresEqual = c.negated; // the code leaves when the comparison is true
+    if (!requiresEqual) return;
+    if (c.inArray) {
+      const subject = varOf(c.left);
+      const values = c.inArray.map((v) => this.value(v, names, selfClass)).filter((v): v is StatusValue => Boolean(v));
+      if (subject && values.length) info.requires.push({ subject, values, via: "guard", source: { file, line } });
+      return;
+    }
+    const subject = varOf(c.left) ?? varOf(c.right);
+    const v = this.value(varOf(c.left) ? c.right : c.left, names, selfClass);
+    if (subject && v) info.requires.push({ subject, values: [v], via: "guard", source: { file, line } });
+  }
+
+  /**
+   * What an if-condition says about the branch it guards, as "key:value" atoms:
+   *   Gate::allows('medical') -> gate·medical:1 (and :0 when negated)
+   *   $latestStatus == 4 / $x->status == 'HOLD' -> st·X.status_id:4
+   * Branches whose atoms disagree cannot both run.
+   */
+  branchAtoms(test: PhpNode, statusVars: Map<string, Subject>, names: NameContext, selfClass: string | undefined, types: Map<string, string>): { then: string[]; else: string[] } {
+    const conj: PhpNode[] = [];
+    const flatten = (n: PhpNode): boolean => {
+      if (n?.kind === "parenthesis") return flatten(n.inner);
+      if (n?.kind === "bin" && /^(&&|and)$/i.test(n.type)) return flatten(n.left) && flatten(n.right);
+      if (n?.kind === "bin" && /^(\|\||or)$/i.test(n.type)) return false;
+      conj.push(n);
+      return true;
+    };
+    if (!flatten(test)) return { then: [], else: [] };
+    const atom = (n: PhpNode, neg: boolean): string | null => {
+      if (n?.kind === "parenthesis") return atom(n.inner, neg);
+      if (n?.kind === "unary" && n.type === "!") return atom(n.what, !neg);
+      if (n?.kind === "call") {
+        const method: string | undefined = n.what?.offset?.name;
+        const arg = stringValue(n.arguments?.[0]);
+        if (!method || !arg) return null;
+        const isGate = n.what?.kind === "staticlookup" && /(^|\\)Gate$/.test(n.what.what?.name ?? "");
+        if (isGate && /^(allows|check|any)$/.test(method)) return `gate·${arg}:${neg ? 0 : 1}`;
+        if (isGate && method === "denies") return `gate·${arg}:${neg ? 1 : 0}`;
+        if (!isGate && (method === "can" || method === "cannot")) return `gate·${arg}:${(method === "can") !== neg ? 1 : 0}`;
+        if (!isGate && /^(hasRole|hasAnyRole)$/.test(method)) return `role·${arg}:${neg ? 0 : 1}`;
+        return null;
+      }
+      if (n?.kind === "bin" && /^(==|===|!=|!==)$/.test(n.type)) {
+        const equal = !n.type.startsWith("!") !== neg;
+        if (!equal) return null; // "is not X" names no single status
+        const subjectOf2 = (x: PhpNode): Subject | null => {
+          if (x?.kind === "variable" && statusVars.has(x.name)) return statusVars.get(x.name)!;
+          const col = x?.kind === "propertylookup" ? x.offset?.name : null;
+          return col && STATUS_COLUMN.test(col) ? subjectOf(x.what, types, col) : null;
+        };
+        const s = subjectOf2(n.left) ?? subjectOf2(n.right);
+        const v = this.value(subjectOf2(n.left) ? n.right : n.left, names, selfClass);
+        return s && v ? `st·${s}:${v.value}` : null;
+      }
+      return null;
+    };
+    return {
+      then: conj.map((c) => atom(c, false)).filter((x): x is string => Boolean(x)),
+      else: conj.length === 1 ? [atom(conj[0], true)].filter((x): x is string => Boolean(x)) : [],
+    };
+  }
+
+  // ----- calls into services ----------------------------------------------
+
+  private callCache = new Map<string, ProcessInfo>();
+  private propCache = new Map<string, Map<string, string>>();
+
+  /**
+   * Follow calls to methods of the app's own classes (services, helpers, the same
+   * controller) and take the status changes, guards and stored procedures found
+   * there. Arguments carry their model type into the called method. Actors are not
+   * taken over: a service may check several roles, and the step's own code says who.
+   */
+  private followCalls(
+    body: PhpNode,
+    names: NameContext,
+    selfClass: string | undefined,
+    types: Map<string, string>,
+    valueLocals: Locals,
+    info: ProcessInfo,
+    depth: number,
+    stack: Set<string>,
+    branches: WeakMap<object, string[]>,
+  ): void {
+    if (depth >= MAX_CALL_DEPTH) return;
+    const locals = new Map<string, string>(); // variable -> service class
+    for (const p of body.arguments ?? []) {
+      const t = p.type?.name;
+      const v = p.name?.name ?? p.name;
+      if (t && v) {
+        const fq = resolveName(t, p.type.resolution, names);
+        if (this.isService(fq)) locals.set(v, fq);
+      }
+    }
+    walk(body, (n) => {
+      if (n.kind === "assign" && n.left?.kind === "variable" && typeof n.left.name === "string") {
+        const cls = this.newClass(n.right, names);
+        if (cls && this.isService(cls)) locals.set(n.left.name, cls);
+      }
+    });
+
+    walk(body, (n) => {
+      if (n.kind !== "call") return;
+      const what = n.what;
+      const method = what?.offset?.name;
+      if (typeof method !== "string" || (what.kind !== "propertylookup" && what.kind !== "nullsafepropertylookup" && what.kind !== "staticlookup")) return;
+      const recv = what.what;
+      let target: string | null = null;
+      if (what.kind === "staticlookup") {
+        if (recv?.kind === "name") target = recv.name === "self" || recv.name === "static" ? selfClass ?? null : resolveName(recv.name, recv.resolution, names);
+      } else if (recv?.kind === "variable" && recv.name === "this") target = selfClass ?? null;
+      else if ((recv?.kind === "propertylookup" || recv?.kind === "nullsafepropertylookup") && recv.what?.kind === "variable" && recv.what.name === "this") {
+        target = selfClass ? this.propertyClass(selfClass, recv.offset?.name) : null;
+      } else if (recv?.kind === "variable" && typeof recv.name === "string") target = locals.get(recv.name) ?? null;
+      else target = this.newClass(recv, names);
+      if (!target || !this.isService(target)) return;
+      if (branches.get(n)?.includes("dead:1")) return; // in a branch that cannot run with the values passed in
+
+      const found = this.methodOf(target, method);
+      if (!found) return;
+      const key = `${target}@${method}`;
+      if (stack.has(key)) return;
+      const seed = new Map<string, string>();
+      const seedValues = new Map<string, StatusValue[]>();
+      (n.arguments ?? []).forEach((a: PhpNode, i: number) => {
+        const p = found.node.arguments?.[i];
+        const pname = p?.name?.name ?? p?.name;
+        if (!a || typeof pname !== "string") return;
+        if (a.kind === "variable" && types.has(a.name)) seed.set(pname, types.get(a.name)!);
+        // A status value passed in (a literal, a constant, or a variable holding one): the callee may write it
+        const vs = this.values(a, names, selfClass, valueLocals);
+        if (vs?.length) seedValues.set(pname, vs);
+      });
+      // Parameters left out take their default: function approve($x, $mode = 'normal')
+      (found.node.arguments ?? []).forEach((p: PhpNode, i: number) => {
+        const pname = p?.name?.name ?? p?.name;
+        if (i < (n.arguments ?? []).length || typeof pname !== "string" || !p.value) return;
+        const v = this.value(p.value, found.names, found.cls);
+        if (v) seedValues.set(pname, [v]);
+      });
+      const cacheKey = `${key}|${[...seed].map(([k, v]) => `${k}:${v}`).join(",")}|${[...seedValues].map(([k, v]) => `${k}=${v.map((x) => x.value).join("/")}`).join(",")}`;
+      let sub = this.callCache.get(cacheKey);
+      if (!sub) {
+        sub = this.analyzeHandler(found.node, found.names, found.file, found.cls, { seedTypes: seed, seedValues, depth: depth + 1, stack: new Set([...stack, key]) });
+        this.callCache.set(cacheKey, sub);
+      }
+      // The callee's writes happen at the call: in its place in the sequence and in its branch
+      const callOrder = offsetOf(n);
+      const callBranch = branches.get(n) ?? [];
+      for (const w of sub.writes) {
+        const placed: StatusWrite = { ...w, order: [callOrder, ...(w.order ?? [])], branch: [...callBranch, ...(w.branch ?? [])] };
+        const key = (x: StatusWrite) => `${x.subject}|${x.to.value}|${(x.order ?? []).join(".")}`;
+        if (!info.writes.some((x) => key(x) === key(placed))) info.writes.push(placed);
+      }
+      for (const r of sub.requires) info.requires.push(r);
+      for (const c of sub.creates) if (!info.creates.includes(c)) info.creates.push(c);
+      for (const u of sub.unresolved ?? []) if (!(info.unresolved ?? []).some((x) => x.source.file === u.source.file && x.source.line === u.source.line)) (info.unresolved ??= []).push(u);
+      for (const sp of sub.procedures ?? []) if (!(info.procedures ?? []).includes(sp)) (info.procedures ??= []).push(sp);
+    });
+  }
+
+  /** new X / (new X) / app(X::class) / resolve(X::class) -> FQCN */
+  private newClass(n: PhpNode, names: NameContext): string | null {
+    if (!n) return null;
+    if (n.kind === "parenthesis") return this.newClass(n.inner, names);
+    if (n.kind === "new" && n.what?.kind === "name") return resolveName(n.what.name, n.what.resolution, names);
+    if (n.kind === "call" && n.what?.kind === "name" && /^\\?(app|resolve)$/.test(n.what.name)) {
+      const a = n.arguments?.[0];
+      if (a?.kind === "staticlookup" && (a.offset?.name ?? "") === "class" && a.what?.kind === "name") return resolveName(a.what.name, a.what.resolution, names);
+    }
+    return null;
+  }
+
+  /** An app class that is not a model, enum or form request: services, helpers, controllers. */
+  private isService(fqcn: string): boolean {
+    if (!fqcn.startsWith("App\\") && !this.locator.fileFor(fqcn)) return false;
+    if (/\\Http\\Requests\\/.test(fqcn)) return false;
+    const info = this.classInfo(fqcn);
+    return Boolean(info && !info.isModel && !info.isEnum);
+  }
+
+  /** A method of a class or of its parents in the app. */
+  private methodOf(fqcn: string, method: string, depth = 0): { node: PhpNode; names: NameContext; file: string; cls: string } | null {
+    const loaded = this.locator.load(fqcn);
+    if (!loaded || depth > 3) return null;
+    let found: PhpNode = null;
+    let parent: string | null = null;
+    walk(loaded.ast, (n) => {
+      if (found) return false;
+      if (n.kind === "class" || n.kind === "trait") {
+        parent = n.extends?.name ? resolveName(n.extends.name, n.extends.resolution, loaded.names) : null;
+        for (const m of n.body ?? []) if (m.kind === "method" && (m.name?.name ?? m.name) === method && m.body) found = m;
+        return false;
+      }
+    });
+    if (found) return { node: found, names: loaded.names, file: loaded.file, cls: fqcn };
+    return parent ? this.methodOf(parent, method, depth + 1) : null;
+  }
+
+  /** Class of $this->prop: typed property, promoted constructor parameter, or set in the constructor. */
+  private propertyClass(fqcn: string, prop: unknown): string | null {
+    if (typeof prop !== "string") return null;
+    let props = this.propCache.get(fqcn);
+    if (!props) {
+      props = new Map();
+      this.propCache.set(fqcn, props);
+      const loaded = this.locator.load(fqcn);
+      if (loaded) {
+        const { names } = loaded;
+        walk(loaded.ast, (n) => {
+          if (n.kind !== "class") return;
+          for (const m of n.body ?? []) {
+            if (m.kind === "propertystatement") {
+              for (const p of m.properties ?? []) {
+                const pn = p.name?.name ?? p.name;
+                if (p.type?.name && typeof pn === "string") props!.set(pn, resolveName(p.type.name, p.type.resolution, names));
+              }
+            }
+            if (m.kind === "method" && (m.name?.name ?? m.name) === "__construct") {
+              const params = new Map<string, string>();
+              for (const a of m.arguments ?? []) {
+                const an = a.name?.name ?? a.name;
+                if (!a.type?.name || typeof an !== "string") continue;
+                const t = resolveName(a.type.name, a.type.resolution, names);
+                params.set(an, t);
+                if (a.flags || a.visibility || a.readonly) props!.set(an, t); // promoted: private Service $svc
+              }
+              walk(m.body, (x) => {
+                if (x.kind !== "assign" || x.left?.kind !== "propertylookup" || x.left.what?.name !== "this") return;
+                const name = x.left.offset?.name;
+                if (typeof name !== "string") return;
+                const cls = this.newClass(x.right, names) ?? (x.right?.kind === "variable" ? params.get(x.right.name) ?? null : null);
+                if (cls) props!.set(name, cls);
+              });
+            }
+          }
+          return false;
+        });
+      }
+    }
+    return props.get(prop) ?? null;
   }
 
   /** Resolve every value an expression can have: literals, constants, ternaries, match arms, local variables. */
@@ -454,7 +794,7 @@ export class ProcessReader {
     }
     if (node.kind === "variable" && typeof node.name === "string") {
       const assigned = locals.values.get(node.name);
-      if (!assigned?.length) return null;
+      if (!assigned?.length) return locals.seeded?.get(node.name) ?? null;
       const out: StatusValue[] = [];
       for (const a of assigned) {
         const v = this.values(a, names, selfClass, locals, depth + 1);
@@ -475,10 +815,17 @@ export class ProcessReader {
     selfClass: string | undefined,
     locals: Locals,
     source: { file: string; line?: number },
+    at?: PhpNode,
   ): void {
     const vs = this.values(valueNode, names, selfClass, locals);
     if (vs) {
-      for (const v of vs) if (!info.writes.some((w) => w.subject === subject && w.to.value === v.value)) info.writes.push({ subject, to: v, source });
+      vs.forEach((v, i) => {
+        if (info.writes.some((w) => w.subject === subject && w.to.value === v.value && this.writeAt.get(w)?.node === at)) return;
+        const w: StatusWrite = { subject, to: v, source };
+        info.writes.push(w);
+        // Several values from one expression (ternary, match) are alternatives, not a sequence
+        if (at) this.writeAt.set(w, { node: at, alt: vs.length > 1 ? i : undefined });
+      });
     } else {
       (info.unresolved ??= []).push({ column: `${subject.split(".")[0] ? subject.split(".")[0] + "." : ""}${column}`, code: exprText(valueNode), source });
     }
@@ -500,7 +847,7 @@ export class ProcessReader {
     if (callName && /^(update|statement|select|insert|unprepared|affectingStatement)$/.test(callName) && n.arguments?.[0]) {
       const sql = stringValue(n.arguments[0]) ?? stringPrefix(n.arguments[0]);
       if (sql) {
-        this.readSql(sql, info, { file, line: lineOf(n) });
+        this.readSql(sql, info, { file, line: lineOf(n) }, n);
         if (/^\s*(update|insert|exec|call|select)/i.test(sql)) return;
       }
     }
@@ -522,22 +869,44 @@ export class ProcessReader {
     else subjectModel = this.modelOfChain(n.what.what, names, types);
     const table = this.tableOfChain(n.what?.what);
     const tableSubject = table ? this.modelForTable(table) ?? table : null;
-    const subjectBase = subjectModel ?? tableSubject;
+    let subjectBase = subjectModel ?? tableSubject;
 
-    if (subjectModel && /^(create|firstOrCreate|updateOrCreate|forceCreate|new|make)$/.test(method)) {
+    // $request->status()->create([...]): a row in the record's status history, not a new record
+    const rel = n.kind === "call" ? statusRelation(n.what?.what) : null;
+    // TStatusRequest::create(['request_id' => $request->id, 'status_id' => …]): same, written from the other side
+    const owner = !rel && subjectModel && STATUS_MODEL.test(subjectModel) ? this.ownerOf(n.arguments ?? [], types, subjectModel, locals) : null;
+    if (owner) subjectBase = owner;
+
+    if (subjectModel && !rel && /^(create|firstOrCreate|updateOrCreate|forceCreate|new|make)$/.test(method)) {
       if (!info.creates.includes(subjectModel)) info.creates.push(subjectModel);
     }
     for (const arg of n.arguments ?? []) {
       for (const entry of entriesOf(arg, locals)) {
         const k = stringValue(entry.key);
         if (!k || !STATUS_COLUMN.test(k)) continue;
-        this.recordWrite(info, `${subjectBase ?? ""}.${k}`, k, entry.value, names, selfClass, locals, { file, line: lineOf(n) });
+        this.recordWrite(info, `${subjectBase ?? ""}.${k}`, k, entry.value, names, selfClass, locals, { file, line: lineOf(n) }, n);
       }
     }
   }
 
+  /** The record a status-history row belongs to: ['request_id' => $request->id] with $request a known model. */
+  private ownerOf(args: PhpNode[], types: Map<string, string>, rowModel: string, locals: Locals): string | null {
+    for (const arg of args) {
+      for (const e of entriesOf(arg, locals)) {
+        const k = stringValue(e.key);
+        const v = e.value;
+        if (!k || !/_id$/.test(k) || STATUS_COLUMN.test(k)) continue;
+        if (v?.kind === "propertylookup" && v.offset?.name === "id" && v.what?.kind === "variable") {
+          const model = types.get(v.what.name);
+          if (model && model !== rowModel) return model;
+        }
+      }
+    }
+    return null;
+  }
+
   /** UPDATE ... SET status = 'X' in raw SQL; EXEC / CALL of stored procedures. */
-  private readSql(sql: string, info: ProcessInfo, source: { file: string; line?: number }): void {
+  private readSql(sql: string, info: ProcessInfo, source: { file: string; line?: number }, at?: PhpNode): void {
     const upd = /\bupdate\s+\[?(?:\w+\]?\.\[?)?(\w+)\]?\s+set\s+([\s\S]+?)(?:\bwhere\b|$)/i.exec(sql);
     if (upd) {
       for (const m of upd[2].matchAll(/\[?(\w+)\]?\s*=\s*('([^']*)'|-?\d+|\?|:\w+)/g)) {
@@ -545,7 +914,9 @@ export class ProcessReader {
         const subject = `${this.modelForTable(upd[1]) ?? upd[1]}.${m[1]}`;
         if (m[3] !== undefined || /^-?\d+$/.test(m[2])) {
           const value = m[3] ?? m[2];
-          info.writes.push({ subject, to: { value, code: m[2], label: m[3] !== undefined ? literalLabel(value) : undefined, labelFrom: m[3] !== undefined ? "literal" : undefined }, source });
+          const w: StatusWrite = { subject, to: { value, code: m[2], label: m[3] !== undefined ? literalLabel(value) : undefined, labelFrom: m[3] !== undefined ? "literal" : undefined }, source };
+          info.writes.push(w);
+          if (at) this.writeAt.set(w, { node: at });
         } else (info.unresolved ??= []).push({ column: subject, code: `SQL parameter ${m[2]}`, source });
       }
     }
@@ -711,7 +1082,14 @@ const VALUE_RE = String.raw`'[^']*'|"[^"]*"|-?\d+(?:\.\d+)?|\\?[A-Za-z_][\w\\]*:
 const COL_RE = String.raw`[a-z_][a-z0-9_]*`;
 
 /** Read status conditions and actors from the raw conditions around a link in a view. */
-export function parseViewConditions(conds: string[], reader: ProcessReader, file: string, line: number): { actors: ActorRef[]; requires: StatusCondition[] } {
+export function parseViewConditions(
+  conds: string[],
+  reader: ProcessReader,
+  file: string,
+  line: number,
+  /** View variables that hold a record's current status, from the handler: latestStatus -> X.status_id */
+  vars: Record<string, Subject> = {},
+): { actors: ActorRef[]; requires: StatusCondition[] } {
   const actors: ActorRef[] = [];
   const requires: StatusCondition[] = [];
   for (const raw of conds) {
@@ -726,7 +1104,15 @@ export function parseViewConditions(conds: string[], reader: ProcessReader, file
       continue;
     }
     const negatedBlock = raw.startsWith("!(");
-    const expr = raw;
+    let expr = raw;
+    // A || B: a status comparison is only a requirement when every alternative is one
+    const alternatives = raw.replace(/^!\(|\)$/g, "").split(/\|\||\s+or\s+/i);
+    if (alternatives.length > 1) {
+      const isStatusCmp = (part: string) =>
+        new RegExp(String.raw`->(${COL_RE})(?:->value)?\s*(===?|!==?)|\$(\w+)\s*===?\s*(${VALUE_RE})|(${VALUE_RE})\s*===?\s*\$(\w+)|in_array\(`, "i").test(part) &&
+        !/^\s*!?\s*\$\w+\s*$/.test(part);
+      if (!alternatives.every((p) => isStatusCmp(p) && (/->\w+/.test(p) || Object.keys(vars).some((v) => p.includes(`$${v}`))))) expr = raw.replace(/\$\w+(?:->\w+)*\s*(===?|!==?|<>)\s*\S+/g, "");
+    }
     // status comparisons: $x->status == V, V === $x->status
     const cmp = new RegExp(String.raw`\$(\w+)((?:->\w+)*?)->(${COL_RE})(?:->value)?\s*(===?|!==?|<>)\s*(${VALUE_RE})|(${VALUE_RE})\s*(===?|!==?|<>)\s*\$(\w+)((?:->\w+)*?)->(${COL_RE})(?:->value)?`, "gi");
     for (const m of expr.matchAll(cmp)) {
@@ -736,6 +1122,22 @@ export function parseViewConditions(conds: string[], reader: ProcessReader, file
       if (equal === negatedBlock) continue; // only "must be X"
       const v = viewValue(value, reader);
       if (v) requires.push({ subject: viewSubject(variable, column, reader), values: [v], via: "view", source: { file, line } });
+    }
+    // $latestStatus == 4, where the handler set $latestStatus to the record's current status
+    const bare = new RegExp(String.raw`\$(\w+)\s*(===?|!==?|<>)\s*(${VALUE_RE})|(${VALUE_RE})\s*(===?|!==?|<>)\s*\$(\w+)(?!\s*->|\w)`, "g");
+    for (const m of expr.matchAll(bare)) {
+      const [variable, op, value] = m[1] ? [m[1], m[2], m[3]] : [m[6], m[5], m[4]];
+      const subject = vars[variable];
+      if (!subject) continue;
+      if (op.startsWith("=") === negatedBlock) continue;
+      const v = viewValue(value, reader);
+      if (v) requires.push({ subject, values: [v], via: "view", source: { file, line } });
+    }
+    for (const m of expr.matchAll(/(!\s*)?in_array\(\s*\$(\w+)\s*,\s*\[([^\]]*)\]/g)) {
+      const subject = vars[m[2]];
+      if (!subject || Boolean(m[1]) !== negatedBlock) continue;
+      const values = [...m[3].matchAll(new RegExp(VALUE_RE, "g"))].map((x) => viewValue(x[0], reader)).filter((x): x is StatusValue => Boolean(x));
+      if (values.length) requires.push({ subject, values, via: "view", source: { file, line } });
     }
     // in_array($x->status, [A, B])
     for (const m of expr.matchAll(new RegExp(String.raw`(!\s*)?in_array\(\s*\$(\w+)(?:->\w+)*?->(${COL_RE})(?:->value)?\s*,\s*\[([^\]]*)\]`, "gi"))) {
@@ -791,6 +1193,8 @@ function viewSubject(variable: string, column: string, reader: ProcessReader): s
 interface Locals {
   values: Map<string, PhpNode[]>;
   arrays: Map<string, Array<{ key: PhpNode; value: PhpNode }>>;
+  /** Parameter values passed in by the caller: tambahStatus($x, Constant::STATUS_HOLD). */
+  seeded?: Map<string, StatusValue[]>;
 }
 
 /** Key/value entries of array literals in an argument, including arrays built in local variables. */
@@ -885,6 +1289,107 @@ function statusSide(c: Comparison): { record: PhpNode; column: string; values: P
   const rc = col(c.right);
   if (rc) return { record: unwrap(c.right).what, column: rc, values: [c.left] };
   return null;
+}
+
+/** $param == 'x' / $param != 'x' with $param passed in as one known value: true or false; otherwise unknown. */
+function decideWithSeeds(test: PhpNode, seeds: Map<string, StatusValue[]> | undefined): boolean | undefined {
+  if (!seeds?.size || test?.kind !== "bin" || !/^(==|===|!=|!==)$/.test(test.type)) return undefined;
+  const side = (a: PhpNode, b: PhpNode) => {
+    if (a?.kind !== "variable" || typeof a.name !== "string") return undefined;
+    const vs = seeds.get(a.name);
+    const lit = literal(b);
+    if (!vs || vs.length !== 1 || lit === null) return undefined;
+    return vs[0].value === lit;
+  };
+  const eq = side(test.left, test.right) ?? side(test.right, test.left);
+  if (eq === undefined) return undefined;
+  return test.type.startsWith("!") ? !eq : eq;
+}
+
+/** $x in $x->a()->b(): the variable a call chain starts from. */
+function baseVariableOf(n: PhpNode): string | null {
+  let cur = n;
+  while (cur) {
+    if (cur.kind === "call") cur = cur.what;
+    else if (cur.kind === "propertylookup" || cur.kind === "nullsafepropertylookup") cur = cur.what;
+    else if (cur.kind === "variable") return typeof cur.name === "string" ? cur.name : null;
+    else return null;
+  }
+  return null;
+}
+
+function offsetOf(n: PhpNode): number {
+  return n?.loc?.start?.offset ?? (n?.loc?.start?.line ?? 0) * 1000;
+}
+
+/**
+ * For every node, the if/else (and switch, ternary) branches it is in, as "<id>:<branch>".
+ * Code after `if (x) { …; return; }` runs only when x is false, so it counts as the else branch.
+ */
+export function branchPaths(
+  body: PhpNode,
+  decide?: (test: PhpNode) => boolean | undefined,
+  atoms?: (test: PhpNode) => { then: string[]; else: string[] },
+): WeakMap<object, string[]> {
+  const map = new WeakMap<object, string[]>();
+  const visit = (node: PhpNode, path: string[]): void => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      let cur = path;
+      for (const stmt of node) {
+        visit(stmt, cur);
+        if (stmt?.kind === "if") cur = afterIf(stmt, cur);
+      }
+      return;
+    }
+    if (typeof node.kind !== "string") return;
+    map.set(node, path);
+    const id = offsetOf(node);
+    if (node.kind === "if") {
+      // A condition known from the caller's arguments (if ($mode != 'skip')): the other branch never runs here
+      const known = decide?.(node.test);
+      visit(node.test, path);
+      const what = atoms?.(node.test) ?? { then: [], else: [] };
+      visit(node.body, [...path, `if${id}:0`, ...what.then, ...(known === false ? ["dead:1"] : [])]);
+      visit(node.alternate, [...path, `if${id}:1`, ...what.else, ...(known === true ? ["dead:1"] : [])]);
+      return;
+    }
+    if (node.kind === "switch") {
+      visit(node.test, path);
+      (node.body?.children ?? []).forEach((c: PhpNode, i: number) => visit(c, [...path, `sw${id}:${i}`]));
+      return;
+    }
+    if (node.kind === "retif") {
+      visit(node.test, path);
+      visit(node.trueExpr, [...path, `t${id}:0`]);
+      visit(node.falseExpr, [...path, `t${id}:1`]);
+      return;
+    }
+    for (const key of Object.keys(node)) {
+      if (key === "loc" || key === "leadingComments" || key === "trailingComments") continue;
+      const v = node[key];
+      if (v && typeof v === "object") visit(v, path);
+    }
+  };
+  /** if (a) { return } elseif (b) { return }: what follows runs in the last else. */
+  const afterIf = (stmt: PhpNode, path: string[]): string[] => {
+    let cur = path;
+    let node = stmt;
+    while (node?.kind === "if" && exits(node.body)) {
+      cur = [...cur, `if${offsetOf(node)}:1`, ...(atoms?.(node.test).else ?? [])];
+      node = node.alternate;
+    }
+    return cur;
+  };
+  visit(body, []);
+  return map;
+}
+
+/** $x->status() in $x->status()->create(...): the relation name when it holds status history. */
+function statusRelation(n: PhpNode): string | null {
+  if (n?.kind !== "call" || (n.what?.kind !== "propertylookup" && n.what?.kind !== "nullsafepropertylookup")) return null;
+  const name = n.what.offset?.name;
+  return typeof name === "string" && STATUS_RELATION.test(name) ? name : null;
 }
 
 function subjectOf(record: PhpNode, types: Map<string, string>, column: string): string | null {

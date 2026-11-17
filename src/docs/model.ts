@@ -29,6 +29,12 @@ export interface DocTransition {
   lane: ProcessLane;
   from: ProcessState[];
   to: ProcessState[];
+  /** Each sequence of statuses the step writes (one per branch); a single status when there is no sequence. */
+  paths: ProcessState[][];
+  /** Per path: the status it starts from, when its branch checks it (if ($latest == X)). */
+  pathFrom: ProcessState[][];
+  /** Per path: the checks it runs under ("medical", "not medical"). */
+  pathWhen: string[][];
 }
 
 export interface DocBackground {
@@ -61,6 +67,8 @@ export interface RoleColumn {
   name: string;
   fallback: boolean;
   human: boolean;
+  /** A named permission check (can:Slide Approve), not a role. */
+  permission: boolean;
   evidence: string[];
 }
 
@@ -134,7 +142,7 @@ export function buildDocModel(map: BuiltMap): DocModel {
     for (const n of f.nodes) {
       if (!n.who) continue;
       rows.push({ feature: f.feature, node: n });
-      const c = columns.get(n.who.id) ?? { id: n.who.id, name: n.who.name, fallback: FALLBACK_LANES.has(n.who.id), human: n.who.provenance === "human", evidence: [] };
+      const c = columns.get(n.who.id) ?? { id: n.who.id, name: n.who.name, fallback: FALLBACK_LANES.has(n.who.id), human: n.who.provenance === "human", permission: n.who.kind === "permission", evidence: [] };
       for (const e of n.who.evidence) if (!c.evidence.includes(e) && c.evidence.length < 4) c.evidence.push(e);
       columns.set(n.who.id, c);
     }
@@ -220,7 +228,23 @@ function docProcess(p: Process, nodeById: Map<string, MapNode>, automation: NonN
       lane: laneById.get(step.lane) ?? { id: step.lane, name: step.lane, evidence: [], provenance: "extracted" },
       from: step.from.map((id) => stateById.get(id)).filter((s): s is ProcessState => Boolean(s)),
       to: step.to.map((id) => stateById.get(id)).filter((s): s is ProcessState => Boolean(s)),
+      paths: [],
+      pathFrom: [],
+      pathWhen: [],
     };
+    t.paths = step.paths
+      ? step.paths.map((p) => p.map((id) => stateById.get(id)).filter((s): s is ProcessState => Boolean(s))).filter((p) => p.length)
+      : t.to.map((s) => [s]);
+    t.pathFrom = t.paths.map((_, i) => (step.pathInfo?.[i]?.from ?? []).map((id) => stateById.get(id)).filter((s): s is ProcessState => Boolean(s)));
+    t.pathWhen = t.paths.map((_, i) => step.pathInfo?.[i]?.when ?? []);
+    // A path that is part of a longer one under the same checks says nothing new: keep the longer one
+    const ids = t.paths.map((p) => p.map((s) => s.id).join(">"));
+    const keep = t.paths.map((_, i) =>
+      !t.paths.some((_, j) => j !== i && ids[j].length > ids[i].length && `>${ids[j]}>`.includes(`>${ids[i]}>`) && t.pathWhen[j].join("|") === t.pathWhen[i].join("|")),
+    );
+    t.paths = t.paths.filter((_, i) => keep[i]);
+    t.pathFrom = t.pathFrom.filter((_, i) => keep[i]);
+    t.pathWhen = t.pathWhen.filter((_, i) => keep[i]);
     (t.to.length ? transitions : other).push(t);
   }
 
@@ -285,7 +309,7 @@ function findings(m: DocModel, featureById: Map<string, Feature>): Finding[] {
     });
   }
 
-  const missing = map.config?.filter((c) => c.uses.length && !c.inExample) ?? [];
+  const missing = map.config?.filter((c) => c.uses.length && !c.inExample && !c.framework) ?? [];
   const hasExample = map.config?.some((c) => c.inExample) ?? false;
   if (missing.length && hasExample) {
     out.push({
@@ -319,18 +343,72 @@ function findings(m: DocModel, featureById: Map<string, Feature>): Finding[] {
     out.push({ title: "Edits for removed code", why: "Still in builtlore.edits.yaml.", items: orphans.map((text) => ({ text })) });
   }
 
-  if (map.skipped.length) {
+  // "Redirect back with no known source page" only affects arrows on the canvas: a scan note, not a finding
+  const minor = (s: { reason: string }) => /^Redirect back from /.test(s.reason);
+  const unread = map.skipped.filter((s) => !minor(s));
+  if (unread.length) {
     out.push({
       title: "Not read by builtlore",
       why: "builtlore does not guess: these lines are not in the docs.",
-      items: map.skipped.map((s) => ({ text: s.reason, source: s.source })),
+      items: unread.map((s) => ({ text: s.reason, source: s.source })),
     });
   }
 
   // How the scan ran (mode, counts, what was left out on purpose): the same notes `builtlore scan` prints.
   const info = map.notes.filter((n) => !n.startsWith("Warning:") && !n.startsWith("Kept "));
-  if (info.length) out.push({ title: "Scan notes", why: "", items: info.map((text) => ({ text })) });
+  const notes = [...info.map((text) => ({ text })), ...map.skipped.filter(minor).map((s) => ({ text: s.reason, source: s.source }))];
+  if (notes.length) out.push({ title: "Scan notes", why: "", items: notes });
   return out;
+}
+
+export interface DocEdge {
+  from: ProcessState | "start" | "any";
+  to: ProcessState;
+  label: string;
+  who: string;
+  negative: boolean;
+  background: boolean;
+  transition?: DocTransition;
+}
+
+/**
+ * Every arrow of a process: from the status a step needs (or a new record, or any
+ * status when the code does not check) to each status it writes, in sequence.
+ */
+export function processEdges(p: DocProcess): DocEdge[] {
+  const out: DocEdge[] = [];
+  const push = (e: DocEdge) => {
+    const key = (x: DocEdge) => `${typeof x.from === "string" ? x.from : x.from.id}>${x.to.id}>${x.label}`;
+    if (!out.some((x) => key(x) === key(e))) out.push(e);
+  };
+  for (const t of p.transitions) {
+    const label = t.node.label;
+    const sources: DocEdge["from"][] = [];
+    if (t.step.creates) sources.push("start");
+    sources.push(...t.from);
+    if (!sources.length) sources.push("any");
+    t.paths.forEach((path, pi) => {
+      const neg = (s: ProcessState) => NEGATIVE.test(label) || NEGATIVE.test(s.label);
+      // A branch that checks the status (if ($latest == X)) starts from X, not from every source of the step
+      const own: DocEdge["from"][] = t.pathFrom[pi]?.length && !t.from.length ? t.pathFrom[pi] : sources;
+      for (const s of own) push({ from: s, to: path[0], label, who: t.lane.name, negative: neg(path[0]), background: false, transition: t });
+      for (let i = 1; i < path.length; i++) push({ from: path[i - 1], to: path[i], label, who: t.lane.name, negative: neg(path[i]), background: false, transition: t });
+    });
+  }
+  for (const b of p.background) {
+    const label = b.schedule ? `${b.by} (${b.schedule.charAt(0).toLowerCase()}${b.schedule.slice(1)})` : b.by;
+    const sources: DocEdge["from"][] = b.from.length ? b.from : ["any"];
+    for (const to of b.to) for (const s of sources) push({ from: s, to, label, who: "automatic", negative: false, background: true });
+  }
+  return out;
+}
+
+/** Statuses the record can end in: reached by some arrow, and no arrow leaves them. */
+export function finalStates(p: DocProcess): ProcessState[] {
+  const edges = processEdges(p);
+  const leaves = new Set(edges.filter((e) => typeof e.from !== "string").map((e) => (e.from as ProcessState).id));
+  const seen = new Set<string>();
+  return edges.map((e) => e.to).filter((s) => !leaves.has(s.id) && !seen.has(s.id) && (seen.add(s.id), true));
 }
 
 export function slugify(s: string): string {

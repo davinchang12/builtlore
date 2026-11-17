@@ -182,7 +182,7 @@ describe("documentation facts from the approval-workflow app", () => {
       assert.ok(!unvalidated.some((t) => t.includes("Save purchase request")), "FormRequest counts as validation");
       assert.deepEqual(titled("env() outside config")!.items[0].source, { file: "app/Http/Controllers/LoginController.php", line: 12 });
       assert.ok(titled("Duplicate routes"));
-      assert.equal(titled("Not read by builtlore")!.items.length, map.skipped.length);
+      assert.equal(titled("Not read by builtlore")!.items.length, map.skipped.filter((s) => !s.reason.startsWith("Redirect back from")).length);
     });
   });
 });

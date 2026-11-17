@@ -79,6 +79,7 @@ export const laravelAdapter: Adapter = {
     const entries: EntryFact[] = [];
     const analyses = new Map<string, HandlerAnalysis | null>();
     const usedIds = new Set<string>();
+    const viewVars = new Map<string, Record<string, string>>();
     // A handler used by several routes is read once (and its unreadable rules reported once).
     const requestCache = new Map<string, RequestReading>();
     const readRequestOnce = (file: string, node: PhpNode, read: () => RequestReading): RequestReading => {
@@ -157,6 +158,8 @@ export const laravelAdapter: Adapter = {
         ...(request?.inputs.length ? { inputs: request.inputs } : {}),
         ...(analysis ? { responds: respondsOf(analysis) } : {}),
       });
+      // The page's view may check these: @if ($latestStatus == 4)
+      if (process.statusVars) viewVars.set(id, process.statusVars);
     }
 
     // 3. Navigation edges
@@ -184,7 +187,7 @@ export const laravelAdapter: Adapter = {
             const trigger = link.trigger === "ref" ? (resolver.typeOf(to) === "page" ? "link" : "ajax") : link.trigger;
             const edge: NavigatesFact = { kind: "navigates", from: e.id, to, trigger, source: { file: link.file, line: link.line } };
             if (link.when) {
-              const when = parseViewConditions(link.when, reader, link.file, link.line);
+              const when = parseViewConditions(link.when, reader, link.file, link.line, viewVars.get(e.id));
               if (when.actors.length || when.requires.length) edge.when = when;
             }
             edges.push(edge);
@@ -279,7 +282,10 @@ export const laravelAdapter: Adapter = {
     const states = reader.statesFacts(models);
     const withStates = states.filter((st) => st.values.length || st.initial).length;
     const steps = entries.filter((e) => e.process?.writes.length).length;
-    if (steps) notes.push(`Process: ${steps} step${steps === 1 ? "" : "s"} change a status; ${withStates} status column${withStates === 1 ? "" : "s"} with known values.`);
+    if (steps) {
+      const described = withStates ? `; ${withStates} status column${withStates === 1 ? "" : "s"} with values listed on the model` : "";
+      notes.push(`Process: ${steps} step${steps === 1 ? "" : "s"} change a status (including in the services they call)${described}.`);
+    }
 
     // 7. Documentation layer: data, configuration, integrations, automation
     const php = new PhpCache(repo.root);
@@ -309,7 +315,13 @@ export const laravelAdapter: Adapter = {
     ].filter(Boolean);
     if (counts.length) notes.push(`Docs: ${counts.join(", ")}.`);
 
-    const facts: Fact[] = [...entries, ...dedupe(resolved), ...skipped, ...states, ...docs];
+    // A line reached from several steps (a shared service method) is reported once
+    const seenSkip = new Set<string>();
+    const uniqueSkipped = skipped.filter((s) => {
+      const k = `${s.reason}|${s.source.file}|${s.source.line ?? ""}`;
+      return seenSkip.has(k) ? false : (seenSkip.add(k), true);
+    });
+    const facts: Fact[] = [...entries, ...dedupe(resolved), ...uniqueSkipped, ...states, ...docs];
     return { facts, notes };
   },
 };

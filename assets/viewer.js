@@ -56,6 +56,15 @@
   $("#stat-edges").textContent = data.edges.length;
 
   var restored = restoreState();
+  // One process per feature on first open: its main one (most statuses); the rest stay one tick away
+  if (!restored) {
+    var mainOf = {};
+    PROCESSES.forEach(function (p) {
+      var cur = mainOf[p.feature];
+      if (!cur || p.states.length > cur.states.length) mainOf[p.feature] = p;
+    });
+    PROCESSES.forEach(function (p) { if (mainOf[p.feature] !== p) state.hiddenProc[p.id] = true; });
+  }
   if (EDIT) $("#edit-banner").style.display = "block";
 
   renderFeatureList();

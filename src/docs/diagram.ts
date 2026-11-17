@@ -6,7 +6,7 @@
  * code does not check starts from "Any status (no check in code)".
  */
 import { createRequire } from "node:module";
-import { NEGATIVE, type DocProcess } from "./model.js";
+import { processEdges, type DocProcess } from "./model.js";
 
 const require = createRequire(import.meta.url);
 
@@ -46,33 +46,16 @@ export function stateGraph(p: DocProcess): StateGraph {
   const edges: GraphEdge[] = [];
   let start = false;
   let any = false;
-  const push = (e: GraphEdge) => {
-    if (!edges.some((x) => x.from === e.from && x.to === e.to && x.label === e.label)) edges.push(e);
-  };
-
-  for (const t of p.transitions) {
-    const label = t.node.label;
-    const negative = NEGATIVE.test(label) || t.to.some((s) => NEGATIVE.test(s.label));
-    const sources: string[] = [];
-    if (t.step.creates) {
+  for (const e of processEdges(p)) {
+    let from: string;
+    if (e.from === "start") {
       start = true;
-      sources.push("start");
-    }
-    for (const f of t.from) sources.push(stateNode(f.id, f.label));
-    if (!sources.length) {
+      from = "start";
+    } else if (e.from === "any") {
       any = true;
-      sources.push("any");
-    }
-    for (const to of t.to) {
-      const target = stateNode(to.id, to.label);
-      for (const s of sources) push({ from: s, to: target, label, who: t.lane.name, negative, background: false });
-    }
-  }
-  for (const b of p.background) {
-    const label = b.schedule ? `${b.by} (${b.schedule.charAt(0).toLowerCase()}${b.schedule.slice(1)})` : b.by;
-    const sources = b.from.length ? b.from.map((f) => stateNode(f.id, f.label)) : ["any"];
-    if (!b.from.length) any = true;
-    for (const to of b.to) for (const s of sources) push({ from: s, to: stateNode(to.id, to.label), label, who: "automatic", negative: false, background: true });
+      from = "any";
+    } else from = stateNode(e.from.id, e.from.label);
+    edges.push({ from, to: stateNode(e.to.id, e.to.label), label: e.label, who: e.who, negative: e.negative, background: e.background });
   }
   if (start) nodes.unshift({ id: "start", label: "", kind: "start" });
   if (any) nodes.push({ id: "any", label: "Any status (no check in code)", kind: "any" });
@@ -84,7 +67,7 @@ export function stateGraph(p: DocProcess): StateGraph {
 // --------------------------------------------------------------- Mermaid
 
 function mm(s: string): string {
-  return s.replace(/[:;#"<>{}[\]]/g, (c) => ({ ":": " -", ";": ",", "#": "No.", '"': "'", "<": "â€¹", ">": "â€º", "{": "(", "}": ")", "[": "(", "]": ")" })[c]!).replace(/\s+/g, " ").trim();
+  return s.replace(/[:;#"<>{}[\]]/g, (c) => ({ ":": " -", ";": ",", "#": "No.", '"': "'", "<": "‹", ">": "›", "{": "(", "}": ")", "[": "(", "]": ")" })[c]!).replace(/\s+/g, " ").trim();
 }
 
 export function mermaid(g: StateGraph): string {

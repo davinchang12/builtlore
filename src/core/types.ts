@@ -202,6 +202,8 @@ export interface ConfigFact {
   uses: ConfigUse[];
   /** Listed in .env.example (names only). */
   inExample: boolean;
+  /** A key the framework's own config files read (APP_KEY, REDIS_HOST…), not one the app added. */
+  framework?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +228,10 @@ export interface StatusWrite {
   subject: Subject;
   to: StatusValue;
   source: SourceRef;
+  /** Position in the step's code (call site first when written in a called method), to put writes in sequence. */
+  order?: number[];
+  /** if/else branches the write is in ("<id>:<branch>"); writes in different branches of one if are alternatives. */
+  branch?: string[];
 }
 
 export interface StatusCondition {
@@ -256,6 +262,8 @@ export interface ProcessInfo {
   unresolved?: Array<{ column: string; code: string; source: SourceRef }>;
   /** Stored procedures called (their status changes are not visible in the code). */
   procedures?: string[];
+  /** Variables holding a record's current status ($latestStatus = TStatusX::where(…)->latest()->value('status_id')), for the view. */
+  statusVars?: Record<string, Subject>;
 }
 
 /** Known values of a status column: constants, enum cases, label arrays, defaults. */
@@ -457,6 +465,8 @@ export interface ProcessState {
 export interface ProcessLane {
   id: string; // lowercase key
   name: string;
+  /** "permission": a named permission check (can:Slide Approve), not a role or position. */
+  kind?: "role" | "permission";
   /** Where builtlore found this actor; empty for the fallback lanes. */
   evidence: string[];
   provenance: Provenance;
@@ -472,6 +482,10 @@ export interface ProcessStep {
   to: string[];
   /** This step creates the record. */
   creates?: boolean;
+  /** When the step writes several statuses in a row (a status history), each sequence it can write, per branch. */
+  paths?: string[][];
+  /** Per path: the status it starts from and the checks it runs under (if (Gate::allows('x')), if ($latest == X)). */
+  pathInfo?: Array<{ from?: string[]; when?: string[] }>;
 }
 
 export interface Process {
