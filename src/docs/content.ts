@@ -483,16 +483,30 @@ function happyPath(p: DocProcess): { states: ProcessState[]; steps: DocTransitio
   const order = storyOrder(p);
   const rank = (e: (typeof edges)[number]) => (e.transition ? order.indexOf(e.transition) : 999);
   const first = edges.filter((e) => e.from === "start").sort((a, b) => rank(a) - rank(b))[0];
-  const start = first?.to ?? p.initial;
+  // No step creates the record here (made elsewhere: import, another app, a stored procedure):
+  // start where the flow is entered (a status steps check but none sets), else at the first status written
+  const targets = new Set(edges.map((e) => e.to.id));
+  const entry = edges
+    .filter((e) => typeof e.from !== "string" && !targets.has(e.from.id))
+    .sort((a, b) => rank(a) - rank(b))[0];
+  const fromAny = edges.filter((e) => e.from === "any" && !e.negative).sort((a, b) => rank(a) - rank(b))[0];
+  const start = first?.to ?? p.initial ?? (entry && typeof entry.from !== "string" ? entry.from : undefined) ?? fromAny?.to;
   if (!start) return { states: [], steps: [] };
   const states = [start];
-  const steps: DocTransition[] = first?.transition ? [first.transition] : [];
+  const lead = first ?? (!p.initial && !entry ? fromAny : undefined);
+  const steps: DocTransition[] = lead?.transition ? [lead.transition] : [];
   const seen = new Set([start.id]);
   let cur = start;
   for (;;) {
-    const next = edges
-      .filter((e) => typeof e.from !== "string" && e.from.id === cur.id && !e.negative && !seen.has(e.to.id))
-      .sort((a, b) => Number(a.transition !== steps[steps.length - 1]) - Number(b.transition !== steps[steps.length - 1]) || rank(a) - rank(b))[0];
+    const next =
+      edges
+        .filter((e) => typeof e.from !== "string" && e.from.id === cur.id && !e.negative && !seen.has(e.to.id))
+        .sort((a, b) => Number(a.transition !== steps[steps.length - 1]) - Number(b.transition !== steps[steps.length - 1]) || rank(a) - rank(b))[0] ??
+      // Stuck right at the start (created with an empty status, then submitted by a step that checks nothing):
+      // a step that runs at any status moves it on. Later in the flow such steps are side paths.
+      (states.length === 1
+        ? edges.filter((e) => e.from === "any" && !e.negative && !seen.has(e.to.id) && e.transition && !steps.includes(e.transition)).sort((a, b) => rank(a) - rank(b))[0]
+        : undefined);
     if (!next) break;
     states.push(next.to);
     seen.add(next.to.id);
@@ -554,7 +568,9 @@ function processBlocks(m: DocModel, f: DocFeature, p: DocProcess): Block[] {
     blocks.push({ t: "flow", graph: lanes, title: `${p.process.name}: who does what`, caption: "One row per role · arrows carry the status in between · rounded green: where it ends, red: stopped", mermaid: flowMermaid(lanes) });
   }
   const graph = stateGraph(p);
-  if (graph.edges.length) {
+  if (graph.edges.length > 40) {
+    blocks.push({ t: "note", kind: "info", c: [`${graph.edges.length} status moves: too many to draw as one picture. The steps above list each of them.`] });
+  } else if (graph.edges.length) {
     blocks.push({ t: "p", c: [{ b: "Status flow" }] });
     blocks.push({ t: "diagram", graph, title: `${f.feature.name}: status flow`, id, mermaid: mermaid(graph) });
   }

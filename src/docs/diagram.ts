@@ -55,7 +55,17 @@ export function stateGraph(p: DocProcess): StateGraph {
       any = true;
       from = "any";
     } else from = stateNode(e.from.id, e.from.label);
-    edges.push({ from, to: stateNode(e.to.id, e.to.label), label: e.label, who: e.who, negative: e.negative, background: e.background });
+    const to = stateNode(e.to.id, e.to.label);
+    // Several steps that make the same move share one arrow: "Approve +2"
+    const same = edges.find((x) => x.from === from && x.to === to && x.background === e.background);
+    if (same) {
+      const [first, more] = same.label.split(" +");
+      if (first !== e.label) same.label = `${first} +${(Number(more) || 0) + 1}`;
+      if (same.who !== e.who) same.who = undefined;
+      same.negative = same.negative && e.negative;
+      continue;
+    }
+    edges.push({ from, to, label: e.label, who: e.who, negative: e.negative, background: e.background });
   }
   if (start) nodes.unshift({ id: "start", label: "", kind: "start" });
   if (any) nodes.push({ id: "any", label: "Any status (no check in code)", kind: "any" });

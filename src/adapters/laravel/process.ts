@@ -491,7 +491,7 @@ export class ProcessReader {
     // Where each write sits: its position, and which if/else branch it is in
     const branches = branchPaths(
       body,
-      (test) => decideWithSeeds(test, opts.seedValues),
+      (test) => decideWithSeeds(test, opts.seedValues, (n) => this.value(n, names, selfClass)?.value ?? null),
       (test) => this.branchAtoms(test, statusVars, names, selfClass, types),
     );
     for (const w of info.writes) {
@@ -662,6 +662,12 @@ export class ProcessReader {
     const atom = (n: PhpNode, neg: boolean): string | null => {
       if (n?.kind === "parenthesis") return atom(n.inner, neg);
       if (n?.kind === "unary" && n.type === "!") return atom(n.what, !neg);
+      // in_array($jabatan, ['13', '55']): branches on other values of $jabatan cannot run with it
+      if (n?.kind === "call" && n.what?.kind === "name" && /^\\?in_array$/.test(n.what.name) && n.arguments?.[0]?.kind === "variable" && n.arguments[1]?.kind === "array" && !statusVars.has(n.arguments[0].name)) {
+        const vals = (n.arguments[1].items ?? []).map((i: PhpNode) => this.value(i?.kind === "entry" ? i.value : i, names, selfClass)?.value ?? null);
+        if (vals.some((v: string | null) => v === null)) return null;
+        return `var·${n.arguments[0].name}:${neg ? "!" : ""}${vals.join("|")}`;
+      }
       if (n?.kind === "call") {
         const method: string | undefined = n.what?.offset?.name;
         const arg = stringValue(n.arguments?.[0]);
@@ -675,6 +681,11 @@ export class ProcessReader {
       }
       if (n?.kind === "bin" && /^(==|===|!=|!==)$/.test(n.type)) {
         const equal = !n.type.startsWith("!") !== neg;
+        // $jabatan == '38' (a plain variable, not a status): same idea
+        const plain = (x: PhpNode) => (x?.kind === "variable" && typeof x.name === "string" && !statusVars.has(x.name) && !types.has(x.name) ? x.name : null);
+        const pv = plain(n.left) ?? plain(n.right);
+        const pval = pv ? this.value(plain(n.left) ? n.right : n.left, names, selfClass) : null;
+        if (pv && pval) return `var·${pv}:${equal ? "" : "!"}${pval.value}`;
         if (!equal) return null; // "is not X" names no single status
         const subjectOf2 = (x: PhpNode): Subject | null => {
           if (x?.kind === "variable" && statusVars.has(x.name)) return statusVars.get(x.name)!;
@@ -1237,6 +1248,9 @@ export class ProcessReader {
     }
     // A request field limited by validation (in:a,b) or by a guard
     const field = inputKey(node, locals.validatedVars);
+    // A value the caller passed in is more precise than a guard's list (hold($x, 'H') vs in_array($s, ['H','REV','O']))
+    const passedIn = node.kind === "variable" && !locals.values.get(node.name)?.length ? locals.seeded?.get(node.name) : undefined;
+    if (passedIn?.length) return passedIn;
     const limited = field ? locals.allowed?.get(`input:${field}`) : node.kind === "variable" ? locals.allowed?.get(`$${node.name}`) : undefined;
     if (limited) {
       const out = limited.map((v) => this.value(v, names, selfClass)).filter((v): v is StatusValue => Boolean(v));
@@ -2018,18 +2032,45 @@ function statusSide(c: Comparison): { record: PhpNode; column: string; values: P
 }
 
 /** $param == 'x' / $param != 'x' with $param passed in as one known value: true or false; otherwise unknown. */
-function decideWithSeeds(test: PhpNode, seeds: Map<string, StatusValue[]> | undefined): boolean | undefined {
-  if (!seeds?.size || test?.kind !== "bin" || !/^(==|===|!=|!==)$/.test(test.type)) return undefined;
-  const side = (a: PhpNode, b: PhpNode) => {
-    if (a?.kind !== "variable" || typeof a.name !== "string") return undefined;
-    const vs = seeds.get(a.name);
-    const lit = literal(b);
-    if (!vs || vs.length !== 1 || lit === null) return undefined;
-    return vs[0].value === lit;
-  };
-  const eq = side(test.left, test.right) ?? side(test.right, test.left);
-  if (eq === undefined) return undefined;
-  return test.type.startsWith("!") ? !eq : eq;
+/**
+ * Whether a condition is certainly true or false for the values passed in (undefined: it depends).
+ * Understands ==, !=, in_array($x, [...]), !, && and ||, with literals or constants
+ * (Constant::STATUS_SUBMIT); with several possible values it decides only when all agree.
+ */
+function decideWithSeeds(test: PhpNode, seeds: Map<string, StatusValue[]> | undefined, valueOf: (n: PhpNode) => string | null = literal): boolean | undefined {
+  if (!seeds?.size || !test) return undefined;
+  const all = (results: boolean[]) => (results.length && results.every((r) => r === results[0]) ? results[0] : undefined);
+  const seeded = (n: PhpNode) => (n?.kind === "variable" && typeof n.name === "string" ? seeds.get(n.name) : undefined);
+  if (test.kind === "parenthesis") return decideWithSeeds(test.inner, seeds, valueOf);
+  if (test.kind === "unary" && test.type === "!") {
+    const r = decideWithSeeds(test.what, seeds, valueOf);
+    return r === undefined ? undefined : !r;
+  }
+  if (test.kind === "bin" && /^(&&|and|\|\||or)$/i.test(test.type)) {
+    const a = decideWithSeeds(test.left, seeds, valueOf);
+    const b = decideWithSeeds(test.right, seeds, valueOf);
+    if (/^(&&|and)$/i.test(test.type)) return a === false || b === false ? false : a === true && b === true ? true : undefined;
+    return a === true || b === true ? true : a === false && b === false ? false : undefined;
+  }
+  if (test.kind === "bin" && /^(==|===|!=|!==|<>)$/.test(test.type)) {
+    const side = (a: PhpNode, b: PhpNode) => {
+      const vs = seeded(a);
+      const lit = valueOf(b);
+      if (!vs?.length || lit === null) return undefined;
+      return all(vs.map((v) => v.value === lit));
+    };
+    const eq = side(test.left, test.right) ?? side(test.right, test.left);
+    if (eq === undefined) return undefined;
+    return /^(!=|!==|<>)$/.test(test.type) ? !eq : eq;
+  }
+  // in_array($status, [Constant::A, 'S'])
+  if (test.kind === "call" && test.what?.kind === "name" && /^\\?in_array$/.test(test.what.name) && test.arguments?.[1]?.kind === "array") {
+    const vs = seeded(test.arguments[0]);
+    const list = (test.arguments[1].items ?? []).map((i: PhpNode) => valueOf(i?.kind === "entry" ? i.value : i));
+    if (!vs?.length || list.some((x: string | null) => x === null)) return undefined;
+    return all(vs.map((v) => list.includes(v.value)));
+  }
+  return undefined;
 }
 
 /** $x in $x->a()->b(): the variable a call chain starts from. */

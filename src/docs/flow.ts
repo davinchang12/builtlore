@@ -40,6 +40,8 @@ export interface FlowGraph {
 }
 
 const MAX_NODES = 40;
+/** Above this many arrows a swimlane stops helping. */
+const MAX_LANE_EDGES = 36;
 
 // ------------------------------------------------------------- process flow
 
@@ -82,11 +84,24 @@ export function processFlow(p: DocProcess): FlowGraph | null {
   }
   if (edges.some((e) => e.from === "start")) nodes.unshift({ id: "start", label: "", kind: "start" });
   if (!edges.length) return null;
+  // One arrow per pair of boxes: several statuses between the same two steps read "A +2"
+  const merged: FlowEdge[] = [];
+  for (const e of edges) {
+    const same = merged.find((x) => x.from === e.from && x.to === e.to);
+    if (!same) merged.push({ ...e, ...(e.label ? { label: e.label } : {}) });
+    else if (e.label && same.label && !same.label.split(" +")[0].includes(e.label)) {
+      const [first, more] = same.label.split(" +");
+      same.label = `${first} +${(Number(more) || 0) + 1}`;
+      same.negative = same.negative && e.negative;
+    }
+  }
+  // Too many arrows to read as a picture: the numbered steps above say it better
+  if (merged.length > MAX_LANE_EDGES) return null;
   // Steps that leave the status as it is are listed in the text, not drawn floating
-  const used = new Set(edges.flatMap((e) => [e.from, e.to]));
+  const used = new Set(merged.flatMap((e) => [e.from, e.to]));
   const shown = nodes.filter((n) => used.has(n.id));
   const shownLanes = [...lanes].filter(([id]) => shown.some((n) => n.lane === id)).map(([id, name]) => ({ id, name }));
-  return { nodes: shown, edges, lanes: shownLanes, direction: "RIGHT" };
+  return { nodes: shown, edges: merged, lanes: shownLanes, direction: "RIGHT" };
 }
 
 // ------------------------------------------------------------- screen flow
@@ -475,7 +490,8 @@ export async function flowSvg(g: FlowGraph, title: string, uid: string): Promise
       layoutOptions: { "elk.padding": `[top=14,left=${LANE_LABEL_W},bottom=14,right=16]`, "elk.direction": direction },
       children: g.nodes.filter((n) => n.lane === l.id).map((n) => ({ id: n.id, ...size(n) })),
     }));
-    return { id: "root", layoutOptions: options(direction), children: [...loose, ...lanes], edges: elkEdges };
+    // A fresh copy each time: ELK writes the routes into the objects it is given
+    return structuredClone({ id: "root", layoutOptions: options(direction), children: [...loose, ...lanes], edges: elkEdges });
   };
   const right = await elk().layout(build(g.direction));
   let laid = right;

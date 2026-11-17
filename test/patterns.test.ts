@@ -1185,6 +1185,71 @@ Route::prefix('master')->name('master.')->middleware('auth')->group(function () 
   });
 });
 
+describe("branches decided by the values passed in", () => {
+  let map: BuiltMap;
+  before(async () => {
+    map = await scan({
+      "routes/web.php": `<?php
+use App\\Http\\Controllers\\MemoController;
+use Illuminate\\Support\\Facades\\Route;
+Route::post('/memos/submit', [MemoController::class, 'submit'])->name('memos.submit');
+Route::post('/memos/hold', [MemoController::class, 'hold'])->name('memos.hold');
+Route::post('/memos/revise', [MemoController::class, 'revise'])->name('memos.revise');
+`,
+      "app/Models/Memo.php": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass Memo extends Model { protected $table = 'memos'; }\n",
+      "app/Support/Constant.php": "<?php\nnamespace App\\Support;\nclass Constant { const SUBMIT = 'S'; const APPROVE = 'A'; const HOLD = 'H'; const REVISE = 'REV'; }\n",
+      "app/Services/MemoFlow.php": `<?php
+namespace App\\Services;
+use Illuminate\\Support\\Facades\\DB;
+class MemoFlow {
+    public function approve($no, $role, $status) {
+        if ($role == 'lead') { DB::table('memos')->where('no', $no)->update(['status' => 'C']); return 'True'; }
+        if (!in_array($role, ['head', 'final', 'deputy'])) { return 'Not in the approval chain'; }
+        if (in_array($role, ['head', 'deputy'])) { DB::table('memos')->where('no', $no)->update(['status' => $status]); }
+        if ($role == 'final') { DB::table('memos')->where('no', $no)->update(['status' => 'C']); }
+        return 'True';
+    }
+    public function hold($no, $status) {
+        if (!in_array($status, ['H', 'REV'])) { return 'Unknown status'; }
+        if ($status == 'H' || $status == 'O') { DB::table('memos')->where('no', $no)->update(['status' => $status]); }
+        else { DB::table('memos')->where('no', $no)->update(['status' => 'S']); }
+        return 'True';
+    }
+}
+`,
+      "app/Http/Controllers/MemoController.php": `<?php
+namespace App\\Http\\Controllers;
+use App\\Services\\MemoFlow;
+use App\\Support\\Constant;
+use Illuminate\\Http\\Request;
+class MemoController extends Controller {
+    public function submit(Request $request) { $this->run($request, Constant::SUBMIT); return back(); }
+    public function hold(Request $request) { $this->run($request, Constant::HOLD); return back(); }
+    public function revise(Request $request) { $this->run($request, Constant::REVISE); return back(); }
+    private function run(Request $request, $status) {
+        $flow = new MemoFlow;
+        if (in_array($status, [Constant::APPROVE, Constant::SUBMIT])) { $flow->approve($request->no, session('role'), $status); }
+        else { $flow->hold($request->no, $status); }
+    }
+}
+`,
+    });
+  });
+  const step = (id: string) => map.processes!.find((p) => p.subject === "Memo.status")!.steps.find((s) => s.node === `route:${id}`)!;
+  const vals = (ids: string[]) => ids.map((x) => x.split("=")[1]).sort();
+
+  it("follows only the branch in_array(...) and || pick for the value passed in", () => {
+    assert.deepEqual(vals(step("memos.hold").to), ["H"]);
+    assert.deepEqual(vals(step("memos.revise").to), ["S"]);
+  });
+
+  it("does not chain writes in branches on different values of the same variable", () => {
+    const s = step("memos.submit");
+    assert.deepEqual(vals(s.to), ["C", "S"]);
+    assert.ok(!(s.paths ?? []).some((p) => p.length > 1), JSON.stringify(s.paths));
+  });
+});
+
 describe("status sequences and branches", () => {
   it("skips a branch that cannot run with the values passed in (review($order, 'pass'))", async () => {
     const map = (await scanProject(dirs.find((d) => existsSync(join(d, "app/Services/OrderWorkflow.php")))!, { mode: "static" })).map;

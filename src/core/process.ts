@@ -61,11 +61,29 @@ export function stepConditions(entries: EntryFact[], navs: NavigatesFact[]): Con
 }
 
 function compatible(a: string[] = [], b: string[] = []): boolean {
-  const seen = new Map(a.map((x) => [x.slice(0, x.lastIndexOf(":")), x.slice(x.lastIndexOf(":") + 1)]));
+  const split = (x: string) => [x.slice(0, x.lastIndexOf(":")), x.slice(x.lastIndexOf(":") + 1)] as const;
+  const left = a.map(split);
+  // Every condition of one branch must be able to hold with every condition of the other on the same thing
   return b.every((x) => {
-    const k = x.slice(0, x.lastIndexOf(":"));
-    return !seen.has(k) || seen.get(k) === x.slice(x.lastIndexOf(":") + 1);
+    const [k, v] = split(x);
+    return left.every(([k2, v2]) => k2 !== k || agree(v2, v));
   });
+}
+
+/**
+ * Two conditions on the same thing can hold together: "13|55" and "38" cannot; "!12" and "38" can.
+ * Values are "a|b" (one of) or "!a|b" (none of).
+ */
+function agree(x: string, y: string): boolean {
+  if (x === y) return true;
+  const parse = (v: string) => ({ not: v.startsWith("!"), set: (v.startsWith("!") ? v.slice(1) : v).split("|") });
+  const a = parse(x);
+  const b = parse(y);
+  if (!a.not && !b.not) return a.set.some((v) => b.set.includes(v));
+  if (a.not && b.not) return true;
+  const pos = a.not ? b : a;
+  const neg = a.not ? a : b;
+  return pos.set.some((v) => !neg.set.includes(v));
 }
 
 function compareOrder(a: number[] = [], b: number[] = []): number {
@@ -174,7 +192,7 @@ export function buildProcesses(input: {
             id,
             value: v.value,
             code: fromCatalog?.code ?? v.code,
-            label: best.label ?? `${column} = ${v.value}`,
+            label: best.label ?? (v.value.trim() === "" ? `${column} empty` : `${column} = ${v.value}`),
             named: best.label ? "code" : "raw",
           });
         }
@@ -272,17 +290,19 @@ export function buildProcesses(input: {
       const siblings = ownerPart.subjects;
       const spread = features.length > 1;
       const modelName = humanizeModel(model);
+      const plainStatus = /^(m_|id_)?status(_id)?$/i.test(column);
       processes.push({
         id: `${owner.id}:${subject}`,
         feature: owner.id,
         ...(spread ? { features } : {}),
-        // Steps in several features: named by the record ("Temp access request"); in one feature: by the feature.
+        // Steps in several features: named by the record when its name reads as words ("Temp access request"),
+        // else by the feature that owns it. In one feature: by the feature.
         // Two tables with the same status column in one feature: name both by table.
-        name: spread && model
-          ? /^(m_)?status(_id)?$/.test(column) ? modelName : `${modelName} · ${column}`
+        name: spread && model && modelName !== model
+          ? plainStatus ? modelName : `${modelName} · ${column}`
           : siblings.filter((s) => s.split(".").slice(1).join(".") === column).length > 1
             ? `${owner.name} · ${subject}`
-            : siblings.length > 1 || !/^(m_)?status(_id)?$/.test(column) ? `${owner.name} · ${column}` : owner.name,
+            : siblings.length > 1 || !plainStatus ? `${owner.name} · ${column}` : owner.name,
         subject,
         states: [...states.values()],
         initial,
