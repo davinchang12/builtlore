@@ -34,7 +34,15 @@ export interface FeatureEdit {
   description?: string;
 }
 
+export interface ProjectEdit {
+  /** Display name for the system, e.g. "Procurement portal". */
+  name?: string;
+  /** What the system is for and who uses it; opens the documentation. */
+  summary?: string;
+}
+
 export interface Edits {
+  project: ProjectEdit;
   features: Record<string, FeatureEdit>;
   steps: Record<string, StepEdit>;
   glossary: Record<string, string>;
@@ -50,14 +58,19 @@ const HEADER = `# builtlore edits: names, descriptions and grouping written by p
 `;
 
 export function emptyEdits(): Edits {
-  return { features: {}, steps: {}, glossary: {}, roles: {}, statuses: {} };
+  return { project: {}, features: {}, steps: {}, glossary: {}, roles: {}, statuses: {} };
 }
 
 export function loadEdits(root: string): Edits {
   const path = join(root, EDITS_FILE);
   if (!existsSync(path)) return emptyEdits();
   const parsed = YAML.parse(readFileSync(path, "utf8")) ?? {};
+  const project = objectOf<unknown>(parsed.project);
   return {
+    project: {
+      ...(typeof project.name === "string" && project.name.trim() ? { name: project.name.trim() } : {}),
+      ...(typeof project.summary === "string" && project.summary.trim() ? { summary: project.summary.trim() } : {}),
+    },
     features: objectOf(parsed.features),
     steps: objectOf(parsed.steps),
     glossary: objectOf(parsed.glossary),
@@ -132,8 +145,18 @@ export function applyEdits(raw: BuiltMap, edits: Edits): BuiltMap {
   }
   map.features.sort((a, b) => a.name.localeCompare(b.name));
 
-  if (Object.keys(edits.glossary).length) map.glossary = { ...edits.glossary };
+  if (Object.keys(edits.glossary).length) map.glossary = Object.fromEntries(Object.entries(edits.glossary).map(([k, v]) => [String(k), String(v)]));
+  if (edits.project?.name) map.project.title = edits.project.name;
+  if (edits.project?.summary) map.project.summary = edits.project.summary;
   applyProcessEdits(map, edits);
+  // Who does each action (role matrix): same overrides as the Process view lanes
+  for (const n of map.nodes) {
+    if (!n.who) continue;
+    const actor = edits.steps[n.id]?.actor;
+    if (actor) n.who = { id: laneKey(actor), name: actor, evidence: ["set by a person"], provenance: "human" };
+    const name = edits.roles[n.who.id];
+    if (name) n.who = { ...n.who, name, provenance: "human" };
+  }
   const edited = Object.keys(edits.steps).length + Object.keys(edits.features).length;
   if (edited) {
     map.notes.push(`Applied ${edited - orphans.length} edit${edited - orphans.length === 1 ? "" : "s"} from ${EDITS_FILE}.`);
@@ -189,9 +212,11 @@ function resolveFeature(map: BuiltMap, byId: Map<string, Feature>, ref: string):
 }
 
 export type EditPatch =
+  | { target: "project"; id: string; fields: ProjectEdit }
   | { target: "step"; id: string; fields: StepEdit }
   | { target: "feature"; id: string; fields: FeatureEdit }
-  | { target: "glossary"; id: string; fields: { definition?: string } }
+  /** id = term; `from` renames an existing term. An empty definition removes the term. */
+  | { target: "glossary"; id: string; fields: { definition?: string; from?: string } }
   | { target: "role"; id: string; fields: { name?: string } }
   | { target: "status"; id: string; fields: { value: string; label?: string } };
 
@@ -204,10 +229,20 @@ export function saveEdit(root: string, patch: EditPatch, raw?: BuiltMap): void {
   const source = existsSync(path) ? readFileSync(path, "utf8") : "";
   const doc: YAML.Document = YAML.parseDocument(YAML.isMap(YAML.parseDocument(source).contents) ? source : HEADER);
 
-  if (patch.target === "glossary") {
+  if (patch.target === "project") {
+    for (const k of ["name", "summary"] as const) {
+      if (!(k in patch.fields)) continue;
+      const v = clean(patch.fields[k]);
+      if (v) doc.setIn(["project", k], v);
+      else del(doc, ["project", k]);
+    }
+  } else if (patch.target === "glossary") {
+    const term = patch.id.trim();
     const def = clean(patch.fields.definition);
-    if (def) doc.setIn(["glossary", patch.id], def);
-    else del(doc, ["glossary", patch.id]);
+    const renamedFrom = clean(patch.fields.from);
+    if (renamedFrom && renamedFrom !== term) del(doc, ["glossary", renamedFrom]);
+    if (def) doc.setIn(["glossary", term], def);
+    else del(doc, ["glossary", term]);
   } else if (patch.target === "role") {
     const name = clean(patch.fields.name);
     if (name) doc.setIn(["roles", patch.id], name);
@@ -239,7 +274,7 @@ export function saveEdit(root: string, patch: EditPatch, raw?: BuiltMap): void {
     const entry = doc.getIn([section, patch.id]);
     if (YAML.isMap(entry) && entry.items.length === 0) del(doc, [section, patch.id]);
   }
-  for (const section of ["features", "steps", "glossary", "roles", "statuses"]) {
+  for (const section of ["project", "features", "steps", "glossary", "roles", "statuses"]) {
     const s = doc.get(section);
     if (YAML.isMap(s) && s.items.length === 0) doc.delete(section);
   }

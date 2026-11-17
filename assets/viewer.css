@@ -33,6 +33,12 @@ header button, .toolbar button {
   font-size: 13px; cursor: pointer; color: var(--ink);
 }
 header button:hover, .toolbar button:hover { border-color: #cbd5e1; background: #f8fafc; }
+header a.button { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 6px 10px; font-size: 13px; color: var(--ink); text-decoration: none; }
+header a.button:hover { border-color: #cbd5e1; background: #f8fafc; }
+.glossary-row { display: grid; gap: 6px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 8px; background: var(--bg); }
+.glossary-row .term { font-weight: 600; font-size: 13.5px; }
+.glossary-row .def { font-size: 13px; color: var(--ink); }
+.form-buttons .link { background: none; border: none; color: #b91c1c; cursor: pointer; font-size: 12.5px; padding: 0 4px; }
 
 aside.sidebar {
   background: var(--panel); border-right: 1px solid var(--line); overflow: auto; padding: 14px;

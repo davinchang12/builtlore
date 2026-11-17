@@ -106,6 +106,9 @@
     layout(true);
   };
   $("#btn-svg").onclick = downloadSvg;
+  $("#btn-project").onclick = selectProject;
+  if (EDIT) $("#btn-docs").style.display = "inline-block";
+  if (data.project.title) { $("#project").textContent = data.project.title; document.title = data.project.title + " · builtlore"; }
   $("#details .close").onclick = function () { select(null); };
   $("#all-features").onclick = function () { state.hidden = {}; renderFeatureList(); layout(true); };
   $("#no-features").onclick = function () {
@@ -316,6 +319,7 @@
         state.pending = null;
         if (p.selected) select(p.selected);
         else if (p.feature) selectFeature(p.feature);
+        else if (p.project) selectProject();
       }
     }).catch(function (err) {
       console.error(err);
@@ -657,6 +661,7 @@
       else if (pend.lane) selectLane(pend.lane[0], pend.lane[1]);
       else if (pend.stateSel) selectState(pend.stateSel[0], pend.stateSel[1]);
       else if (pend.process) selectProcess(pend.process);
+      else if (pend.project) selectProject();
     }
   }
 
@@ -998,6 +1003,79 @@
     }
   }
 
+  // --------------------------------------------------------------- project
+  /** What the system is for, and the glossary: the prose that opens the documentation. */
+  function selectProject() {
+    state.panel = { project: true };
+    state.selectedFeature = null;
+    openPanel(function (d) {
+      var proj = data.project;
+      d.appendChild(h("h2", null, proj.title || proj.name));
+      var badges = h("div", "badges");
+      badges.appendChild(h("span", "badge", "project"));
+      if (proj.title) badges.appendChild(h("span", "badge mono", proj.name));
+      d.appendChild(badges);
+      if (proj.summary) d.appendChild(h("p", "description", proj.summary));
+      else if (!EDIT) d.appendChild(h("p", "description empty", "No summary yet. Run builtlore serve to write one."));
+      if (EDIT) {
+        var form = h("form", "edit-form");
+        var name = field(form, "Name", "input", proj.title || "");
+        name.placeholder = proj.name;
+        var sum = field(form, "What this system is for, and who uses it", "textarea", proj.summary || "");
+        sum.rows = 6;
+        sum.placeholder = "e.g. Staff request items, their manager approves, procurement orders them from the ERP.";
+        form.appendChild(h("div", "hint", "Opens the documentation (builtlore docs). Leave the name empty to use " + proj.name + "."));
+        formButtons(form, function () {
+          return save({ target: "project", id: "project", fields: { name: name.value, summary: sum.value } });
+        });
+        d.appendChild(form);
+      }
+
+      var glossary = data.glossary || {};
+      var terms = Object.keys(glossary).sort(function (a, b) { return a.localeCompare(b, undefined, { sensitivity: "base" }); });
+      d.appendChild(h("h4", null, "Glossary (" + terms.length + ")"));
+      if (!terms.length && !EDIT) d.appendChild(h("div", "how", "No terms yet. Run builtlore serve to add them."));
+      terms.forEach(function (t) {
+        if (!EDIT) {
+          var row = h("div", "glossary-row");
+          row.appendChild(h("div", "term", t));
+          row.appendChild(h("div", "def", glossary[t]));
+          d.appendChild(row);
+          return;
+        }
+        d.appendChild(glossaryForm(t, glossary[t]));
+      });
+      if (EDIT) {
+        d.appendChild(h("div", "how", "Add a term"));
+        d.appendChild(glossaryForm("", ""));
+      }
+    });
+  }
+
+  function glossaryForm(term, definition) {
+    var form = h("form", "edit-form");
+    var t = field(form, "Term", "input", term);
+    t.placeholder = "e.g. PR";
+    var def = field(form, "Meaning", "textarea", definition);
+    def.rows = 2;
+    def.placeholder = "e.g. Purchase request: a request to buy items, approved by the manager and then procurement.";
+    formButtons(form, function () {
+      var id = t.value.trim();
+      if (!id) return Promise.reject(new Error("Write the term first."));
+      return save({ target: "glossary", id: id, fields: { definition: def.value, from: term && term !== id ? term : undefined } });
+    });
+    if (term) {
+      var remove = h("button", "link", "Remove");
+      remove.type = "button";
+      remove.onclick = function () {
+        if (!confirm("Remove \"" + term + "\" from the glossary?")) return;
+        save({ target: "glossary", id: term, fields: { definition: "" } }).catch(function (err) { alert("Not removed: " + err.message); });
+      };
+      form.querySelector(".form-buttons").appendChild(remove);
+    }
+    return form;
+  }
+
   // --------------------------------------------------------------- editing
   function stepForm(n) {
     var form = h("form", "edit-form");
@@ -1120,7 +1198,7 @@
       state.mode = s.mode || state.mode;
       state.hiddenProc = s.hiddenProc || {};
       var pn = s.panel || {};
-      state.pending = { selected: s.selected, feature: s.selectedFeature, lane: pn.lane, stateSel: pn.stateSel, process: pn.process };
+      state.pending = { selected: s.selected, feature: s.selectedFeature, lane: pn.lane, stateSel: pn.stateSel, process: pn.process, project: pn.project };
       $("#btn-direction").textContent = state.direction === "RIGHT" ? "Layout: left → right" : "Layout: top → bottom";
       return true;
     } catch (e) { return false; }

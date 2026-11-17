@@ -17,15 +17,19 @@ Open `fixtures/laravel-clinic/.builtlore/map.html` in a browser to see the resul
 
 ```
 src/
-  cli.ts                  command-line entry (init, scan, view)
+  cli.ts                  command-line entry (init, scan, view, serve, docs)
   core/
     types.ts              Fact and BuiltMap types (the contract between adapters and the rest)
     model.ts              facts -> features, nodes, edges (stack-agnostic)
+    process.ts            processes (swimlanes) and who does each action
+    edits.ts              builtlore.edits.yaml: load, apply, save
     scan.ts               detect stacks, run adapters, write builtlore.json and the canvas
   adapters/
     index.ts              registered adapters
-    laravel/              the Laravel adapter
+    laravel/              the Laravel adapter (routes, controllers, Blade, process,
+                          validation, migrations, automation, integrations, config)
   render/html.ts          builds the single-file canvas
+  docs/                   builtlore docs: model -> content tree -> Markdown and HTML
 assets/                   viewer.js and viewer.css, inlined into the canvas
 fixtures/                 small sample apps used by the tests
 test/                     tests (node:test)
@@ -57,6 +61,7 @@ An adapter emits:
 - `entry` facts: pages, actions and API endpoints, with source file and line.
 - `navigates` facts: links, form submissions, redirects and failure branches between entries.
 - `skipped` facts: anything seen but not resolvable.
+- Optionally, for the documentation: `validation` on entries, and `table`, `schedule`, `command`, `job`, `integration` and `config` facts (environment key names only, never values).
 
 Steps:
 

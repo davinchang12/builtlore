@@ -24,26 +24,19 @@ import type {
 
 const VIA_PRIORITY: ActorRef["via"][] = ["code", "view", "middleware", "name"];
 
-export function buildProcesses(input: {
-  entries: EntryFact[];
-  navs: NavigatesFact[];
-  states: StatesFact[];
-  nodes: MapNode[];
-  features: Feature[];
-}): Process[] {
-  const entryById = new Map(input.entries.map((e) => [e.id, e]));
-  const nodeById = new Map(input.nodes.map((n) => [n.id, n]));
-  const catalog = new Map(input.states.map((s) => [s.subject, s]));
+type Conditions = (id: string) => { requires: StatusCondition[]; via?: ProcessStep["fromVia"]; actors: ActorRef[] };
+
+/** Conditions and actors that apply to a step, from its own code and from how it is reached. */
+export function stepConditions(entries: EntryFact[], navs: NavigatesFact[]): Conditions {
+  const entryById = new Map(entries.map((e) => [e.id, e]));
   const incoming = new Map<string, NavigatesFact[]>();
-  for (const e of input.navs) {
+  for (const e of navs) {
     if (!["link", "submit", "ajax"].includes(e.trigger)) continue;
     const list = incoming.get(e.to) ?? [];
     list.push(e);
     incoming.set(e.to, list);
   }
-
-  // Conditions and actors that apply to a step, from its own code and from how it is reached.
-  const conditionsOf = (id: string): { requires: StatusCondition[]; via?: ProcessStep["fromVia"]; actors: ActorRef[] } => {
+  return (id: string) => {
     const own = entryById.get(id)?.process;
     const actors: ActorRef[] = [...(own?.actors ?? [])];
     const guard = own?.requires ?? [];
@@ -63,6 +56,24 @@ export function buildProcesses(input: {
     }
     return { requires: viaPage, via: viaPage.length ? "page" : undefined, actors };
   };
+}
+
+/** Who does a step: the lane the Process view would put it in. */
+export function whoDoes(entry: EntryFact, conditionsOf: Conditions): ProcessLane {
+  return pickLane(conditionsOf(entry.id).actors, entry);
+}
+
+export function buildProcesses(input: {
+  entries: EntryFact[];
+  navs: NavigatesFact[];
+  states: StatesFact[];
+  nodes: MapNode[];
+  features: Feature[];
+}): Process[] {
+  const entryById = new Map(input.entries.map((e) => [e.id, e]));
+  const nodeById = new Map(input.nodes.map((n) => [n.id, n]));
+  const catalog = new Map(input.states.map((s) => [s.subject, s]));
+  const conditionsOf = stepConditions(input.entries, input.navs);
 
   const processes: Process[] = [];
   for (const feature of input.features) {

@@ -6,7 +6,7 @@
 
 ![Process view: who does each step and how the status changes](docs/images/process.png)
 
-> **Status: early alpha (v0.2).** Laravel is supported today. Go, Next.js and Flutter are next. See the [design document](docs/DESIGN.md) for the full plan.
+> **Status: early alpha (v0.3).** Laravel is supported today. Go, Next.js and Flutter are next. See the [design document](docs/DESIGN.md) for the full plan.
 
 ## Why
 
@@ -24,6 +24,7 @@ builtlore generates a map of the system **as it is built**, straight from the co
 - **A JSON model you can commit.** `builtlore.json` is a stable, diff-friendly description of your app's flows.
 - **No guessing.** Anything builtlore can't resolve is listed under *Skipped*, never invented. A step with no role check sits in *Signed-in user*, not in an invented role.
 - **Your corrections stick.** Rename roles and statuses, describe steps, regroup features in the canvas (`builtlore serve`); edits live in `builtlore.edits.yaml` and survive every rescan.
+- **Documentation you can hand over.** `builtlore docs` writes a Markdown folder and one printable HTML file: roles × actions, each process with its status lifecycle, form rules, data dictionary, integrations, scheduled jobs, API, configuration, glossary and findings. Regenerate it any time; the parts people write are kept.
 
 ![Screens view](docs/images/canvas.png)
 
@@ -55,6 +56,7 @@ builtlore scan                              # scan the current folder
 builtlore scan ~/work/project-1 ~/work/project-2   # scan several projects, each gets its own map
 builtlore view ~/work/project-1             # re-open the canvas for a scanned project
 builtlore serve                             # open the canvas with editing on (see below)
+builtlore docs                              # write the project documentation (see below)
 builtlore init                              # write builtlore.config.yaml and ignore .builtlore/
 ```
 
@@ -139,7 +141,38 @@ glossary:
 - When the code behind a described step changes, the step gets an **amber dot** and a "check the description" note, rather than silently showing something outdated. Saving it again clears the flag.
 - Edits for steps that no longer exist are kept and listed in the scan notes, so you can decide what to do with them.
 
+The **Project** button holds the text that opens the documentation: the system's name, what it is for, and a glossary of the terms your team uses. **Docs** shows the documentation as `builtlore docs` would write it right now.
+
+```yaml
+project:
+  name: Procurement portal
+  summary: Staff request items; their manager approves, then procurement orders them from the ERP.
+```
+
 `serve` only listens on `127.0.0.1`, and writes need a per-session token, so other websites open in your browser cannot change your files.
+
+### Project documentation
+
+```bash
+builtlore docs                      # writes docs/builtlore/ (Markdown) + docs/builtlore/index.html
+builtlore docs --out handover --open
+```
+
+| Section | What is in it | Read from |
+|---|---|---|
+| Overview | Summary, counts, one line per module | `project:` and feature descriptions in `builtlore.edits.yaml` |
+| Roles and permissions | Matrix of roles × actions, and where each role was found | Middleware, handler checks, Blade conditions (same as the Process view) |
+| Features and processes | Per feature: status lifecycle (Mermaid / SVG), who moves the record to which status, statuses, steps, screens | Process layer, jobs that change a status |
+| Business rules | Per form: each field's rules as written and in plain English; when each step is allowed | `validate()`, `Validator::make()`, FormRequest `rules()`, status guards |
+| Data dictionary | Tables, columns, types, defaults, keys, relationships, known status values | `database/migrations` (oldest first), models |
+| Integrations | HTTP APIs, email, notifications and channels, file storage, and which step calls them | `Http::`, `Mail::`, `notify()`, `Notification::send()`, `Storage::`, `->store()` |
+| Automation | Schedule in plain English, commands, jobs, the statuses they change | `routes/console.php`, `app/Console/Kernel.php`, `app/Console/Commands`, `app/Jobs` |
+| API reference | API, data (JSON) and file endpoints: access, parameters, validation, response | Routes, handlers, validation |
+| Configuration | Environment keys, where they are read, whether `.env.example` lists them | `env()` calls, `config/*.php`, key names of `.env.example` |
+| Glossary | Your terms | `glossary:` in `builtlore.edits.yaml` |
+| Findings | Duplicate routes, writes without validation, `env()` outside config, missing `.env.example` keys, pages nothing leads to, and everything builtlore could not read | Scan |
+
+The Markdown pages link every fact to its file and line, and render on GitHub and GitLab (diagrams included). `index.html` is a single offline file with a table of contents; print it from the browser to get a PDF. builtlore only replaces files it wrote, and refuses to overwrite anything else.
 
 ## What builtlore reads in a Laravel app
 
@@ -152,20 +185,25 @@ glossary:
 | Scripts and attributes in Blade (`$.post("{{ route('x') }}")`, DataTables `ajax:`, `data-url="{{ route('x') }}"`) | AJAX calls and links built in JavaScript |
 | Layouts (`@extends`, `<x-app-layout>`) | Counted but not drawn, so navigation menus do not connect every page to every other page |
 | The route table as a whole | Warnings for duplicate routes (same method and URI defined twice) and route names used by more than one route |
+| Validation and FormRequests | Rules per form field, kept as written with a plain-English reading |
+| `database/migrations` | Tables, columns, foreign keys, enums and comments, with later changes replayed in order |
+| `routes/console.php`, `app/Console`, `app/Jobs` | Scheduled tasks, commands, jobs, and the statuses they change |
+| `Http::`, `Mail::`, notifications, `Storage::` | Integrations, and the step, command or job that uses each one |
+| `config/*.php`, `env()`, `.env.example` | Environment key names (never values) |
 
 Inertia and Livewire pages are detected; following their navigation is planned.
 
 ## Privacy
 
-builtlore v0.1 runs entirely on your machine. It does not use AI and makes no network calls (`builtlore serve` listens on `127.0.0.1` only). It reads code only: it never reads `.env` values or connects to your database. (Optional AI naming and a read-only database layer are planned, and will be opt-in; see the design document.)
+builtlore runs entirely on your machine. It does not use AI and makes no network calls (`builtlore serve` listens on `127.0.0.1` only). It reads code only: it never opens `.env`, reads only the key names of `.env.example`, does not copy defaults written next to `env()`, and does not connect to your database. (Optional AI naming and a read-only database layer are planned, and will be opt-in; see the design document.)
 
 ## Roadmap
 
 | Version | Scope |
 |---|---|
 | **v0.1** | Laravel flows · canvas · JSON model |
-| **v0.2** | **Process view** (alpha): swimlanes per role, status changes from strings, numbers, constants and enums; roles and statuses editable |
-| v0.3 | **Project documentation:** a full docs site generated from code + your edits: system overview, roles and permissions, processes, screens, business rules (validation), data dictionary, integrations, jobs, API reference, glossary, change history. Export to Markdown, HTML, Word/PDF |
+| v0.2 | Process view: swimlanes per role, status changes from strings, numbers, constants and enums; roles and statuses editable |
+| **v0.3** | **Project documentation** (alpha): `builtlore docs` → Markdown + printable HTML: overview, roles × actions, processes, business rules, data dictionary, integrations, automation, API, configuration, glossary, findings. Next: change history, Word export |
 | v0.3.x | History: when each feature appeared and how it changed (git) · timeline slider · CI check |
 | v0.4 | Data layer: tables, relationships, stored procedures, step ↔ table links |
 | v0.5 | Automation layer: schedulers, cron, queues, webhooks |

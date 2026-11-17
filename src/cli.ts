@@ -6,6 +6,7 @@ import { parseArgs } from "node:util";
 import { adapters } from "./adapters/index.js";
 import { detectStacks, scanProject, writeHtml, DEFAULT_CONFIG, loadConfig } from "./core/scan.js";
 import { serveProject } from "./core/serve.js";
+import { DEFAULT_DOCS_DIR, writeDocs } from "./docs/index.js";
 import type { BuiltMap } from "./core/types.js";
 import { VERSION } from "./core/version.js";
 
@@ -17,8 +18,11 @@ Usage
   builtlore scan [paths...] [options]   Scan one or more projects (default: current folder)
   builtlore view [path] [--no-open]     Open the canvas for a scanned project
   builtlore serve [path] [--port 4321]  Scan and open the canvas with editing on:
-                                        name steps, describe features, regroup, hide.
+                                        name steps, describe features, regroup, hide,
+                                        write the project summary and glossary.
                                         Edits save to builtlore.edits.yaml and survive rescans.
+  builtlore docs [path] [--out <dir>]   Scan and write the project documentation: Markdown
+                                        (default docs/builtlore/) plus one printable index.html
 
 Scan options
   --mode <auto|static|artisan>         Laravel: artisan (exact, needs PHP + vendor/), static (no PHP), auto (default)
@@ -26,10 +30,16 @@ Scan options
   --php <path>                         PHP executable for artisan mode (default: php on PATH; or set BUILTLORE_PHP)
   --open                               Open the canvas after scanning (single project only)
 
+Docs options
+  --out <dir>                          Docs folder relative to the project (default: docs/builtlore)
+  --open                               Open index.html after writing
+  (--mode and --php work as for scan)
+
 Examples
   builtlore scan
   builtlore scan ~/work/project-1 ~/work/project-2
   builtlore view ~/work/project-1
+  builtlore docs --open
 
 Supported stacks: ${adapters.map((a) => a.name).join(", ")} (Go, Next.js and Flutter are planned)
 `;
@@ -72,6 +82,13 @@ async function main(argv: string[]): Promise<number> {
       });
     case "view":
       return view(paths[0] ?? ".", !values["no-open"]);
+    case "docs":
+      return docs(paths[0] ?? ".", {
+        mode: values.mode as "auto" | "static" | "artisan" | undefined,
+        out: values.out,
+        php: values.php,
+        open: values.open,
+      });
     case "serve":
       return serve(paths[0] ?? ".", {
         mode: values.mode as "auto" | "static" | "artisan" | undefined,
@@ -156,6 +173,28 @@ async function view(pathArg: string, open: boolean): Promise<number> {
   console.log(`Canvas: ${rel(html)}`);
   if (open) openFile(html);
   return 0;
+}
+
+async function docs(pathArg: string, opts: { mode?: "auto" | "static" | "artisan"; out?: string; php?: string; open: boolean }): Promise<number> {
+  const started = Date.now();
+  try {
+    const res = await scanProject(pathArg, { mode: opts.mode, php: opts.php });
+    const written = await writeDocs(res.root, res.map, opts.out ?? DEFAULT_DOCS_DIR);
+    const m = res.map;
+    const secs = ((Date.now() - started) / 1000).toFixed(1);
+    console.log(`\n✔ ${m.project.title ?? m.project.name}  (${secs}s)`);
+    console.log(`  ${written.files.length} Markdown files and one HTML file in ${rel(written.dir)}`);
+    if (written.removed.length) console.log(`  removed ${written.removed.length} page${written.removed.length === 1 ? "" : "s"} for features no longer in the code`);
+    if (!m.project.summary) console.log("  · No project summary yet: add one in builtlore serve (Project) or project.summary in builtlore.edits.yaml.");
+    if (m.skipped.length) console.log(`  · ${m.skipped.length} thing${m.skipped.length === 1 ? "" : "s"} builtlore could not read: see Findings.`);
+    console.log(`  html:   ${rel(written.html)}  (print it to PDF from the browser)`);
+    console.log(`  start:  ${rel(join(written.dir, "README.md"))}`);
+    if (opts.open) openFile(written.html);
+    return 0;
+  } catch (err) {
+    console.error(`\n✖ ${pathArg}: ${(err as Error).message}`);
+    return 1;
+  }
 }
 
 async function serve(pathArg: string, opts: { mode?: "auto" | "static" | "artisan"; php?: string; port?: number; open: boolean }): Promise<number> {

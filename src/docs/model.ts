@@ -1,0 +1,365 @@
+/**
+ * The documentation, as data: everything the Markdown and HTML outputs show,
+ * derived from builtlore.json (code + edits). Renderers only format this.
+ * Nothing here is inferred: every row points back to the code or to a person.
+ */
+import type {
+  BackgroundWrite,
+  BuiltMap,
+  ConfigFact,
+  DataColumn,
+  DataTable,
+  Feature,
+  Integration,
+  MapNode,
+  Process,
+  ProcessLane,
+  ProcessState,
+  ProcessStep,
+  QueuedJob,
+  ConsoleCommand,
+  ScheduledTask,
+  SourceRef,
+  Validation,
+} from "../core/types.js";
+
+export interface DocTransition {
+  step: ProcessStep;
+  node: MapNode;
+  lane: ProcessLane;
+  from: ProcessState[];
+  to: ProcessState[];
+}
+
+export interface DocBackground {
+  /** "Job ExpireLeaveRequests" / "Command purchase-requests:remind" */
+  by: string;
+  schedule?: string;
+  from: ProcessState[];
+  to: ProcessState[];
+  source: SourceRef;
+}
+
+export interface DocProcess {
+  process: Process;
+  transitions: DocTransition[];
+  /** Steps that do not change the status (or whose change is not readable). */
+  other: DocTransition[];
+  background: DocBackground[];
+  initial?: ProcessState;
+}
+
+export interface DocFeature {
+  feature: Feature;
+  slug: string;
+  nodes: MapNode[];
+  processes: DocProcess[];
+}
+
+export interface RoleColumn {
+  id: string;
+  name: string;
+  fallback: boolean;
+  human: boolean;
+  evidence: string[];
+}
+
+export interface RuleRow {
+  feature: Feature;
+  node: MapNode;
+  /** Pages whose form submits here. */
+  forms: MapNode[];
+  validation: Validation[];
+}
+
+export interface StatusRuleRow {
+  process: Process;
+  node: MapNode;
+  from: ProcessState[];
+  via: "guard" | "view" | "page";
+}
+
+export interface Finding {
+  title: string;
+  why: string;
+  items: Array<{ text: string; source?: SourceRef }>;
+}
+
+export interface DocModel {
+  map: BuiltMap;
+  title: string;
+  summary?: string;
+  features: DocFeature[];
+  roles: { columns: RoleColumn[]; rows: Array<{ feature: Feature; node: MapNode }> };
+  rules: RuleRow[];
+  statusRules: StatusRuleRow[];
+  tables: DataTable[];
+  relations: Array<{ table: string; column: DataColumn }>;
+  integrations: Integration[];
+  schedule: ScheduledTask[];
+  commands: ConsoleCommand[];
+  jobs: QueuedJob[];
+  endpoints: Array<{ feature: Feature; node: MapNode }>;
+  config: ConfigFact[];
+  glossary: Array<[string, string]>;
+  findings: Finding[];
+  counts: Record<"features" | "pages" | "actions" | "processes" | "tables" | "tasks" | "integrations" | "endpoints" | "envKeys", number>;
+}
+
+const FALLBACK_LANES = new Set(["signed-in-user", "anyone"]);
+
+export function buildDocModel(map: BuiltMap): DocModel {
+  const visible = map.nodes.filter((n) => !n.hidden);
+  const nodeById = new Map(visible.map((n) => [n.id, n]));
+  const featureById = new Map(map.features.map((f) => [f.id, f]));
+  const automation = map.automation ?? { schedule: [], commands: [], jobs: [] };
+
+  // ---- Features and their processes
+  const usedSlugs = new Set<string>();
+  const features: DocFeature[] = map.features
+    .map((f) => {
+      const nodes = f.nodes.map((id) => nodeById.get(id)).filter((n): n is MapNode => Boolean(n));
+      let slug = slugify(f.id);
+      while (usedSlugs.has(slug)) slug += "-2";
+      usedSlugs.add(slug);
+      const processes = (map.processes ?? []).filter((p) => p.feature === f.id).map((p) => docProcess(p, nodeById, automation));
+      return { feature: f, slug, nodes, processes };
+    })
+    .filter((f) => f.nodes.length);
+
+  // ---- Roles × actions
+  const rows: Array<{ feature: Feature; node: MapNode }> = [];
+  const columns = new Map<string, RoleColumn>();
+  for (const f of features) {
+    for (const n of f.nodes) {
+      if (!n.who) continue;
+      rows.push({ feature: f.feature, node: n });
+      const c = columns.get(n.who.id) ?? { id: n.who.id, name: n.who.name, fallback: FALLBACK_LANES.has(n.who.id), human: n.who.provenance === "human", evidence: [] };
+      for (const e of n.who.evidence) if (!c.evidence.includes(e) && c.evidence.length < 4) c.evidence.push(e);
+      columns.set(n.who.id, c);
+    }
+  }
+  const roleColumns = [...columns.values()].sort((a, b) => Number(a.fallback) - Number(b.fallback) || (a.fallback ? (a.id === "signed-in-user" ? -1 : 1) : a.name.localeCompare(b.name)));
+
+  // ---- Business rules: validation per form, and status rules
+  const rules: RuleRow[] = [];
+  for (const f of features) {
+    for (const n of f.nodes) {
+      if (!n.validation?.length) continue;
+      const forms = map.edges
+        .filter((e) => e.to === n.id && e.trigger === "submit")
+        .map((e) => nodeById.get(e.from))
+        .filter((x): x is MapNode => Boolean(x));
+      rules.push({ feature: f.feature, node: n, forms: uniqueBy(forms, (x) => x.id), validation: n.validation });
+    }
+  }
+  const statusRules: StatusRuleRow[] = [];
+  for (const f of features) {
+    for (const p of f.processes) {
+      for (const t of [...p.transitions, ...p.other]) {
+        if (t.from.length && t.step.fromVia) statusRules.push({ process: p.process, node: t.node, from: t.from, via: t.step.fromVia });
+      }
+    }
+  }
+
+  // ---- Data
+  const tables = map.data?.tables ?? [];
+  const relations = tables.flatMap((t) => t.columns.filter((c) => c.references).map((c) => ({ table: t.name, column: c })));
+
+  // ---- Endpoints: APIs, data and file endpoints
+  const endpoints: Array<{ feature: Feature; node: MapNode }> = [];
+  for (const f of features) for (const n of f.nodes) if (n.type === "api" || n.type === "data" || n.type === "download") endpoints.push({ feature: f.feature, node: n });
+
+  const glossary = Object.entries(map.glossary ?? {}).sort((a, b) => a[0].localeCompare(b[0], undefined, { sensitivity: "base" }));
+
+  const model: DocModel = {
+    map,
+    title: map.project.title ?? map.project.name,
+    summary: map.project.summary,
+    features,
+    roles: { columns: roleColumns, rows },
+    rules,
+    statusRules,
+    tables,
+    relations,
+    integrations: map.integrations ?? [],
+    schedule: automation.schedule,
+    commands: automation.commands,
+    jobs: automation.jobs,
+    endpoints,
+    config: map.config ?? [],
+    glossary,
+    findings: [],
+    counts: {
+      features: features.length,
+      pages: visible.filter((n) => n.type === "page").length,
+      actions: rows.length,
+      processes: (map.processes ?? []).length,
+      tables: tables.length,
+      tasks: automation.schedule.length,
+      integrations: (map.integrations ?? []).length,
+      endpoints: endpoints.length,
+      envKeys: (map.config ?? []).filter((c) => c.uses.length).length,
+    },
+  };
+  model.findings = findings(model, featureById);
+  return model;
+}
+
+function docProcess(p: Process, nodeById: Map<string, MapNode>, automation: NonNullable<BuiltMap["automation"]>): DocProcess {
+  const stateById = new Map(p.states.map((s) => [s.id, s]));
+  const laneById = new Map(p.lanes.map((l) => [l.id, l]));
+  const transitions: DocTransition[] = [];
+  const other: DocTransition[] = [];
+  for (const step of p.steps) {
+    const node = nodeById.get(step.node);
+    if (!node) continue; // hidden by a person
+    const t: DocTransition = {
+      step,
+      node,
+      lane: laneById.get(step.lane) ?? { id: step.lane, name: step.lane, evidence: [], provenance: "extracted" },
+      from: step.from.map((id) => stateById.get(id)).filter((s): s is ProcessState => Boolean(s)),
+      to: step.to.map((id) => stateById.get(id)).filter((s): s is ProcessState => Boolean(s)),
+    };
+    (t.to.length ? transitions : other).push(t);
+  }
+
+  // Jobs and commands that change this status in the background
+  const background: DocBackground[] = [];
+  const scheduleOf = (kind: "job" | "command", name: string) => {
+    const t = automation.schedule.find((s) => s.runs.kind === kind && s.runs.name === name);
+    return t ? t.whenText ?? t.when : undefined;
+  };
+  const stateFor = (value: string) => p.states.find((s) => s.value === value);
+  const add = (by: string, schedule: string | undefined, writes: BackgroundWrite[]) => {
+    for (const w of writes) {
+      if (w.subject !== p.subject) continue;
+      const to = stateFor(w.to.value);
+      if (!to) continue;
+      background.push({
+        by,
+        schedule,
+        from: (w.when ?? []).map((v) => stateFor(v.value)).filter((s): s is ProcessState => Boolean(s)),
+        to: [to],
+        source: w.source,
+      });
+    }
+  };
+  for (const j of automation.jobs) add(`Job ${short(j.class)}`, scheduleOf("job", j.class), j.writes);
+  for (const c of automation.commands) add(`Command ${c.name}`, scheduleOf("command", c.name), c.writes);
+
+  return { process: p, transitions, other, background, initial: p.initial ? stateById.get(p.initial) : undefined };
+}
+
+function findings(m: DocModel, featureById: Map<string, Feature>): Finding[] {
+  const map = m.map;
+  const out: Finding[] = [];
+  const nodeLabel = (n: MapNode) => `${featureById.get(n.feature)?.name ?? n.feature} › ${n.label} (${n.methods.join("|")} /${n.uri === "/" ? "" : n.uri})`;
+
+  const dup = map.notes.filter((n) => n.startsWith("Warning:"));
+  if (dup.length) {
+    out.push({
+      title: "Duplicate routes",
+      why: "Laravel keeps only the last definition, so the earlier ones are dead code or a copy-paste mistake.",
+      items: dup.map((text) => ({ text: text.replace(/^Warning:\s*/, "") })),
+    });
+  }
+
+  const unvalidated = map.nodes.filter(
+    (n) => !n.hidden && n.who && n.type === "action" && !n.methods.every((x) => x === "GET") && !n.validation?.length && (n.inputs?.length ?? 0) > 0,
+  );
+  if (unvalidated.length) {
+    out.push({
+      title: "Writes without validation",
+      why: "These actions read request fields but no validation rules were found (no validate(), Validator or FormRequest).",
+      items: unvalidated.map((n) => ({ text: `${nodeLabel(n)} reads ${n.inputs!.map((i) => (i === "*" ? "all fields" : i)).join(", ")}`, source: n.handler?.file ? { file: n.handler.file, line: n.handler.line } : n.source })),
+    });
+  }
+
+  const envOutside = map.config?.flatMap((c) => c.uses.filter((u) => !u.source.file.startsWith("config/")).map((u) => ({ key: c.key, u }))) ?? [];
+  if (envOutside.length) {
+    out.push({
+      title: "env() outside config files",
+      why: "After php artisan config:cache, env() returns null outside config/. Read these through config() instead.",
+      items: envOutside.map(({ key, u }) => ({ text: `env('${key}')`, source: u.source })),
+    });
+  }
+
+  const missing = map.config?.filter((c) => c.uses.length && !c.inExample) ?? [];
+  const hasExample = map.config?.some((c) => c.inExample) ?? false;
+  if (missing.length && hasExample) {
+    out.push({
+      title: "Environment keys missing from .env.example",
+      why: "The code reads these keys, but a new installation would not know they exist.",
+      items: missing.map((c) => ({ text: c.key, source: c.uses[0]?.source })),
+    });
+  }
+
+  const incoming = new Set(map.edges.map((e) => e.to));
+  const unreachable = map.nodes.filter((n) => !n.hidden && n.type === "page" && n.uri.includes("{") && !incoming.has(n.id));
+  if (unreachable.length) {
+    out.push({
+      title: "Pages nothing leads to",
+      why: "No link, form, redirect or script found in the code leads to these pages (they may only be opened from outside, or be left over).",
+      items: unreachable.map((n) => ({ text: nodeLabel(n), source: n.source })),
+    });
+  }
+
+  const review = map.nodes.filter((n) => n.review);
+  if (review.length) {
+    out.push({
+      title: "Descriptions to check",
+      why: "The code behind these steps changed after a person described them.",
+      items: review.map((n) => ({ text: nodeLabel(n), source: n.source })),
+    });
+  }
+
+  const orphans = map.notes.filter((n) => n.startsWith("Kept "));
+  if (orphans.length) {
+    out.push({ title: "Edits for things no longer in the code", why: "Kept in builtlore.edits.yaml until someone removes them.", items: orphans.map((text) => ({ text })) });
+  }
+
+  if (map.skipped.length) {
+    out.push({
+      title: "Not read by builtlore",
+      why: "builtlore does not guess. These lines were seen but could not be read, so what they do is not in this documentation.",
+      items: map.skipped.map((s) => ({ text: s.reason, source: s.source })),
+    });
+  }
+  return out;
+}
+
+export function slugify(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "feature";
+}
+
+export function short(fqcn: string): string {
+  return fqcn.split("\\").pop() ?? fqcn;
+}
+
+function uniqueBy<T>(xs: T[], key: (x: T) => string): T[] {
+  const seen = new Set<string>();
+  return xs.filter((x) => (seen.has(key(x)) ? false : (seen.add(key(x)), true)));
+}
+
+/** "Step label" for a usage id: a node, a command or a job. */
+export function byLabel(m: DocModel, id: string): string {
+  if (id.startsWith("command:")) return `Command ${id.slice(8)}`;
+  if (id.startsWith("job:")) return `Job ${short(id.slice(4))}`;
+  const n = m.map.nodes.find((x) => x.id === id);
+  if (!n) return id;
+  const f = m.map.features.find((x) => x.id === n.feature);
+  return `${f?.name ?? n.feature} › ${n.label}`;
+}
+
+export function endpoint(n: MapNode): string {
+  return `${n.methods.join("|")} /${n.uri === "/" ? "" : n.uri}`;
+}
+
+export function where(s: SourceRef | undefined): string {
+  if (!s) return "";
+  return s.line ? `${s.file}:${s.line}` : s.file;
+}
+
+/** Same words the canvas draws as hold / reject / cancel. */
+export const NEGATIVE = /reject|declin|\bhold|cancel|tolak|batal|\bvoid|fail|expire|ditolak|dibatalkan/i;

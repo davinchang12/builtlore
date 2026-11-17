@@ -2,5 +2,6 @@ node_modules/
 dist/
 .builtlore/
 fixtures/**/builtlore.json
+fixtures/**/docs/builtlore/
 *.log
 .DS_Store

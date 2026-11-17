@@ -3,8 +3,25 @@
  * grouped by route name / URI, labels are derived from names. (An optional
  * AI pass that renames and regroups is planned; see docs/DESIGN.md.)
  */
-import { buildProcesses } from "./process.js";
-import type { BuiltMap, EntryFact, Feature, MapEdge, MapNode, NavigatesFact, SkippedFact, StatesFact, Fact } from "./types.js";
+import { buildProcesses, stepConditions, whoDoes } from "./process.js";
+import type {
+  BuiltMap,
+  CommandFact,
+  ConfigFact,
+  EntryFact,
+  Fact,
+  Feature,
+  Integration,
+  IntegrationFact,
+  JobFact,
+  MapEdge,
+  MapNode,
+  NavigatesFact,
+  ScheduleFact,
+  SkippedFact,
+  StatesFact,
+  TableFact,
+} from "./types.js";
 
 const AUTH_NAMES = /^(login|logout|register|password|verification|two-factor|auth|sanctum)(\.|$)/;
 const AUTH_URIS = /^(login|logout|register|forgot-password|reset-password|verify-email|email|confirm-password|two-factor-challenge)(\/|$)/;
@@ -32,9 +49,10 @@ export function buildMap(input: {
   const skipped = input.facts.filter((f): f is SkippedFact => f.kind === "skipped");
 
   const { featureById, display } = assignFeatures(entries);
+  const conditionsOf = stepConditions(entries, navs);
   const nodes: MapNode[] = entries.map((e) => {
     const feature = featureById.get(e.id)!;
-    return {
+    const node: MapNode = {
       id: e.id,
       type: e.type,
       label: labelOf(e, feature, display.get(feature) ?? featureName(feature)),
@@ -48,6 +66,11 @@ export function buildMap(input: {
       source: e.source,
       provenance: "extracted",
     };
+    if (isAction(e)) node.who = whoDoes(e, conditionsOf);
+    if (e.validation?.length) node.validation = e.validation;
+    if (e.inputs?.length) node.inputs = e.inputs;
+    if (e.responds?.length) node.responds = e.responds;
+    return node;
   });
 
   const nodeIds = new Set(nodes.map((n) => n.id));
@@ -87,6 +110,18 @@ export function buildMap(input: {
     features,
   });
 
+  const tables = input.facts.filter((f): f is TableFact => f.kind === "table").map((f) => f.table);
+  const schedule = input.facts.filter((f): f is ScheduleFact => f.kind === "schedule").map((f) => f.task);
+  const commands = input.facts.filter((f): f is CommandFact => f.kind === "command").map((f) => f.command);
+  const jobs = input.facts.filter((f): f is JobFact => f.kind === "job").map((f) => f.job);
+  const config = input.facts.filter((f): f is ConfigFact => f.kind === "config");
+  const integrations = groupIntegrations(
+    input.facts.filter((f): f is IntegrationFact => f.kind === "integration"),
+    nodes,
+    commands.map((c) => ({ id: `command:${c.name}`, class: c.class })),
+    jobs.map((j) => ({ id: `job:${j.class}`, class: j.class })),
+  );
+
   return {
     schema: "builtlore/0.1",
     generatedAt: new Date().toISOString(),
@@ -99,7 +134,60 @@ export function buildMap(input: {
     skipped,
     notes: input.notes,
     ...(processes.length ? { processes } : {}),
+    ...(tables.length ? { data: { tables } } : {}),
+    ...(schedule.length || commands.length || jobs.length ? { automation: { schedule, commands, jobs } } : {}),
+    ...(integrations.length ? { integrations } : {}),
+    ...(config.length ? { config } : {}),
   };
+}
+
+/** Steps a person performs: form submits, writes and exports (not pages or data reads). */
+export function isAction(e: Pick<EntryFact, "type" | "methods">): boolean {
+  if (e.type === "action" || e.type === "download") return true;
+  return e.type === "api" && !e.methods.every((m) => m === "GET");
+}
+
+/**
+ * One integration per target (an API base URL, a mailable, a notification, a
+ * disk), with every call to it and the steps, commands or jobs that make it.
+ */
+function groupIntegrations(
+  facts: IntegrationFact[],
+  nodes: MapNode[],
+  commands: Array<{ id: string; class?: string }>,
+  jobs: Array<{ id: string; class: string }>,
+): Integration[] {
+  const byTarget = new Map<string, Integration>();
+  for (const { usage: u } of facts) {
+    let g = byTarget.get(u.target);
+    if (!g) {
+      g = { id: u.target, kind: u.kind, name: u.name, usages: [] };
+      byTarget.set(u.target, g);
+    }
+    if (u.env?.length) g.env = [...new Set([...(g.env ?? []), ...u.env])];
+    if (u.channels?.length) g.channels = [...new Set([...(g.channels ?? []), ...u.channels])];
+    const by: string[] = [];
+    if (u.in) {
+      const inn = u.in;
+      if (inn.class === "closure") {
+        for (const n of nodes) if (n.handler?.kind === "closure" && n.handler.file === u.source.file && `closure:${n.handler.line}` === inn.method) by.push(n.id);
+      } else {
+        for (const n of nodes) if (n.handler?.class === inn.class && n.handler.method === inn.method) by.push(n.id);
+        for (const c of commands) if (c.class === inn.class) by.push(c.id);
+        for (const j of jobs) if (j.class === inn.class) by.push(j.id);
+      }
+    }
+    g.usages.push({
+      by,
+      ...(u.in && u.in.class !== "closure" ? { in: u.in } : {}),
+      ...(u.method ? { method: u.method } : {}),
+      ...(u.path ? { path: u.path } : {}),
+      ...(u.operation ? { operation: u.operation } : {}),
+      source: u.source,
+    });
+  }
+  const order = { http: 0, mail: 1, notification: 2, storage: 3 };
+  return [...byTarget.values()].sort((a, b) => order[a.kind] - order[b.kind] || a.name.localeCompare(b.name));
 }
 
 /** Name prefixes that describe an area of the app rather than a feature. */

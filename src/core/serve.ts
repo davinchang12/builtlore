@@ -10,6 +10,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type Server } from "node:http";
+import { renderDocs } from "../docs/index.js";
 import { renderHtml } from "../render/html.js";
 import { applyEdits, loadEdits, saveEdit, type EditPatch } from "./edits.js";
 import { scanProject, writeHtml, writeJson, type Config } from "./scan.js";
@@ -35,6 +36,13 @@ export async function serveProject(path: string, opts: Partial<Config> & { port?
       if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
         res.end(renderHtml(map, { edit: { token } }));
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/docs") {
+        // The documentation as `builtlore docs` would write it now, with the latest edits.
+        const docs = await renderDocs(map);
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+        res.end(docs.html);
         return;
       }
       if (req.method === "GET" && url.pathname === "/builtlore.json") {
@@ -74,7 +82,7 @@ export async function serveProject(path: string, opts: Partial<Config> & { port?
 function validatePatch(p: unknown): EditPatch {
   const o = p as { target?: unknown; id?: unknown; fields?: unknown };
   if (!o || typeof o.id !== "string" || !o.id || !o.fields || typeof o.fields !== "object") throw new Error("Invalid edit");
-  if (!["step", "feature", "glossary", "role", "status"].includes(o.target as string)) throw new Error("Invalid edit target");
+  if (!["project", "step", "feature", "glossary", "role", "status"].includes(o.target as string)) throw new Error("Invalid edit target");
   for (const v of Object.values(o.fields as Record<string, unknown>)) {
     if (typeof v === "string" && v.length > 20000) throw new Error("Text too long");
   }

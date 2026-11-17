@@ -43,6 +43,8 @@ export function renderHtml(map: BuiltMap, options: RenderOptions = {}): string {
       <button data-mode="screens" title="Every page, form and endpoint, and how they connect">Screens</button>
     </div>
     <div class="spacer"></div>
+    <button id="btn-project" title="What the system is for, and the glossary">Project</button>
+    <a id="btn-docs" class="button" href="/docs" target="_blank" rel="noopener" style="display:none" title="The documentation as it would be written now (builtlore docs)">Docs</a>
     <button id="btn-direction" title="Switch layout direction">Layout: left → right</button>
     <button id="btn-svg" title="Download the current canvas as SVG">Download SVG</button>
   </header>

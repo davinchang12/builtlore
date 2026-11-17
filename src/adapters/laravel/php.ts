@@ -181,6 +181,58 @@ export function shortClass(fqcn: string): string {
   return fqcn.split("\\").pop() ?? fqcn;
 }
 
+/** Source-like text of an expression (for showing code as written). Long output is shortened. */
+export function phpText(n: PhpNode, depth = 0): string {
+  if (!n) return "";
+  if (depth > 5) return "…";
+  const t = (x: PhpNode) => phpText(x, depth + 1);
+  const args = (xs: PhpNode[] | undefined) => (xs ?? []).map(t).join(", ");
+  switch (n.kind) {
+    case "variable":
+      return `$${n.name}`;
+    case "string":
+      return `'${n.value}'`;
+    case "number":
+      return String(n.value);
+    case "boolean":
+      return n.raw ?? (n.value ? "true" : "false");
+    case "nullkeyword":
+      return "null";
+    case "name":
+      return n.name;
+    case "array":
+      return `[${(n.items ?? []).map((it: PhpNode) => (it?.kind === "entry" ? (it.key ? `${t(it.key)} => ${t(it.value)}` : t(it.value)) : t(it))).join(", ")}]`;
+    case "propertylookup":
+    case "nullsafepropertylookup":
+      return `${t(n.what)}->${n.offset?.name ?? t(n.offset)}`;
+    case "staticlookup":
+      return `${n.what?.kind === "name" ? n.what.name : t(n.what)}::${n.offset?.name ?? t(n.offset)}`;
+    case "offsetlookup":
+      return `${t(n.what)}[${t(n.offset)}]`;
+    case "call":
+      return `${t(n.what)}(${args(n.arguments)})`;
+    case "new":
+      return `new ${n.what?.kind === "name" ? n.what.name : "class"}${n.arguments?.length ? `(${args(n.arguments)})` : ""}`;
+    case "bin":
+      return `${t(n.left)} ${n.type} ${t(n.right)}`;
+    case "retif":
+      return `${t(n.test)} ? ${t(n.trueExpr)} : ${t(n.falseExpr)}`;
+    case "closure":
+    case "arrowfunc":
+      return "function () { … }";
+    case "unary":
+      return `${n.type}${t(n.what)}`;
+    case "cast":
+      return `(${n.type})${t(n.expr ?? n.what)}`;
+    case "parenthesis":
+      return `(${t(n.inner)})`;
+    case "encapsed":
+      return `"${(n.value ?? []).map((p: PhpNode) => (p?.expression?.kind === "string" ? p.expression.value : `{${t(p?.expression)}}`)).join("")}"`;
+    default:
+      return n.kind;
+  }
+}
+
 /** Depth-first walk over every AST node. Return `false` from fn to skip children. */
 export function walk(node: PhpNode, fn: (n: PhpNode, parent: PhpNode | null) => boolean | void, parent: PhpNode | null = null): void {
   if (!node || typeof node !== "object") return;

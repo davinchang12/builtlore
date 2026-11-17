@@ -14,10 +14,16 @@ import type {
   SkippedFact,
   ViewRef,
 } from "../../core/types.js";
+import { readAutomation } from "./automation.js";
 import { BladeReader, viewFile, type BladeTarget } from "./blade.js";
+import { readConfig } from "./config.js";
 import { analyzeClosure, analyzeControllerMethod, ClassLocator, findMethod, type HandlerAnalysis, type RedirectTarget } from "./controllers.js";
+import { PhpCache } from "./files.js";
+import { readIntegrations } from "./integrations.js";
+import { readMigrations } from "./migrations.js";
 import { parseViewConditions, ProcessReader } from "./process.js";
-import { shortClass } from "./php.js";
+import { readRequest, type RequestReading } from "./validation.js";
+import { lineOf, shortClass, type PhpNode } from "./php.js";
 import { artisanAvailable, extractRoutesArtisan, mergeRoutes } from "./routes-artisan.js";
 import { extractRoutesStatic, type RawRoute } from "./routes-static.js";
 
@@ -73,6 +79,18 @@ export const laravelAdapter: Adapter = {
     const entries: EntryFact[] = [];
     const analyses = new Map<string, HandlerAnalysis | null>();
     const usedIds = new Set<string>();
+    // A handler used by several routes is read once (and its unreadable rules reported once).
+    const requestCache = new Map<string, RequestReading>();
+    const readRequestOnce = (file: string, node: PhpNode, read: () => RequestReading): RequestReading => {
+      const key = `${file}:${lineOf(node)}`;
+      let got = requestCache.get(key);
+      if (!got) {
+        got = read();
+        requestCache.set(key, got);
+        skipped.push(...got.skipped);
+      }
+      return got;
+    };
 
     for (const r of routes) {
       let id = entryId(r);
@@ -82,10 +100,14 @@ export const laravelAdapter: Adapter = {
       let handler: HandlerRef = { kind: "unknown" };
       let analysis: HandlerAnalysis | null = null;
       let process: ProcessInfo = { actors: [], writes: [], requires: [], creates: [] };
+      let request: RequestReading | null = null;
       if (r.action.kind === "controller") {
         analysis = analyzeControllerMethod(locator, r.action.class, r.action.method);
         const m = findMethod(locator, r.action.class, r.action.method);
-        if (m) process = reader.analyzeHandler(m.node, m.names, m.file, r.action.class);
+        if (m) {
+          process = reader.analyzeHandler(m.node, m.names, m.file, r.action.class);
+          request = readRequestOnce(m.file, m.node, () => readRequest(m.node, m.names, m.file, locator));
+        }
         handler = { kind: "controller", class: r.action.class, method: r.action.method, file: analysis?.file, line: analysis?.line };
         if (!analysis) {
           skipped.push({ kind: "skipped", reason: `Controller not found: ${r.action.class}@${r.action.method}`, source: { file: r.file, line: r.line } });
@@ -93,6 +115,8 @@ export const laravelAdapter: Adapter = {
       } else if (r.action.kind === "closure") {
         analysis = analyzeClosure(r.action.node, r.action.ctx, r.action.file);
         process = reader.analyzeHandler(r.action.node, r.action.ctx, r.action.file);
+        const a = r.action;
+        request = readRequestOnce(a.file, a.node, () => readRequest(a.node, a.ctx, a.file, locator));
         handler = { kind: "closure", file: r.action.file, line: analysis.line };
       } else if (r.action.kind === "view") {
         analysis = { views: [{ engine: "blade", name: r.action.view }], redirects: [], validates: false };
@@ -129,6 +153,9 @@ export const laravelAdapter: Adapter = {
         view,
         source: { file: r.file, line: r.line },
         process: process.actors.length || process.writes.length || process.requires.length || process.creates.length ? process : undefined,
+        ...(request?.validation.length ? { validation: request.validation } : {}),
+        ...(request?.inputs.length ? { inputs: request.inputs } : {}),
+        ...(analysis ? { responds: respondsOf(analysis) } : {}),
       });
     }
 
@@ -254,10 +281,47 @@ export const laravelAdapter: Adapter = {
     const steps = entries.filter((e) => e.process?.writes.length).length;
     if (steps) notes.push(`Process: ${steps} step${steps === 1 ? "" : "s"} change a status; ${withStates} status column${withStates === 1 ? "" : "s"} with known values.`);
 
-    const facts: Fact[] = [...entries, ...dedupe(resolved), ...skipped, ...states];
+    // 7. Documentation layer: data, configuration, integrations, automation
+    const php = new PhpCache(repo.root);
+    const docs: Fact[] = [];
+    const migrations = readMigrations(repo.root, {
+      modelForTable: (t) => reader.modelForTable(t),
+      tableForModel: (fq) => reader.tableForModel(fq),
+    });
+    skipped.push(...migrations.skipped);
+    for (const table of migrations.tables) docs.push({ kind: "table", table });
+    const config = readConfig(repo.root, php);
+    skipped.push(...config.skipped);
+    docs.push(...config.keys);
+    const integrations = readIntegrations(repo.root, php, locator, config.configEnv);
+    skipped.push(...integrations.skipped);
+    for (const usage of integrations.usages) docs.push({ kind: "integration", usage });
+    const automation = readAutomation(repo.root, php, reader);
+    skipped.push(...automation.skipped);
+    for (const task of automation.schedule) docs.push({ kind: "schedule", task });
+    for (const command of automation.commands) docs.push({ kind: "command", command });
+    for (const job of automation.jobs) docs.push({ kind: "job", job });
+    const counts = [
+      migrations.files ? `${migrations.tables.length} table${migrations.tables.length === 1 ? "" : "s"} from ${migrations.files} migration${migrations.files === 1 ? "" : "s"}` : "",
+      automation.schedule.length ? `${automation.schedule.length} scheduled task${automation.schedule.length === 1 ? "" : "s"}` : "",
+      integrations.usages.length ? `${integrations.usages.length} integration call${integrations.usages.length === 1 ? "" : "s"}` : "",
+      config.keys.length ? `${config.keys.length} environment key${config.keys.length === 1 ? "" : "s"} (names only)` : "",
+    ].filter(Boolean);
+    if (counts.length) notes.push(`Docs: ${counts.join(", ")}.`);
+
+    const facts: Fact[] = [...entries, ...dedupe(resolved), ...skipped, ...states, ...docs];
     return { facts, notes };
   },
 };
+
+function respondsOf(a: HandlerAnalysis): EntryFact["responds"] {
+  const out: NonNullable<EntryFact["responds"]> = [];
+  if (a.views.length) out.push("view");
+  if (a.redirects.length) out.push("redirect");
+  if (a.returnsJson) out.push("json");
+  if (a.returnsFile) out.push("file");
+  return out;
+}
 
 function entryId(r: RawRoute): string {
   if (r.name) return `route:${r.name}`;

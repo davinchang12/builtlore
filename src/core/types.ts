@@ -30,6 +30,178 @@ export interface EntryFact {
   source: SourceRef;
   /** Who may do this and how it changes a record's status (Process layer). */
   process?: ProcessInfo;
+  /** Validation rules applied to the request (validate(), Validator::make, FormRequest rules()). */
+  validation?: Validation[];
+  /** Request fields the handler reads ($request->input('x'), $request->x, only/except). */
+  inputs?: string[];
+  /** What the handler returns, when the code says. */
+  responds?: ResponseKind[];
+}
+
+export type ResponseKind = "view" | "redirect" | "json" | "file";
+
+// ---------------------------------------------------------------------------
+// Documentation layer facts (v0.3): rules, data, automation, integrations, config
+// ---------------------------------------------------------------------------
+
+export interface ValidationRule {
+  /** As written: "max:150", "Rule::in(['low', 'normal'])". */
+  rule: string;
+  /** Plain English when builtlore knows the rule, e.g. "at most 150 characters". */
+  text?: string;
+}
+
+export interface FieldRules {
+  field: string;
+  rules: ValidationRule[];
+  line?: number;
+}
+
+export interface Validation {
+  /** inline: $request->validate() / Validator::make(); form-request: rules() of a FormRequest class. */
+  via: "inline" | "form-request";
+  /** FormRequest class, e.g. App\Http\Requests\StorePurchaseRequestRequest. */
+  class?: string;
+  fields: FieldRules[];
+  source: SourceRef;
+}
+
+export interface DataColumn {
+  name: string;
+  /** Column type as written in the migration: string, decimal, foreignId, enum… */
+  type: string;
+  /** Length / precision as written: "150", "15, 2". */
+  size?: string;
+  nullable?: boolean;
+  /** Default as written in the migration. */
+  default?: string;
+  unique?: boolean;
+  index?: boolean;
+  primary?: boolean;
+  comment?: string;
+  /** Allowed values (enum columns). */
+  values?: string[];
+  references?: { table: string; column: string; by: "explicit" | "convention"; onDelete?: string };
+  /** Where the column was added (or last changed). */
+  source: SourceRef;
+}
+
+export interface DataTable {
+  name: string;
+  /** Eloquent model for this table ($table or Laravel's naming convention). */
+  model?: string;
+  columns: DataColumn[];
+  /** Migrations that created or changed the table, oldest first. */
+  migrations: string[];
+  /** Table comment from the migration. */
+  comment?: string;
+  /** The table is created outside the migrations that were read; only the changes are known. */
+  partial?: boolean;
+  source: SourceRef;
+}
+
+export interface TableFact {
+  kind: "table";
+  table: DataTable;
+}
+
+export interface ScheduledTask {
+  /** What runs: an artisan command, a queued job, a closure or a shell command. */
+  runs: { kind: "command" | "job" | "closure" | "exec"; name: string };
+  /** Frequency calls as written: "weekdays()->dailyAt('08:00')". */
+  when: string;
+  /** Plain English, only when every frequency call is known: "Weekdays at 08:00". */
+  whenText?: string;
+  /** without overlapping, on one server… */
+  options: string[];
+  description?: string;
+  source: SourceRef;
+}
+
+export interface ScheduleFact {
+  kind: "schedule";
+  task: ScheduledTask;
+}
+
+/** A status change made by a command or job, with the records it applies to when the code says. */
+export interface BackgroundWrite extends StatusWrite {
+  /** where('status', X) on the same query: only records in these states. */
+  when?: StatusValue[];
+}
+
+export interface ConsoleCommand {
+  /** "purchase-requests:remind" */
+  name: string;
+  signature: string;
+  class?: string;
+  description?: string;
+  writes: BackgroundWrite[];
+  source: SourceRef;
+}
+
+export interface CommandFact {
+  kind: "command";
+  command: ConsoleCommand;
+}
+
+export interface QueuedJob {
+  class: string;
+  /** Implements ShouldQueue. */
+  queued: boolean;
+  writes: BackgroundWrite[];
+  /** Where it is dispatched or scheduled. */
+  dispatchedFrom: SourceRef[];
+  source: SourceRef;
+}
+
+export interface JobFact {
+  kind: "job";
+  job: QueuedJob;
+}
+
+export type IntegrationKind = "http" | "mail" | "notification" | "storage";
+
+export interface IntegrationUsage {
+  kind: IntegrationKind;
+  /** Stable grouping key: "config:services.erp.url", "env:EPORTAL_URL", "host:api.x.com", "mail:WaitingApprovalReminder", "disk:s3". */
+  target: string;
+  /** Display name: "services.erp", "EPORTAL_URL", "api.x.com", "WaitingApprovalReminder", "s3". */
+  name: string;
+  /** HTTP verb. */
+  method?: string;
+  /** Literal path after the base URL. */
+  path?: string;
+  /** Environment keys behind the target (names only). */
+  env?: string[];
+  /** Notification channels from via(). */
+  channels?: string[];
+  /** Storage operation (put, get, delete…). */
+  operation?: string;
+  /** The class and method that contains the call. */
+  in?: { class: string; method?: string };
+  source: SourceRef;
+}
+
+export interface IntegrationFact {
+  kind: "integration";
+  usage: IntegrationUsage;
+}
+
+export interface ConfigUse {
+  source: SourceRef;
+  /** Config key that reads it: "services.erp.url". */
+  config?: string;
+  /** A fallback is written in code (the value itself is never recorded). */
+  hasDefault: boolean;
+}
+
+export interface ConfigFact {
+  kind: "config";
+  /** Environment variable name. Values are never read. */
+  key: string;
+  uses: ConfigUse[];
+  /** Listed in .env.example (names only). */
+  inExample: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +308,17 @@ export interface SkippedFact {
   source: SourceRef;
 }
 
-export type Fact = EntryFact | NavigatesFact | SkippedFact | StatesFact;
+export type Fact =
+  | EntryFact
+  | NavigatesFact
+  | SkippedFact
+  | StatesFact
+  | TableFact
+  | ScheduleFact
+  | CommandFact
+  | JobFact
+  | IntegrationFact
+  | ConfigFact;
 
 export interface RepoInfo {
   root: string; // absolute path
@@ -187,6 +369,11 @@ export interface MapNode {
   hidden?: boolean;
   /** Set when the code changed after a person described this step. */
   review?: string;
+  /** Who does this step (same rule as the Process view lanes); actions only. */
+  who?: ProcessLane;
+  validation?: Validation[];
+  inputs?: string[];
+  responds?: ResponseKind[];
 }
 
 export interface MapEdge {
@@ -213,7 +400,14 @@ export interface BuiltMap {
   schema: "builtlore/0.1";
   generatedAt: string;
   generator: string;
-  project: { name: string; commit?: string };
+  project: {
+    name: string;
+    commit?: string;
+    /** Display name written by a person. */
+    title?: string;
+    /** What the system is for, written by a person. */
+    summary?: string;
+  };
   stacks: string[];
   features: Feature[];
   nodes: MapNode[];
@@ -224,6 +418,31 @@ export interface BuiltMap {
   glossary?: Record<string, string>;
   /** Business processes: who does each step and how the status changes. */
   processes?: Process[];
+  /** Tables and columns from migrations. */
+  data?: { tables: DataTable[] };
+  /** Scheduler, console commands and queued jobs. */
+  automation?: { schedule: ScheduledTask[]; commands: ConsoleCommand[]; jobs: QueuedJob[] };
+  /** External systems the app talks to: HTTP APIs, mail, notifications, file storage. */
+  integrations?: Integration[];
+  /** Environment keys the code reads (names only, never values). */
+  config?: ConfigFact[];
+}
+
+export interface Integration {
+  id: string;
+  kind: IntegrationKind;
+  name: string;
+  env?: string[];
+  channels?: string[];
+  usages: Array<{
+    /** Steps (node ids), commands ("command:<name>") or jobs ("job:<class>") that make the call. */
+    by: string[];
+    in?: { class: string; method?: string };
+    method?: string;
+    path?: string;
+    operation?: string;
+    source: SourceRef;
+  }>;
 }
 
 export interface ProcessState {

@@ -2,7 +2,7 @@
 
 > **Name.** `builtlore` = "the lore of what you built": the knowledge, flows and history of an application that usually live only in people's heads, made visible. Chosen 2026-11-16 (see [Open questions](#16-open-questions)).
 
-**Status:** v0.2.0-alpha.0 (Laravel: Process view, Screens view, edits that survive rescans) · **Next:** project documentation (6.8) · **Last updated:** 2026-11-16
+**Status:** v0.3.0-alpha.0 (Laravel: Process view, Screens view, edits that survive rescans, `builtlore docs`) · **Next:** History layer (6.3), change history in the docs · **Last updated:** 2026-11-17
 
 ---
 
@@ -146,7 +146,7 @@ Adapter order: **Laravel → Go → Next.js → Flutter.** Where each stack's en
 
 | Stack | Entry points | Navigation / links | Scheduler |
 |---|---|---|---|
-| Laravel | `routes/web.php`, `routes/api.php` (incl. groups, prefixes, names, resource routes) | `redirect()->route()`, `to_route()`, Blade `route()` in links and form actions | `routes/console.php`, Console Kernel `schedule()` |
+| Laravel | `routes/web.php`, `routes/api.php` (incl. groups, prefixes, names, resource routes) | `redirect()->route()`, `to_route()`, Blade `route()` in links and form actions | `routes/console.php`, Console Kernel `schedule()`, `bootstrap/app.php` `withSchedule()` (read since 0.3) |
 | Go | `net/http`, gin, echo, chi route registrations | (API only) | cron libraries |
 | Next.js | `app/**/page.tsx`, `app/**/route.ts`, `pages/**` | `<Link href>`, `router.push`, `redirect()` | `vercel.json` crons |
 | Flutter | GoRouter / Navigator route definitions | `context.go/push`, `Navigator.push` | (n/a) |
@@ -226,7 +226,7 @@ glossary:
 - **Orphans:** edits whose id no longer exists are kept and listed in the scan notes; never deleted automatically.
 - **Untouched generated names stay generated**, so they keep improving as the extractor improves; only names a person actually changed are pinned (`provenance: human`).
 - `builtlore serve` binds to 127.0.0.1 and requires a per-session token in a custom header for writes (blocks cross-site requests from other tabs).
-- The same file will hold later human inputs: status names for the Process view (`statuses:`), actor names (`roles:`), and documentation prose (6.8).
+- The same file holds the other human inputs: status names for the Process view (`statuses:`), actor names (`roles:`), and documentation prose (6.8): `project:` (`name`, `summary`) and `glossary:`, edited in `builtlore serve` under *Project*.
 
 ### 6.6 Render
 
@@ -293,6 +293,15 @@ Goal: documentation an enterprise team would hand over or audit, generated from 
 
 Each fact carries provenance (*from code* / *inferred* / *written by a person*) so readers know what to trust. Outputs: a Markdown folder (versioned with the repo), a static HTML docs site, and Word/PDF export for formal handover. Prose fields are edited the same way as names (canvas or YAML) and survive rescans.
 
+**As implemented (0.3.0-alpha.0):**
+- `builtlore docs [path] [--out docs/builtlore] [--open]` scans, then writes one Markdown file per section (features under `features/`) and a single `index.html`. PDF comes from printing the HTML (print stylesheet: A4, one section per page, no navigation). Word export and change history are not done yet.
+- Pipeline: `builtlore.json` → `docs/model.ts` (derived views: role matrix, findings, per-process transitions incl. background jobs) → `docs/content.ts` (a small document tree) → `markdown.ts` / `html.ts`. Both outputs come from the same tree, so they never disagree.
+- Status lifecycle: Mermaid `stateDiagram-v2` in Markdown; static SVG laid out with ELK (in Node) in HTML, switching to top-to-bottom when that reads larger on a page. A step whose starting status is not checked in code starts from *Any status (not checked in code)*; jobs that change the status are drawn as automatic transitions.
+- New facts from the Laravel adapter: `validation` and `inputs` on entries; `table`, `schedule`, `command`, `job`, `integration`, `config` facts (see 6.2). Every action node gets `who` (same lane rule as the Process view, same edits).
+- Values are never read: `.env` is not opened, only key names of `.env.example`, and `env('X', default)` records only that a default exists.
+- Safety: `builtlore docs` replaces only files it wrote (marked in the first line) and removes its own pages for features that are gone; it refuses to overwrite any other file.
+- `builtlore serve` serves `/docs` (the docs as they would be written now) and edits `project:` / `glossary:`.
+
 ---
 
 ## 7. Data model (`builtlore.json`)
@@ -354,11 +363,11 @@ Provenance values: `extracted` (from code, deterministic) · `inferred` (from LL
 | `builtlore scan [paths...]` | Run the full pipeline and write `builtlore.json`; several project paths can be given, each gets its own map |
 | `builtlore view` | Open the canvas in the browser |
 | `builtlore serve` | Scan and serve the canvas on 127.0.0.1 with editing on; saves to `builtlore.edits.yaml` |
-| `builtlore docs` | Generate Markdown docs into `docs/builtlore/` |
+| `builtlore docs` | Scan and write the documentation: Markdown into `docs/builtlore/` plus a printable `index.html` |
 | `builtlore diff <refA> <refB>` | Show features/flows added, changed, removed between two git refs |
 | `builtlore check` | CI mode: exit non-zero if the committed map is out of date |
 
-Implemented in v0.1: `init`, `scan`, `view`, `serve`, flags `--mode auto|static|artisan`, `--out`, `--open`, `--php <path>`, `--port`.
+Implemented: `init`, `scan`, `view`, `serve`, `docs` (0.3), flags `--mode auto|static|artisan`, `--out`, `--open`, `--php <path>`, `--port`.
 Planned flags: `--no-ai` (becomes meaningful once the AI pass exists; v0.1 is fully deterministic), `--since <ref>` (incremental), `--provider`, `--model`, `--workspace <file>` (named sets of projects).
 
 ---
@@ -414,7 +423,7 @@ Alternative considered: a Go CLI (single binary by default). Rejected for v0.1 b
 | **v0.1** | Flows layer for **one** stack · `scan`, `view` · single-HTML canvas · `--no-ai` mode |
 | v0.1 (alpha.3) | Human edits + stable IDs + `serve` (done, 6.5) |
 | v0.2 | **Process layer:** swimlanes from actors + status transitions (6.7); default view — alpha.0 done |
-| v0.3 | **Project documentation** (6.8): `builtlore docs` → Markdown, HTML site, Word/PDF |
+| v0.3 | **Project documentation** (6.8): `builtlore docs` → Markdown, HTML, PDF via print — alpha.0 done (Word export and change history next) |
 | v0.3.x | History layer: feature birth, churn, contributors · timeline slider · `diff` · `check` for CI · GitHub Action |
 | v0.4 | Data layer: migrations/ORM → ERD · live read-only DB (FKs, stored procedures) · step ↔ table links |
 | v0.5 | Automation layer: schedulers, cron, queues, webhooks as time/event-triggered flows |

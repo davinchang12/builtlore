@@ -17,6 +17,7 @@ import {
   type NameContext,
   type PhpNode,
 } from "./php.js";
+import { requestKind } from "./validation.js";
 
 export interface HandlerAnalysis {
   file?: string;
@@ -102,12 +103,12 @@ export function analyzeControllerMethod(locator: ClassLocator, fqcn: string, met
   analysis.file = loaded.file;
   analysis.line = lineOf(found);
   // FormRequest parameter => validation happens before the method body runs
+  // (a model named PurchaseRequest is not one: the class must extend FormRequest)
   for (const p of (found as PhpNode).arguments ?? []) {
     const typeName: string | undefined = p.type?.name;
-    if (typeName && /Request$/.test(typeName) && !/^\\?(Illuminate\\Http\\)?Request$/.test(typeName)) {
-      const resolved = resolveClass(p.type, loaded.names) ?? typeName;
-      if (resolved !== "Illuminate\\Http\\Request") analysis.validates = true;
-    }
+    if (!typeName) continue;
+    const resolved = resolveClass(p.type, loaded.names) ?? typeName;
+    if (requestKind(resolved, locator) === "form") analysis.validates = true;
   }
   return analysis;
 }

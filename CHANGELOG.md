@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented here.
 
+## 0.3.0-alpha.0 — 2026-11-17
+
+Project documentation, generated from the code and the text people write.
+
+### Added
+- **`builtlore docs`**: scans the project and writes a Markdown folder (`docs/builtlore/` by default, `--out` to change) plus one self-contained `index.html` that prints cleanly to PDF. Sections: system overview, roles × actions matrix, one page per feature with its business process (status lifecycle as a Mermaid diagram in Markdown, an SVG diagram in HTML), business rules, data dictionary, integrations, automation, API reference, configuration, glossary and findings. Every fact links to the file and line it comes from.
+- **Business rules from validation**: `$request->validate()`, `validateWithBag()`, `$this->validate()`, `Validator::make()` / `validator()`, and `rules()` of FormRequest classes (including ones that extend the app's own base request, and rules returned from a variable). Each rule is kept as written with a plain-English reading (`max:150` → "at most 150 characters", `max:2048` on a file → "at most 2048 KB", `exists:items,id`, `Rule::in([...])`, custom rule classes and closures). The request fields a handler reads are recorded too.
+- **Data dictionary from migrations**: `Schema::create` and `Schema::table` replayed oldest first (only `up()`): column types, sizes, nullable, defaults, unique/index/primary, comments, enum values, `->after()`, `->change()`, renamed and dropped columns, renamed and dropped tables, `timestamps`, `softDeletes`, `morphs`. Foreign keys from `constrained()` (named, or by Laravel's naming convention, and marked as such), `foreign()->references()->on()`, `foreignIdFor()`, `dropForeign()`, with on-delete rules. Tables are matched to models.
+- **Automation**: the scheduler in `routes/console.php`, `app/Console/Kernel.php` and `bootstrap/app.php` (`Schedule::command/job/call/exec`, `$schedule->…`), with frequencies as written and in plain English when every call is known ("Weekdays at 08:00"); console commands (`$signature`, `$description`, `Artisan::command()->purpose()`); jobs in `app/Jobs`, where they are dispatched, and the statuses they change (including `where('status', …)` on the same query). Jobs that change a status appear in that process's lifecycle.
+- **Integrations**: `Http::` calls with the base URL from a literal host, `config()` or `env()` and the path after it; credentials passed with `withToken(config(...))`; `Mail::…->send/queue`; `notify()` and `Notification::send()` with channels from the notification's `via()`; `Storage::disk()->…`, the default disk, and uploads stored with `->store(…, 's3')`. Each call is linked to the step, command or job that makes it.
+- **Configuration**: environment keys read with `env()` in `config/*.php` (and the config key they become) and elsewhere, and the key names of `.env.example`. Values are never read: `.env` is not opened and defaults written in code are not copied.
+- **Roles × actions**: every action records who does it, using the same rule as the Process view lanes (and the same edits: `roles:`, `actor:`).
+- **Findings**: duplicate routes, writes without validation, `env()` outside config files, keys missing from `.env.example`, pages nothing leads to, descriptions to check, and everything builtlore could not read.
+- **Project summary and glossary in `builtlore serve`**: a *Project* button opens the system name, summary and glossary for editing; saved under `project:` and `glossary:` in `builtlore.edits.yaml`. *Docs* opens the documentation as it would be written now (`/docs`).
+- Unreadable rules, table names, URLs, disks, notification channels, env keys and schedule targets are listed under *Skipped* with file and line.
+
+### Fixed
+- A model whose name ends in `Request` (`PurchaseRequest $purchaseRequest`) was taken for a FormRequest, which added a false "validation failed" branch to steps such as approve and reject. A parameter now counts as a FormRequest only when its class extends `FormRequest`.
+
 ## 0.2.0-alpha.1 — 2026-11-16
 
 Fixes from the first run of the Process view on a real 145-route app.

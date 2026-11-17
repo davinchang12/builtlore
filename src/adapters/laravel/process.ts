@@ -295,6 +295,14 @@ export class ProcessReader {
     return this.tables.get(t) ?? null;
   }
 
+  /** Table of a model class: $table, or Laravel's snake_case plural convention. */
+  tableForModel(fqcn: string): string | null {
+    const info = this.classInfo(fqcn);
+    if (info?.table) return info.table;
+    const short = fqcn.split("\\").pop();
+    return short ? pluralSnake(short) : null;
+  }
+
   modelFor(short: string): string | null {
     for (const c of this.findShort(short)) if (this.classInfo(c)?.isModel) return c;
     return null;
