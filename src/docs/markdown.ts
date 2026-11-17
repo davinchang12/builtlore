@@ -102,6 +102,8 @@ function block(b: Block, ctx: Ctx): string[] {
     }
     case "diagram":
       return ["```mermaid", b.mermaid, "```"];
+    case "flow":
+      return ["```mermaid", b.mermaid, "```", "", `*${b.caption}*`];
     case "mermaid":
       return ["```mermaid", b.code, "```"];
     case "code":

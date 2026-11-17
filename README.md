@@ -175,7 +175,7 @@ builtlore docs --out handover --open
 |---|---|---|
 | Start here | Summary, main path of each process, who uses the system, modules, what to read next, the canvas | `project:` and feature descriptions in `builtlore.edits.yaml`, Process layer |
 | Who uses it | Each role and what it can do (plus the full role × action matrix) | Middleware, handler checks, Blade conditions (same as the Process view) |
-| Features | Per feature: what you can do there, how it works as numbered steps, status diagram (Mermaid / SVG); routes and files folded for developers | Process layer, jobs that change a status |
+| Features | Per feature: what you can do there, how it works as numbered steps, a *who does what* swimlane flowchart, the status diagram, and a *screens and actions* flowchart (Mermaid / SVG); routes and files folded for developers. Features that only add, edit, delete, import or export (master data) get one table of operations instead, and a *Data management overview* sums them all up | Process layer, jobs that change a status, routes and views |
 | Business rules | Per form: each field's rules as written and in plain English; when each step is allowed | `validate()`, `Validator::make()`, FormRequest `rules()`, status guards |
 | Data dictionary | Tables, columns, types, defaults, keys, relationships, known status values | `database/migrations` (oldest first), models |
 | Integrations | HTTP APIs, email, notifications and channels, file storage, and which step calls them | `Http::`, `Mail::`, `notify()`, `Notification::send()`, `Storage::`, `->store()` |
@@ -186,7 +186,7 @@ builtlore docs --out handover --open
 | Findings | Permission checked only in the page, writes open to anyone, duplicate routes, writes without validation, `env()` outside config, missing `.env.example` keys, pages nothing leads to, and everything builtlore could not read | Scan |
 | To write | What only people can write and nobody has yet, as YAML to paste into `builtlore.edits.yaml` | Scan + `builtlore.edits.yaml` |
 
-The Markdown pages link every fact to its file and line, and render on GitHub and GitLab (diagrams included). `index.html` is a single offline file with a table of contents and the canvas embedded; print it from the browser to get a PDF. `builtlore docs` also does everything `builtlore scan` does, so one command is enough. builtlore only replaces files it wrote, and refuses to overwrite anything else.
+The Markdown pages link every fact to its file and line, and render on GitHub and GitLab (diagrams included). `index.html` is a single offline file with a folding table of contents (business processes first, master data and other screens folded, grouped by area) and the canvas embedded; print it from the browser to get a PDF. `builtlore docs` also does everything `builtlore scan` does, so one command is enough. builtlore only replaces files it wrote, and refuses to overwrite anything else.
 
 ### What changed between two versions
 

@@ -42,6 +42,12 @@ Project documentation, generated from the code and the text people write.
 - **Permission checked only in the page**: when a page handler checks abilities and hands them to its view (`$canInsert = Gate::allows('X Insert'); compact('canInsert')`) and the actions that page calls have no check on the server, those actions say so (who, feature page) and are listed under the new finding *Permission checked only in the page*. builtlore does not pick one of the page's permissions for the action.
 - **Open to anyone** finding: writes with no login, API key or permission check at all.
 - `Model::where('status', X)->update(['status' => Y])` (and `whereIn`) starts from X.
+- **More flowcharts in the docs** (Mermaid in Markdown, SVG in HTML):
+  - *Who does what*: each process as swimlanes, one row per role, arrows carrying the status one step leaves and the next needs, where it ends in green (red when stopped). Laid out by builtlore so lanes stay rows; steps that leave the status unchanged are listed in the text, not drawn.
+  - *Screens and actions*: each feature's screens, the actions they offer, where they lead and what happens when they fail. A busy feature (more than 16 boxes) gets a list of where each screen leads instead of an unreadable picture.
+  - *How the areas connect* on *Start here*: links, forms and redirects between the app's areas.
+- **Many CRUD features, summed up**: features that only keep a list up to date (add, edit, delete, import, export) are recognised as *Data management*: their page shows one table of operations (who, fields checked, *page only* when the permission is checked only in the page) and a screen diagram instead of a story; a *Data management overview* page lists them all in one table. *Modules* on *Start here* says which kind each feature is.
+- **Sidebar that folds**: each part folds (only *Understand the system* starts open); features are split into *Business processes* (open), *Data management* and *Other screens*, and by area ("Application", "Infrastructure", "Master") with short names and counts; the section being read is highlighted and its folds open by themselves.
 - A status not readable from the code says where it comes from: a form field nothing limits, or a table (`exists:general_codes,code`).
 
 ### Fixed

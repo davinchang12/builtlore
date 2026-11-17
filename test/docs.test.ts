@@ -228,6 +228,26 @@ describe("builtlore docs output", () => {
     assert.ok(leave.includes('state "Any status (no check in code)" as any'), "a step with no status check starts from any status");
   });
 
+  it("draws who does what as a swimlane flowchart, and each feature's screens and actions", () => {
+    const pr = read("features/menu-purchaserequest.md");
+    assert.ok(pr.includes("**Who does what**"));
+    assert.match(pr, /```mermaid\nflowchart LR[\s\S]*subgraph L\d\["Manager"\][\s\S]*subgraph L\d\["Procurement"\]/, "one lane per role");
+    assert.match(pr, /-->\|"Waiting for manager"\|/, "arrows carry the status in between");
+    assert.ok(pr.includes("## Screens and actions"));
+    const html = read("index.html");
+    assert.match(html, /<svg class="flow lanes/);
+    assert.match(html, /<rect class="lane/);
+  });
+
+  it("folds the sidebar: parts, features by kind, areas", () => {
+    const html = read("index.html");
+    const toc = html.slice(html.indexOf('<ul class="toc-list">'), html.indexOf("</nav>"));
+    assert.match(toc, /<li class="part"><details open><summary>Understand the system/);
+    assert.match(toc, /<li class="part"><details><summary>Reference/, "Reference starts folded");
+    assert.match(toc, /<li class="section"><details open><summary>Business processes <span class="count">\d+<\/span>/);
+    assert.ok(html.includes("IntersectionObserver"), "the section being read opens by itself");
+  });
+
   it("links facts to the file and line they come from", () => {
     assert.ok(read("business-rules.md").includes("(../../app/Http/Requests/StorePurchaseRequestRequest.php#L10)"));
     assert.ok(read("features/menu-purchaserequest.md").includes("(../../../app/Http/Controllers/PurchaseRequestController.php)"));

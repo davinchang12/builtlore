@@ -1125,6 +1125,66 @@ class InboxController extends Controller {
   });
 });
 
+describe("many CRUD features", () => {
+  it("sums up list-only features as data management, with one diagram each and one overview table", async () => {
+    const crud = (name: string, cls: string) => ({
+      [`app/Http/Controllers/${cls}Controller.php`]: `<?php
+namespace App\\Http\\Controllers;
+use Illuminate\\Http\\Request;
+class ${cls}Controller extends Controller {
+    public function index() { return view('${name}.index'); }
+    public function store(Request $request) { $request->validate(['name' => 'required|max:50']); return back(); }
+    public function update(Request $request, $id) { return back(); }
+    public function destroy($id) { return back(); }
+    public function export() { return response()->download('x.xlsx'); }
+}
+`,
+      [`resources/views/${name}/index.blade.php`]: `<form method="POST" action="{{ route('master.${name}.store') }}">@csrf</form>
+<a href="{{ route('master.${name}.export') }}">Export</a>
+`,
+    });
+    const map = await scan({
+      "routes/web.php": `<?php
+use Illuminate\\Support\\Facades\\Route;
+foreach ([] as $x) {}
+Route::prefix('master')->name('master.')->middleware('auth')->group(function () {
+    Route::get('sites', [App\\Http\\Controllers\\SiteController::class, 'index'])->name('site.index');
+    Route::post('sites', [App\\Http\\Controllers\\SiteController::class, 'store'])->name('site.store');
+    Route::put('sites/{id}', [App\\Http\\Controllers\\SiteController::class, 'update'])->name('site.update');
+    Route::delete('sites/{id}', [App\\Http\\Controllers\\SiteController::class, 'destroy'])->name('site.destroy');
+    Route::get('sites/export', [App\\Http\\Controllers\\SiteController::class, 'export'])->name('site.export');
+    Route::get('tags', [App\\Http\\Controllers\\TagController::class, 'index'])->name('tag.index');
+    Route::post('tags', [App\\Http\\Controllers\\TagController::class, 'store'])->name('tag.store');
+    Route::put('tags/{id}', [App\\Http\\Controllers\\TagController::class, 'update'])->name('tag.update');
+    Route::delete('tags/{id}', [App\\Http\\Controllers\\TagController::class, 'destroy'])->name('tag.destroy');
+    Route::get('tags/export', [App\\Http\\Controllers\\TagController::class, 'export'])->name('tag.export');
+    Route::get('units', [App\\Http\\Controllers\\UnitController::class, 'index'])->name('unit.index');
+    Route::post('units', [App\\Http\\Controllers\\UnitController::class, 'store'])->name('unit.store');
+    Route::put('units/{id}', [App\\Http\\Controllers\\UnitController::class, 'update'])->name('unit.update');
+    Route::delete('units/{id}', [App\\Http\\Controllers\\UnitController::class, 'destroy'])->name('unit.destroy');
+    Route::get('units/export', [App\\Http\\Controllers\\UnitController::class, 'export'])->name('unit.export');
+});
+`,
+      ...crud("site", "Site"),
+      ...crud("tag", "Tag"),
+      ...crud("unit", "Unit"),
+    });
+    const { renderDocs } = await import("../src/docs/index.js");
+    const docs = await renderDocs(map);
+    const dm = docs.markdown.get("data-management.md")!;
+    assert.ok(dm, [...docs.markdown.keys()].join(", "));
+    assert.match(dm, /\| Feature \| Add \| Edit \| Delete \| Import \| Export \| Who \|/);
+    assert.match(dm, /\[Master › Site\]\([^)]*\) \| ✓ \| ✓ \| ✓ \|\s+\| ✓ \| Signed-in user \|/);
+    const site = [...docs.markdown.entries()].find(([k]) => /site/.test(k) && k.startsWith("features/"))![1];
+    assert.match(site, /## Data management/);
+    assert.match(site, /\| Add \| Save site \| Signed-in user \| name \|/);
+    assert.match(site, /## Screens and actions\n\n```mermaid\nflowchart LR/);
+    // Sidebar: the data features sit under "Data management", grouped by area with short names
+    const toc = docs.html.slice(docs.html.indexOf('<ul class="toc-list">'), docs.html.indexOf("</nav>"));
+    assert.match(toc, /<summary>Data management <span class="count">3<\/span><\/summary><ul><li class="area"><details><summary>Master <span class="count">3<\/span><\/summary><ul><li><a href="#feature-[^"]+">Site<\/a>/);
+  });
+});
+
 describe("status sequences and branches", () => {
   it("skips a branch that cannot run with the values passed in (review($order, 'pass'))", async () => {
     const map = (await scanProject(dirs.find((d) => existsSync(join(d, "app/Services/OrderWorkflow.php")))!, { mode: "static" })).map;

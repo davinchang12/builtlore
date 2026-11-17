@@ -5,33 +5,23 @@
  */
 import { PARTS, type Block, type Inline, type Page, type Part } from "./content.js";
 import { stateSvg } from "./diagram.js";
+import { flowSvg } from "./flow.js";
 import type { DocModel } from "./model.js";
 
 export async function renderDocsHtml(m: DocModel, pages: Page[], opts: { canvasHref?: string } = {}): Promise<string> {
   const body: string[] = [];
-  const toc: string[] = [];
   let openGroup: string | null = null;
-  let part: Part | null = null;
   let svgCount = 0;
   const next = () => ++svgCount;
+  const toc = tocHtml(pages);
 
   for (const page of pages) {
     const grouped = Boolean(page.group);
-    if (openGroup && page.group?.id !== openGroup) {
-      openGroup = null;
-      toc.push("</ul></li>");
-    }
-    if (page.part !== part) {
-      if (part) toc.push("</ul></li>");
-      part = page.part;
-      toc.push(`<li class="part"><div class="part-title">${esc(PARTS[part].title)}</div><ul>`);
-    }
+    if (openGroup && page.group?.id !== openGroup) openGroup = null;
     if (page.group && openGroup !== page.group.id) {
       openGroup = page.group.id;
       body.push(`<section class="page group-head" id="${page.group.id}"><h2>${esc(page.group.title)}</h2><p class="lead">${esc(page.group.lead)}</p></section>`);
-      toc.push(`<li><a href="#${page.group.id}">${esc(page.group.title)}</a><ul>`);
     }
-    toc.push(`<li><a href="#${page.id}">${esc(page.file === "README.md" ? "Start here" : page.title)}</a></li>`);
 
     if (page.file === "README.md") {
       body.push(`<header class="cover" id="${page.id}"><div class="kicker">System documentation</div><h1>${esc(page.title)}</h1>`);
@@ -45,8 +35,6 @@ export async function renderDocsHtml(m: DocModel, pages: Page[], opts: { canvasH
     for (const b of page.blocks) body.push(await block(b, shift, next));
     body.push("</section>");
   }
-  if (openGroup) toc.push("</ul></li>");
-  if (part) toc.push("</ul></li>");
 
   const map = m.map;
   const meta = [`Generated ${map.generatedAt.slice(0, 10)}`, map.project.commit ? `commit ${map.project.commit}` : "", map.generator].filter(Boolean).join(" · ");
@@ -67,7 +55,7 @@ export async function renderDocsHtml(m: DocModel, pages: Page[], opts: { canvasH
     <input id="q" type="search" placeholder="Search…  ( / )" autocomplete="off" aria-label="Search the documentation">
     <ul id="results" hidden></ul>
   </div>
-  <ul class="toc-list">${toc.join("")}</ul>
+  <ul class="toc-list">${toc}</ul>
   ${opts.canvasHref ? `<a class="side-button" href="${esc(opts.canvasHref)}" target="_blank" rel="noopener">Open canvas</a>` : ""}
   <button type="button" class="side-button" onclick="window.print()">Print / save as PDF</button>
 </nav>
@@ -75,11 +63,85 @@ export async function renderDocsHtml(m: DocModel, pages: Page[], opts: { canvasH
 ${body.join("\n")}
 <footer>${esc(meta)} · from the code and builtlore.edits.yaml · update with <code>builtlore docs</code></footer>
 </main>
-<script>${SCRIPT}</script>
+<script>${SCRIPT}${NAV_SCRIPT}</script>
 </body>
 </html>
 `;
 }
+
+/**
+ * The sidebar as folding sections: each part, the features group, and inside it
+ * Business processes / Data management / Other screens, each split by area
+ * ("Application", "Infrastructure") with short names. Only "Understand" and
+ * "Business processes" start open; the section being read opens by itself.
+ */
+function tocHtml(pages: Page[]): string {
+  const link = (p: Page, text?: string) => `<li><a href="#${p.id}">${esc(text ?? (p.file === "README.md" ? "Start here" : p.title))}</a></li>`;
+  const fold = (title: string, count: number | null, inner: string, open: boolean, cls: string) =>
+    `<li class="${cls}"><details${open ? " open" : ""}><summary>${esc(title)}${count !== null ? ` <span class="count">${count}</span>` : ""}</summary><ul>${inner}</ul></details></li>`;
+  const out: string[] = [];
+  const parts: Part[] = [];
+  for (const p of pages) if (!parts.includes(p.part)) parts.push(p.part);
+  for (const part of parts) {
+    const inPart = pages.filter((p) => p.part === part);
+    const inner: string[] = [];
+    let i = 0;
+    while (i < inPart.length) {
+      const p = inPart[i];
+      if (!p.group) {
+        inner.push(link(p));
+        i++;
+        continue;
+      }
+      // A group (features): sections, then areas
+      const group = inPart.filter((x) => x.group?.id === p.group!.id);
+      i += group.length;
+      const sections: string[] = [];
+      for (const section of [...new Set(group.map((x) => x.nav?.section ?? ""))]) {
+        const inSection = group.filter((x) => (x.nav?.section ?? "") === section);
+        const items: string[] = [];
+        const areas = new Map<string, Page[]>();
+        for (const x of inSection) {
+          const a = x.nav?.area ?? "";
+          areas.set(a, [...(areas.get(a) ?? []), x]);
+        }
+        for (const [area, list] of areas) {
+          if (area && list.length > 1) items.push(fold(area, list.length, list.map((x) => link(x, x.nav?.short)).join(""), false, "area"));
+          // One page in its area: "Task › Task" reads as "Task"
+          else items.push(...list.map((x) => link(x, x.nav?.area && x.nav.short === x.nav.area ? x.nav.short : undefined)));
+        }
+        if (section) sections.push(fold(section, inSection.length, items.join(""), section === "Business processes", "section"));
+        else sections.push(items.join(""));
+      }
+      inner.push(fold(p.group.title, group.length, sections.join(""), true, "group"));
+    }
+    out.push(fold(PARTS[part].title, null, inner.join(""), part === "understand", "part"));
+  }
+  return out.join("");
+}
+
+/**
+ * Sidebar: highlight the section being read and open the folds around it.
+ */
+const NAV_SCRIPT = `(function(){
+  var links={};document.querySelectorAll(".toc-list a[href^='#']").forEach(function(a){links[a.getAttribute("href").slice(1)]=a;});
+  var current=null;
+  function mark(id){
+    var a=links[id];if(!a||a===current)return;
+    if(current)current.classList.remove("active");
+    current=a;a.classList.add("active");
+    for(var d=a.parentElement;d&&!d.classList.contains("toc-list");d=d.parentElement){if(d.tagName==="DETAILS")d.open=true;}
+    var nav=document.querySelector(".toc");var r=a.getBoundingClientRect(),n=nav.getBoundingClientRect();
+    if(r.top<n.top+80||r.bottom>n.bottom-40)a.scrollIntoView({block:"center"});
+  }
+  var sections=[].slice.call(document.querySelectorAll("main > section[id], main > header[id]"));
+  if("IntersectionObserver" in window){
+    var io=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting)mark(e.target.id);});},{rootMargin:"0px 0px -70% 0px"});
+    sections.forEach(function(s){io.observe(s);});
+  }
+  function fromHash(){var id=decodeURIComponent(location.hash.slice(1));if(!id)return;var el=document.getElementById(id);var s=el&&el.closest("main > section[id], main > header[id]");mark(s?s.id:id);}
+  window.addEventListener("hashchange",fromHash);fromHash();
+})();`;
 
 /**
  * Search (headings, table rows, list items; jumps to the section) and printing
@@ -113,7 +175,7 @@ const SCRIPT = `(function(){
   q.addEventListener("keydown",function(e){if(e.key==="Enter"){var a=out.querySelector("a");if(a)a.click();}if(e.key==="Escape"){q.value="";show();}});
   document.addEventListener("keydown",function(e){if(e.key==="/"&&document.activeElement!==q){e.preventDefault();q.focus();}});
   var closed=[];
-  window.addEventListener("beforeprint",function(){closed=[];document.querySelectorAll("details:not([open])").forEach(function(d){closed.push(d);d.open=true;});});
+  window.addEventListener("beforeprint",function(){closed=[];document.querySelectorAll("main details:not([open])").forEach(function(d){closed.push(d);d.open=true;});});
   window.addEventListener("afterprint",function(){closed.forEach(function(d){d.open=false;});});
 })();`;
 
@@ -145,6 +207,10 @@ async function block(b: Block, shift: number, nextId: () => number): Promise<str
     case "diagram": {
       const svg = await stateSvg(b.graph, b.title, `d${nextId()}`);
       return `<figure class="diagram">${svg}<figcaption>Red dashed: hold / reject / cancel · purple dotted: automatic (job or command)</figcaption></figure>`;
+    }
+    case "flow": {
+      const svg = await flowSvg(b.graph, b.title, `f${nextId()}`);
+      return `<figure class="diagram flow-fig"><div class="zoom">${svg}</div><figcaption>${esc(b.caption)}</figcaption></figure>`;
     }
     case "mermaid":
       return ""; // Markdown only (the HTML shows the same information as a table)
@@ -178,12 +244,12 @@ const CSS = `
 :root{
   --bg:#ffffff;--fg:#1f2937;--muted:#6b7280;--line:#e5e7eb;--soft:#f7f7f8;--accent:#2563eb;
   --code-bg:#f3f4f6;--human:#047857;--human-bg:#ecfdf5;--missing:#92400e;--missing-bg:#fffbeb;--warn:#b91c1c;--warn-bg:#fef2f2;
-  --state:#ffffff;--state-line:#94a3b8;--edge:#475569;--neg:#dc2626;--auto:#7c3aed;--label-bg:#ffffff;
+  --state:#ffffff;--state-line:#94a3b8;--edge:#475569;--neg:#dc2626;--auto:#7c3aed;--label-bg:#ffffff;--action:#d97706;--action-bg:#fffbf5;
 }
 @media (prefers-color-scheme: dark){
   :root{--bg:#111318;--fg:#e5e7eb;--muted:#9ca3af;--line:#2b2f37;--soft:#181b21;--accent:#7aa2ff;--code-bg:#1f232b;
     --human:#6ee7b7;--human-bg:#0f2a22;--missing:#fcd34d;--missing-bg:#2a2210;--warn:#fca5a5;--warn-bg:#2d1515;
-    --state:#181b21;--state-line:#64748b;--edge:#cbd5e1;--neg:#f87171;--auto:#c4b5fd;--label-bg:#111318;}
+    --state:#181b21;--state-line:#64748b;--edge:#cbd5e1;--neg:#f87171;--auto:#c4b5fd;--label-bg:#111318;--action:#f59e0b;--action-bg:#1f1a12;}
 }
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
@@ -192,8 +258,17 @@ body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,B
 .toc-title{font-weight:650;font-size:15px;line-height:1.3}
 .toc-meta{color:var(--muted);font-size:12px;margin:4px 0 16px}
 .toc ul{list-style:none;margin:0;padding:0}
-.toc .part{margin-top:14px}
-.part-title{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);font-weight:650;padding:0 8px 4px}
+.toc .part{margin-top:12px}
+.toc summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:6px;padding:4px 8px;border-radius:6px;user-select:none}
+.toc summary::-webkit-details-marker{display:none}
+.toc summary::before{content:'';width:0;height:0;border-left:4px solid var(--muted);border-top:4px solid transparent;border-bottom:4px solid transparent;transition:transform .15s;flex:none}
+.toc details[open]>summary::before{transform:rotate(90deg)}
+.toc summary:hover{background:var(--soft)}
+.toc .part>details>summary{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);font-weight:650}
+.toc .section>details>summary{font-weight:600}
+.toc .count{margin-left:auto;font-size:11px;color:var(--muted);font-weight:400;background:var(--soft);border-radius:9px;padding:0 6px}
+.toc a.active{background:var(--soft);color:var(--accent);font-weight:600}
+@media (prefers-reduced-motion: reduce){.toc summary::before{transition:none}}
 .search{position:relative;margin-bottom:6px}
 .search input{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
 .search input:focus{outline:2px solid var(--accent);outline-offset:-1px}
@@ -206,10 +281,10 @@ body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,B
 ol.steps{padding-left:0;list-style:none;counter-reset:s;margin:4px 0 16px}
 ol.steps li{counter-increment:s;position:relative;padding:8px 12px 8px 44px;margin:6px 0;border:1px solid var(--line);border-radius:8px;background:var(--soft)}
 ol.steps li::before{content:counter(s);position:absolute;left:12px;top:8px;width:22px;height:22px;border-radius:50%;background:var(--accent);color:#fff;font-size:12px;font-weight:700;display:grid;place-items:center}
-details{margin:12px 0 18px;border:1px solid var(--line);border-radius:8px}
-details>summary{cursor:pointer;padding:9px 12px;color:var(--muted);font-size:14px;list-style-position:inside}
-details>summary:hover{color:var(--accent)}
-details[open]>summary{border-bottom:1px solid var(--line)}
+main details{margin:12px 0 18px;border:1px solid var(--line);border-radius:8px}
+main details>summary{cursor:pointer;padding:9px 12px;color:var(--muted);font-size:14px;list-style-position:inside}
+main details>summary:hover{color:var(--accent)}
+main details[open]>summary{border-bottom:1px solid var(--line)}
 .details-body{padding:12px 14px 2px}
 .toc ul ul{padding-left:12px;margin:2px 0 6px;border-left:1px solid var(--line)}
 .toc li{margin:1px 0}
@@ -273,6 +348,21 @@ svg .edge-label-bg{fill:var(--label-bg);opacity:.92}
 svg .edge-text{font-size:11px;fill:var(--fg)}
 svg .edge-text.neg{fill:var(--neg)}
 svg .edge-who{font-size:10px;fill:var(--muted)}
+svg.flow text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}
+svg .lane{fill:var(--soft);stroke:var(--line)} svg .lane.alt{fill:var(--bg)}
+svg .lane-name{font-size:12px;font-weight:600;fill:var(--muted)}
+svg .node{fill:var(--bg);stroke:var(--state-line);stroke-width:1.2}
+svg .node.action{fill:var(--action-bg);stroke:var(--action)}
+svg .node-bar{fill:var(--action)}
+svg .node.end{fill:var(--human-bg);stroke:var(--human)} svg .node.end.neg{fill:var(--warn-bg);stroke:var(--neg)}
+svg .node.external{fill:var(--soft);stroke-dasharray:4 3}
+svg .node.area{fill:var(--state);stroke:var(--state-line)}
+svg .node-text{font-size:12px;fill:var(--fg);font-weight:600}
+svg .node-sub{font-size:10px;fill:var(--muted)}
+svg .edge.ajax{stroke-dasharray:2 3}
+figure.flow-fig .zoom{overflow-x:auto}
+figure.flow-fig svg.wide{max-width:none}
+@media print{figure.flow-fig svg.wide{max-width:100%}}
 footer{margin-top:56px;padding-top:16px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}
 @media (max-width:860px){
   body{display:block}
@@ -283,7 +373,7 @@ footer{margin-top:56px;padding-top:16px;border-top:1px solid var(--line);color:v
 @media print{
   :root{--bg:#fff;--fg:#111;--muted:#555;--line:#d4d4d8;--soft:#f4f4f5;--accent:#1d4ed8;--code-bg:#f4f4f5;
     --human:#047857;--human-bg:#ecfdf5;--missing:#92400e;--missing-bg:#fffbeb;--warn:#b91c1c;--warn-bg:#fef2f2;
-    --state:#fff;--state-line:#71717a;--edge:#3f3f46;--neg:#dc2626;--auto:#7c3aed;--label-bg:#fff}
+    --state:#fff;--state-line:#71717a;--edge:#3f3f46;--neg:#dc2626;--auto:#7c3aed;--label-bg:#fff;--action:#b45309;--action-bg:#fff}
   @page{size:A4;margin:16mm 14mm}
   body{display:block;font-size:10.5pt;line-height:1.5}
   .toc{display:none}

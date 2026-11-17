@@ -10,7 +10,8 @@
  */
 import type { BuiltMap, DataColumn, DataTable, Integration, MapNode, ProcessState, SourceRef, Validation } from "../core/types.js";
 import { mermaid, stateGraph, type StateGraph } from "./diagram.js";
-import { byLabel, endpoint, finalStates, NEGATIVE, processEdges, short, type DocFeature, type DocModel, type DocProcess, type DocTransition } from "./model.js";
+import { areaMap, flowMermaid, processFlow, screenFlow, type FlowGraph } from "./flow.js";
+import { byLabel, CRUD_LABEL, endpoint, finalStates, NEGATIVE, processEdges, short, type CrudOp, type DocFeature, type DocModel, type DocProcess, type DocTransition } from "./model.js";
 
 export type Inline =
   | string
@@ -30,6 +31,8 @@ export type Block =
   | { t: "steps"; items: Inline[][] }
   | { t: "table"; head: string[]; rows: Inline[][][]; compact?: boolean }
   | { t: "diagram"; graph: StateGraph; title: string; id: string; mermaid: string }
+  /** A flowchart: swimlanes of who does what, screens and actions, or areas. */
+  | { t: "flow"; graph: FlowGraph; title: string; caption: string; mermaid: string }
   | { t: "mermaid"; code: string }
   /** A block of text to copy, e.g. YAML to paste into builtlore.edits.yaml. */
   | { t: "code"; lang: string; text: string }
@@ -57,8 +60,12 @@ export interface Page {
   lead?: string;
   /** Pages of a group (features) share one heading in the HTML. */
   group?: { id: string; title: string; lead: string };
+  /** Where the page sits in the sidebar: a section ("Business processes"), an area ("Application") and a short title ("PID"). */
+  nav?: { section: string; area?: string; short: string };
   blocks: Block[];
 }
+
+const SECTION = { process: "Business processes", data: "Data management", other: "Other screens" } as const;
 
 export interface PageOptions {
   /** Where the canvas is, relative to the docs folder (or a URL in builtlore serve). */
@@ -68,10 +75,14 @@ export interface PageOptions {
 const DASH = "—";
 
 export function buildPages(m: DocModel, opts: PageOptions = {}): Page[] {
+  // Features with a business process first, then data management (CRUD), then the rest
+  const rank = { process: 0, data: 1, other: 2 };
+  const ordered = [...m.features].sort((a, b) => rank[a.kind] - rank[b.kind] || a.feature.name.localeCompare(b.feature.name));
   return [
     overview(m, opts),
     roles(m),
-    ...m.features.map((f) => featurePage(m, f)),
+    ...ordered.map((f) => featurePage(m, f)),
+    ...(m.features.some((f) => f.kind === "data") ? [dataManagement(m)] : []),
     glossary(m),
     businessRules(m),
     dataDictionary(m),
@@ -117,7 +128,7 @@ function overview(m: DocModel, opts: PageOptions): Page {
       t: "list",
       items: processes.map(({ f, p }) => {
         const path = happyPath(p).states;
-        const line: Inline[] = [{ link: f.feature.name, to: featureAnchor(f) }, ": "];
+        const line: Inline[] = [{ link: p.process.features?.length ? p.process.name : f.feature.name, to: featureAnchor(f) }, ": "];
         path.forEach((s, i) => {
           if (i) line.push(" → ");
           line.push(stateText(s));
@@ -158,15 +169,25 @@ function overview(m: DocModel, opts: PageOptions): Page {
     }
   }
 
+  // How the areas of the app connect, as a flowchart
+  const areas = areaMap(m);
+  if (areas && areas.nodes.length > 2) {
+    blocks.push({ t: "h", level: 2, text: "How the areas connect", id: "area-map" });
+    blocks.push({ t: "flow", graph: areas, title: "How the areas connect", caption: "Arrows: links, forms and redirects from one area's screens to another's", mermaid: flowMermaid(areas) });
+  }
+
   blocks.push({ t: "h", level: 2, text: "Modules", id: "modules" });
+  const rank = { process: 0, data: 1, other: 2 };
   blocks.push({
     t: "table",
-    head: ["Feature", "Purpose", "Process"],
-    rows: m.features.map((f) => [
-      [{ link: f.feature.name, to: featureAnchor(f) }],
-      [f.feature.description ?? DASH],
-      [f.processes.length ? "yes" : DASH],
-    ]),
+    head: ["Feature", "Kind", "Purpose"],
+    rows: [...m.features]
+      .sort((a, b) => rank[a.kind] - rank[b.kind] || a.feature.name.localeCompare(b.feature.name))
+      .map((f) => [
+        [{ link: f.feature.name, to: featureAnchor(f) }],
+        [f.kind === "process" ? "Business process" : f.kind === "data" ? "Data management" : DASH],
+        [f.feature.description ?? DASH],
+      ]),
   });
 
   blocks.push({ t: "h", level: 2, text: "Where to read next", id: "read-next" });
@@ -298,7 +319,43 @@ function featurePage(m: DocModel, f: DocFeature): Page {
     blocks.push({ t: "list", items: can });
   }
 
+  // Data management (CRUD): one compact table instead of a story
+  if (f.kind === "data") {
+    const rank: CrudOp[] = ["add", "edit", "delete", "import", "export", "other"];
+    const writes = f.ops.filter((o) => o.node.type !== "page" && o.op !== "list" && o.op !== "view").sort((a, b) => rank.indexOf(a.op) - rank.indexOf(b.op));
+    blocks.push({ t: "h", level: 2, text: "Data management", id: `${featureAnchor(f)}-data` });
+    blocks.push({ t: "p", c: [{ i: `Operations: ${crudSummary(f.ops.map((o) => o.op))}.` }] });
+    blocks.push({
+      t: "table",
+      head: ["Operation", "Step", "Who", "Fields checked"],
+      rows: writes.map(({ op, node }) => {
+        const fields = (node.validation ?? []).flatMap((v) => v.fields.map((x) => x.field));
+        return [
+          [CRUD_LABEL[op]],
+          [node.label],
+          [node.who ? node.who.name : DASH, ...(node.pageOnly ? [" ", { badge: "page only", kind: "warn" } as Inline] : [])],
+          [fields.length ? `${fields.slice(0, 6).join(", ")}${fields.length > 6 ? ` +${fields.length - 6}` : ""}` : DASH],
+        ];
+      }),
+    });
+  }
+
   for (const p of f.processes) blocks.push(...processBlocks(m, f, p));
+
+  // Where each screen leads (links, forms, script calls, redirects); data endpoints left out
+  const flow: Inline[][] = [];
+  for (const n of pages) {
+    const out = m.map.edges.filter((e) => e.from === n.id && e.to !== n.id && ["link", "submit", "redirect", "ajax"].includes(e.trigger));
+    const targets = [...new Set(out.map((e) => e.to))]
+      .map((id) => m.map.nodes.find((x) => x.id === id))
+      .filter((x): x is MapNode => Boolean(x) && !x!.hidden && x!.type !== "data");
+    if (targets.length) flow.push([{ b: n.label }, " → ", targets.map((t) => (t.feature === n.feature ? t.label : byLabel(m, t.id))).join(", ")]);
+  }
+  // Screens and actions as a flowchart when it stays readable; as a list when the feature is busy
+  const screens = screenFlow(m, f);
+  if (screens || flow.length) blocks.push({ t: "h", level: 2, text: "Screens and actions", id: `${featureAnchor(f)}-screens` });
+  if (screens) blocks.push({ t: "flow", graph: screens, title: `${f.feature.name}: screens and actions`, caption: "Boxes: screens · rounded with a bar: actions · dashed red: when it fails · dotted: called from the page's script", mermaid: flowMermaid(screens) });
+  else if (flow.length) blocks.push({ t: "list", items: flow });
   // Processes owned by another feature that this one takes part in (created there, approved here)
   if (f.shared.length) {
     blocks.push({ t: "h", level: 2, text: "Also part of", id: `${featureAnchor(f)}-shared` });
@@ -325,15 +382,7 @@ function featurePage(m: DocModel, f: DocFeature): Page {
       [n.description ?? DASH],
     ]),
   });
-  const flow: Inline[][] = [];
-  for (const n of pages) {
-    const out = m.map.edges.filter((e) => e.from === n.id && e.to !== n.id && ["link", "submit", "redirect", "ajax"].includes(e.trigger));
-    const targets = [...new Set(out.map((e) => e.to))]
-      .map((id) => m.map.nodes.find((x) => x.id === id))
-      .filter((x): x is MapNode => Boolean(x) && !x!.hidden);
-    if (targets.length) flow.push([{ b: n.label }, " → ", targets.map((t) => (t.feature === n.feature ? t.label : byLabel(m, t.id))).join(", ")]);
-  }
-  if (flow.length) dev.push({ t: "p", c: [{ b: "Where each screen leads" }] }, { t: "list", items: flow });
+  if (flow.length && screens) dev.push({ t: "p", c: [{ b: "Where each screen leads" }] }, { t: "list", items: flow });
   if (f.feature.files.length) dev.push({ t: "p", c: [{ b: "Files" }] }, { t: "list", items: f.feature.files.map((x) => [{ src: { file: x } }]) });
   blocks.push({ t: "details", summary: "For developers: routes, screens, files", blocks: dev });
 
@@ -343,8 +392,47 @@ function featurePage(m: DocModel, f: DocFeature): Page {
     title: f.feature.name,
     part: "understand",
     group: { id: "features", title: "Features", lead: "What each part of the app does, and how a record moves through it." },
+    nav: { section: SECTION[f.kind], ...(f.area !== f.feature.name ? { area: f.area } : {}), short: f.short },
     blocks,
   };
+}
+
+/** "Add · Edit · Delete · Import · Export" in that order, each once. */
+function crudSummary(ops: CrudOp[]): string {
+  const order: CrudOp[] = ["list", "view", "add", "edit", "delete", "import", "export", "other"];
+  return order.filter((o) => ops.includes(o)).map((o) => CRUD_LABEL[o]).join(" · ");
+}
+
+// ---------------------------------------------------------------- data management
+
+/** Every master-data feature in one table: what can be done and who may do it. */
+function dataManagement(m: DocModel): Page {
+  const data = m.features.filter((f) => f.kind === "data").sort((a, b) => a.feature.name.localeCompare(b.feature.name));
+  const cols: CrudOp[] = ["add", "edit", "delete", "import", "export"];
+  const blocks: Block[] = [];
+  blocks.push({
+    t: "p",
+    c: [
+      `${data.length} feature${data.length === 1 ? "" : "s"} only keep a list up to date (add, edit, delete, import, export) with no status flow. They are summed up here; each still has its own page.`,
+    ],
+  });
+  const pageOnly = data.filter((f) => f.nodes.some((n) => n.pageOnly)).length;
+  if (pageOnly) blocks.push({ t: "note", kind: "warn", c: [`In ${pageOnly} of them the permission is checked only in the page, not on the server (`, { link: "Findings", to: "findings" }, ")."] });
+  blocks.push({
+    t: "table",
+    head: ["Feature", ...cols.map((c) => CRUD_LABEL[c]), "Who"],
+    rows: data.map((f) => {
+      const who = [...new Set(f.nodes.filter((n) => n.who).map((n) => n.who!.name))];
+      const pagePerms = [...new Set(f.nodes.flatMap((n) => n.pageOnly?.abilities ?? []))];
+      return [
+        [{ link: f.feature.name, to: featureAnchor(f) }],
+        ...cols.map((c): Inline[] => [f.ops.some((o) => o.op === c && o.node.type !== "page") ? "✓" : ""]),
+        [who.join(", ") || DASH, ...(pagePerms.length ? [{ i: ` (page: ${pagePerms.join(", ")})` } as Inline] : [])],
+      ];
+    }),
+    compact: true,
+  });
+  return { file: "data-management.md", id: "data-management", title: "Data management overview", part: "understand", lead: "Lists the app keeps (master data), what can be done with each, and who may do it.", blocks };
 }
 
 function stateText(s: ProcessState): Inline {
@@ -459,8 +547,17 @@ function processBlocks(m: DocModel, f: DocFeature, p: DocProcess): Block[] {
   const finals = finalStates(p);
   if (finals.length) blocks.push({ t: "p", c: ["Can end as ", ...states(finals), "."] });
   if (p.other.length) blocks.push({ t: "p", c: [{ i: `Also: ${p.other.map((t) => `${t.node.feature === f.feature.id ? t.node.label : byLabel(m, t.node.id)} (${t.lane.name})`).join(", ")}. Status unchanged.` }] });
+  // Who does what, as swimlanes: each arrow carries the status one step leaves and the next needs
+  const lanes = processFlow(p);
+  if (lanes && lanes.nodes.filter((n) => n.kind === "action").length > 1) {
+    blocks.push({ t: "p", c: [{ b: "Who does what" }] });
+    blocks.push({ t: "flow", graph: lanes, title: `${p.process.name}: who does what`, caption: "One row per role · arrows carry the status in between · rounded green: where it ends, red: stopped", mermaid: flowMermaid(lanes) });
+  }
   const graph = stateGraph(p);
-  if (graph.edges.length) blocks.push({ t: "diagram", graph, title: `${f.feature.name}: status flow`, id, mermaid: mermaid(graph) });
+  if (graph.edges.length) {
+    blocks.push({ t: "p", c: [{ b: "Status flow" }] });
+    blocks.push({ t: "diagram", graph, title: `${f.feature.name}: status flow`, id, mermaid: mermaid(graph) });
+  }
 
   blocks.push({
     t: "details",

@@ -62,6 +62,50 @@ export interface DocFeature {
   processes: DocProcess[];
   /** Processes owned by another feature that have steps here (approved here, created there). */
   shared: Array<{ process: Process; owner: Feature }>;
+  /**
+   * process: a record moves through statuses here; data: list, add, edit, delete, import,
+   * export and little else (master data); other: everything else.
+   */
+  kind: "process" | "data" | "other";
+  /** "Application" for "Application › PID"; the name itself when there is no "›". */
+  area: string;
+  /** "PID" for "Application › PID". */
+  short: string;
+  /** What each action does to the data, read from its method, route name and handler. */
+  ops: Array<{ op: CrudOp; node: MapNode }>;
+}
+
+export type CrudOp = "list" | "view" | "add" | "edit" | "delete" | "import" | "export" | "other";
+
+export const CRUD_LABEL: Record<CrudOp, string> = {
+  list: "List",
+  view: "View",
+  add: "Add",
+  edit: "Edit",
+  delete: "Delete",
+  import: "Import",
+  export: "Export",
+  other: "Other",
+};
+
+/** What a step does to the data, from its HTTP method, route name, URI and handler method. */
+export function crudOp(n: MapNode): CrudOp {
+  const words = `${n.name ?? ""} ${n.uri} ${n.handler?.method ?? ""}`.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
+  const has = (re: RegExp) => re.test(words);
+  if (n.type === "page") {
+    if (has(/\b(create|add|new)\b/)) return "add";
+    if (has(/\bedit\b/)) return "edit";
+    if (has(/\b(show|detail|view)\b/) || /\{[^}]+\}\s*$/.test(n.uri)) return "view";
+    return "list";
+  }
+  if (n.type === "download" || has(/\b(export|download|print|pdf)\b/)) return "export";
+  if (has(/\bimport\b/)) return "import";
+  // A read (JSON for the page's table): part of the list, not a change
+  if (n.methods.every((x) => x === "GET" || x === "HEAD")) return "list";
+  if (n.methods.includes("DELETE") || has(/\b(delete|destroy|remove)\b/)) return "delete";
+  if (n.methods.includes("PUT") || n.methods.includes("PATCH") || has(/\b(update|edit)\b/)) return "edit";
+  if (n.methods.includes("POST") && has(/\b(store|create|save|insert|add)\b/)) return "add";
+  return "other";
 }
 
 export interface RoleColumn {
@@ -137,7 +181,14 @@ export function buildDocModel(map: BuiltMap): DocModel {
         .filter((p) => p.feature !== f.id && p.features?.includes(f.id))
         .map((p) => ({ process: p, owner: featureById.get(p.feature)! }))
         .filter((x) => x.owner);
-      return { feature: f, slug, nodes, processes, shared };
+      const area = f.name.includes(" › ") ? f.name.split(" › ")[0] : f.name;
+      const short = f.name.includes(" › ") ? f.name.split(" › ").slice(1).join(" › ") : f.name;
+      const ops = nodes.filter((n) => n.type !== "data").map((n) => ({ op: crudOp(n), node: n }));
+      const writes = ops.filter((o) => o.node.type !== "page" && o.op !== "list");
+      const crud = writes.filter((o) => ["add", "edit", "delete"].includes(o.op)).length;
+      const other = writes.filter((o) => o.op === "other").length;
+      const kind: DocFeature["kind"] = processes.length || shared.length ? "process" : crud && other <= Math.max(1, Math.floor(writes.length / 3)) ? "data" : "other";
+      return { feature: f, slug, nodes, processes, shared, kind, area, short, ops };
     })
     .filter((f) => f.nodes.length);
 
