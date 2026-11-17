@@ -364,10 +364,10 @@ Provenance values: `extracted` (from code, deterministic) · `inferred` (from LL
 | `builtlore view` | Open the canvas in the browser |
 | `builtlore serve` | Scan and serve the canvas on 127.0.0.1 with editing on; saves to `builtlore.edits.yaml` |
 | `builtlore docs` | Scan and write the documentation: Markdown into `docs/builtlore/` plus a printable `index.html` |
-| `builtlore diff <refA> <refB>` | Show features/flows added, changed, removed between two git refs |
+| `builtlore diff [base] [head]` | Behaviour changes between two versions, in words (steps, who, status flow, rules, integrations, data, automation, configuration). A side is a git ref (scanned in a temporary worktree) or a `builtlore.json`; defaults `HEAD` → working folder; `--md` for pull requests |
 | `builtlore check` | CI mode: exit non-zero if the committed map is out of date |
 
-Implemented: `init`, `scan`, `view`, `serve`, `docs` (0.3), flags `--mode auto|static|artisan`, `--out`, `--open`, `--php <path>`, `--port`.
+Implemented: `init`, `scan`, `view`, `serve`, `docs`, `diff` (0.3), flags `--mode auto|static|artisan`, `--out`, `--open`, `--php <path>`, `--port`, `--md`, `--project`.
 Planned flags: `--no-ai` (becomes meaningful once the AI pass exists; v0.1 is fully deterministic), `--since <ref>` (incremental), `--provider`, `--model`, `--workspace <file>` (named sets of projects).
 
 ---
@@ -424,7 +424,7 @@ Alternative considered: a Go CLI (single binary by default). Rejected for v0.1 b
 | v0.1 (alpha.3) | Human edits + stable IDs + `serve` (done, 6.5) |
 | v0.2 | **Process layer:** swimlanes from actors + status transitions (6.7); default view — alpha.0 done |
 | v0.3 | **Project documentation** (6.8): `builtlore docs` → Markdown, HTML, PDF via print — alpha.0 done (Word export and change history next) |
-| v0.3.x | History layer: feature birth, churn, contributors · timeline slider · `diff` · `check` for CI · GitHub Action |
+| v0.3.x | History layer: feature birth, churn, contributors · timeline slider · `diff` (alpha.0 done) · `check` for CI · GitHub Action |
 | v0.4 | Data layer: migrations/ORM → ERD · live read-only DB (FKs, stored procedures) · step ↔ table links |
 | v0.5 | Automation layer: schedulers, cron, queues, webhooks as time/event-triggered flows |
 | v0.6 | More adapters (Go, then Next.js, then Flutter) · adapter SDK and contributor guide |

@@ -73,6 +73,19 @@ export function buildMap(input: {
     return node;
   });
 
+  // Actions the server lets anyone (or any signed-in user) run, while the page that calls them
+  // checks a permission before showing its buttons: say so, without picking one for the action
+  const entryById = new Map(entries.map((e) => [e.id, e]));
+  for (const n of nodes) {
+    if (!n.who || !/^(anyone|signed-in-user)$/.test(n.who.id)) continue;
+    const pages = [...new Set(navs.filter((x) => x.to === n.id && ["ajax", "submit", "link"].includes(x.trigger)).map((x) => x.from))]
+      .filter((id) => entryById.get(id)?.pageAbilities?.length);
+    if (!pages.length) continue;
+    const abilities = [...new Set(pages.flatMap((id) => entryById.get(id)!.pageAbilities!))];
+    n.pageOnly = { abilities, pages };
+    n.who = { ...n.who, evidence: [...n.who.evidence, `the calling page checks ${abilities.join(", ")} before showing its buttons; this endpoint does not check`] };
+  }
+
   const nodeIds = new Set(nodes.map((n) => n.id));
   const edges: MapEdge[] = navs
     .filter((n) => nodeIds.has(n.from) && nodeIds.has(n.to))

@@ -148,6 +148,8 @@ async function block(b: Block, shift: number, nextId: () => number): Promise<str
     }
     case "mermaid":
       return ""; // Markdown only (the HTML shows the same information as a table)
+    case "code":
+      return `<pre class="copy"><code>${esc(b.text)}</code></pre>`;
     case "canvas":
       return `<div class="canvas-wrap"><iframe class="canvas-frame" src="${esc(b.href)}" title="Canvas" loading="lazy"></iframe><p class="canvas-actions"><a href="${esc(b.href)}" target="_blank" rel="noopener">Open full screen</a> · drag to move, scroll to zoom, click a step for details</p><p class="print-only">Interactive canvas: open ${esc(b.href)} in a browser.</p></div>`;
   }
@@ -235,6 +237,8 @@ ul{margin:0 0 14px;padding-left:22px}
 li{margin:3px 0}
 a{color:var(--accent)}
 code{font:12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--code-bg);padding:1px 5px;border-radius:4px;overflow-wrap:anywhere}
+pre.copy{background:var(--code-bg);border:1px solid var(--line);border-radius:8px;padding:12px 14px;overflow:auto;max-height:420px}
+pre.copy code{background:none;padding:0;white-space:pre;overflow-wrap:normal}
 .src{font:11.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--muted);white-space:nowrap}
 .table{overflow-x:auto;margin:6px 0 18px;border:1px solid var(--line);border-radius:8px}
 table{border-collapse:collapse;width:100%;font-size:13.5px}

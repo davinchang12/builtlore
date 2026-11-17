@@ -45,7 +45,7 @@ export interface ScanResult {
   htmlPath: string;
 }
 
-export async function scanProject(rootArg: string, overrides: Partial<Config> = {}): Promise<ScanResult> {
+export async function scanProject(rootArg: string, overrides: Partial<Config> = {}, opts: { write?: boolean } = {}): Promise<ScanResult> {
   const root = resolve(rootArg);
   if (!existsSync(root)) throw new Error(`Path not found: ${root}`);
   const config = { ...loadConfig(root), ...stripUndefined(overrides) };
@@ -76,6 +76,7 @@ export async function scanProject(rootArg: string, overrides: Partial<Config> = 
   });
   const map = applyEdits(raw, loadEdits(root));
 
+  if (opts.write === false) return { root, raw, map, jsonPath: "", htmlPath: "" };
   const jsonPath = join(root, config.output);
   writeFileSync(jsonPath, JSON.stringify(map, null, 2) + "\n");
   const htmlPath = writeHtml(root, map);

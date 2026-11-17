@@ -102,11 +102,15 @@ export const laravelAdapter: Adapter = {
       let analysis: HandlerAnalysis | null = null;
       let process: ProcessInfo = { actors: [], writes: [], requires: [], creates: [] };
       let request: RequestReading | null = null;
+      let paramModels = new Map<string, string>();
+      let pageAbilities: string[] = [];
       if (r.action.kind === "controller") {
         analysis = analyzeControllerMethod(locator, r.action.class, r.action.method);
         const m = findMethod(locator, r.action.class, r.action.method);
         if (m) {
           process = reader.analyzeHandler(m.node, m.names, m.file, r.action.class);
+          paramModels = reader.paramModels(m.node, m.names);
+          pageAbilities = reader.pageAbilities(m.node);
           request = readRequestOnce(m.file, m.node, () => readRequest(m.node, m.names, m.file, locator));
         }
         handler = { kind: "controller", class: r.action.class, method: r.action.method, file: analysis?.file, line: analysis?.line };
@@ -116,6 +120,8 @@ export const laravelAdapter: Adapter = {
       } else if (r.action.kind === "closure") {
         analysis = analyzeClosure(r.action.node, r.action.ctx, r.action.file);
         process = reader.analyzeHandler(r.action.node, r.action.ctx, r.action.file);
+        paramModels = reader.paramModels(r.action.node, r.action.ctx);
+        pageAbilities = reader.pageAbilities(r.action.node);
         const a = r.action;
         request = readRequestOnce(a.file, a.node, () => readRequest(a.node, a.ctx, a.file, locator));
         handler = { kind: "closure", file: r.action.file, line: analysis.line };
@@ -138,9 +144,12 @@ export const laravelAdapter: Adapter = {
         };
       }
 
-      for (const a of reader.actorsFromMiddleware(r.middleware)) {
+      for (const a of reader.actorsFromMiddleware(r.middleware, paramModels)) {
         if (!process.actors.some((x) => x.name === a.name)) process.actors.push(a);
       }
+      // A custom middleware that only checks login (isLogin, checkSession, sso.auth)
+      const loginMw = r.middleware.find((mw) => /login|logged|session|sso|signed[-_.]?in|authenticated/i.test(mw.split(":")[0]) && !/^(guest|signed)$/i.test(mw.split(":")[0]));
+      if (loginMw && !process.login) process.login = `middleware ${loginMw}`;
 
       entries.push({
         kind: "entry",
@@ -153,11 +162,16 @@ export const laravelAdapter: Adapter = {
         handler,
         view,
         source: { file: r.file, line: r.line },
-        process: process.actors.length || process.writes.length || process.requires.length || process.creates.length ? process : undefined,
+        process:
+          process.actors.length || process.writes.length || process.requires.length || process.creates.length ||
+          process.unresolved?.length || process.skipped?.length || process.procedures?.length || process.calls?.length || process.login || process.client
+            ? process
+            : undefined,
         ...(request?.validation.length ? { validation: request.validation } : {}),
         ...(request?.inputs.length ? { inputs: request.inputs } : {}),
         ...(analysis ? { responds: respondsOf(analysis) } : {}),
         ...(process.calls?.length ? { calls: process.calls } : {}),
+        ...(pageAbilities.length ? { pageAbilities } : {}),
       });
       // The page's view may check these: @if ($latestStatus == 4)
       if (process.statusVars) viewVars.set(id, process.statusVars);
@@ -259,8 +273,9 @@ export const laravelAdapter: Adapter = {
     for (const e of entries) {
       for (const u of e.process?.unresolved ?? []) {
         unresolved++;
-        skipped.push({ kind: "skipped", reason: `Status change not readable yet: ${u.column} = ${u.code}`, source: u.source });
+        skipped.push({ kind: "skipped", reason: `Status change not readable yet: ${u.column} = ${u.code}${u.why ? ` (${u.why})` : ""}`, source: u.source });
       }
+      for (const s of e.process?.skipped ?? []) skipped.push({ kind: "skipped", reason: s.reason, source: s.source });
       for (const sp of e.process?.procedures ?? []) {
         skipped.push({ kind: "skipped", reason: `Calls stored procedure ${sp}: status changes inside it are not visible in the code`, source: e.handler?.file ? { file: e.handler.file, line: e.handler.line } : e.source });
       }

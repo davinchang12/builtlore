@@ -84,7 +84,7 @@ describe("process view (actors and status)", () => {
     assert.equal(label(p, step(p, "review.presentations.hold").to[0]), "Hold - Perlu Revisi"); // raw SQL UPDATE
     assert.deepEqual(step(p, "review.presentations.decide").to.map((t) => label(p, t)).sort(), ["Finished", "Hold - Perlu Revisi"]); // ternary
     const reasons = map.skipped.map((x) => x.reason);
-    assert.ok(reasons.some((r) => r === "Status change not readable yet: Presentation.status = $request->status"), reasons.join("\n"));
+    assert.ok(reasons.some((r) => r === "Status change not readable yet: Presentation.status = $request->status (from form field 'status'; nothing in the code limits its values)"), reasons.join("\n"));
     assert.ok(reasons.some((r) => r.startsWith("Calls stored procedure sp_delegate_presentasi")));
   });
 

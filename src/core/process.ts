@@ -1,8 +1,9 @@
 /**
  * Build business processes (swimlanes) from Process-layer facts.
  *
- * One process per feature and status column ("Purchase request · status").
- * Lanes are actors; steps are the actions of the feature; each step moves the
+ * One process per record status (Model.column), across features: a request created
+ * in one feature and approved in another is one flow, owned by the feature that
+ * creates it. Lanes are actors; steps are the actions that touch it; each step moves the
  * record from the states it requires to the states it writes. Where code says
  * nothing, the process says nothing: no invented actors or transitions.
  */
@@ -112,26 +113,51 @@ export function buildProcesses(input: {
   const catalog = new Map(input.states.map((s) => [s.subject, s]));
   const conditionsOf = stepConditions(input.entries, input.navs);
 
-  const processes: Process[] = [];
-  for (const feature of input.features) {
-    const featureNodes = feature.nodes.map((id) => nodeById.get(id)).filter((n): n is MapNode => Boolean(n));
-    const actions = featureNodes.filter((n) => !n.methods.every((m) => m === "GET"));
+  // History/log tables (SlideHistory, ApprovalLog) record the process; they are not a process of their own.
+  const isLog = (s: Subject) => /(History|Histories|Hist|Log|Logs|Audit|Audits|Trail|Activity|Activities|Tracking)$/i.test(s.split(".")[0]) || /(_history|_histories|_log|_logs|_audit|_trail)$/i.test(s.split(".")[0]);
+  const isAction = (n: MapNode) => !n.methods.every((m) => m === "GET");
 
-    // Subjects written by this feature
-    const written = new Map<Subject, number>();
-    for (const n of actions) for (const w of entryById.get(n.id)?.process?.writes ?? []) written.set(w.subject, (written.get(w.subject) ?? 0) + 1);
-    // History/log tables (SlideHistory, ApprovalLog) record the process; they are not a process of their own.
-    const isLog = (s: Subject) => /(History|Histories|Hist|Log|Logs|Audit|Audits|Trail|Activity|Activities|Tracking)$/i.test(s.split(".")[0]) || /(_history|_histories|_log|_logs|_audit|_trail)$/i.test(s.split(".")[0]);
-    const subjects = [...written.keys()].filter((s) => !s.startsWith(".") && !isLog(s));
-    // Writes with an unknown model join the feature's only subject on that column
+  // Per feature: the subjects its actions write, and how a write with an unknown model
+  // (".status") resolves there (to the feature's only subject on that column).
+  const perFeature = input.features.map((feature) => {
+    const actions = feature.nodes.map((id) => nodeById.get(id)).filter((n): n is MapNode => Boolean(n) && isAction(n!));
+    const written = new Set<Subject>();
+    for (const n of actions) for (const w of entryById.get(n.id)?.process?.writes ?? []) written.add(w.subject);
+    const subjects = [...written].filter((s) => !s.startsWith(".") && !isLog(s));
     const resolve = (s: Subject): Subject | null => {
       if (!s.startsWith(".")) return s;
       const same = subjects.filter((x) => x.endsWith(s));
       return same.length === 1 ? same[0] : null;
     };
-    for (const s of written.keys()) if (s.startsWith(".") && !resolve(s) && !subjects.length) subjects.push(s);
+    // Only unknown-model writes: a process of their own, kept to this feature
+    const local = subjects.length ? [] : [...written].filter((s) => s.startsWith("."));
+    return { feature, actions, subjects, resolve, local };
+  });
 
-    for (const subject of subjects) {
+  // One process per record status (Model.column), across every feature that touches it:
+  // created in "Device", approved in "Outstanding" is one flow, not two.
+  const groups: Array<{ subject: Subject; home: Feature; parts: typeof perFeature }> = [];
+  for (const pf of perFeature) {
+    for (const s of pf.subjects) {
+      const g = groups.find((x) => x.subject === s);
+      if (g) g.parts.push(pf);
+      else groups.push({ subject: s, home: pf.feature, parts: [pf] });
+    }
+    for (const s of pf.local) groups.push({ subject: s, home: pf.feature, parts: [pf] });
+  }
+  // Steps elsewhere that only check the status (approve in another feature) join too
+  for (const g of groups) {
+    if (g.subject.startsWith(".")) continue;
+    for (const pf of perFeature) {
+      if (g.parts.includes(pf)) continue;
+      const touches = pf.actions.some((n) => conditionsOf(n.id).requires.some((r) => r.subject === g.subject));
+      if (touches) g.parts.push(pf);
+    }
+  }
+
+  const processes: Process[] = [];
+  for (const { subject, home, parts } of groups) {
+    {
       const model = subject.split(".")[0];
       const column = subject.split(".").slice(1).join(".");
       const states = new Map<string, ProcessState>();
@@ -159,15 +185,21 @@ export function buildProcesses(input: {
       const laneOf = new Map<string, ProcessLane>();
       let initial: string | undefined;
 
-      for (const n of actions) {
+      const featureOf = new Map<string, Feature>();
+      for (const part of parts) for (const n of part.actions) {
+        const resolve = part.resolve;
+        // A feature that writes this status brings all its actions that check a role;
+        // other features only bring the steps that touch the status
+        const owns = part.subjects.includes(subject) || part.local.includes(subject);
         const p = entryById.get(n.id)?.process;
         const cond = conditionsOf(n.id);
         const writes = (p?.writes ?? []).filter((w) => resolve(w.subject) === subject);
-        const requires = cond.requires.filter((r) => resolve(r.subject) === subject || (r.subject.startsWith(".") && subject.endsWith(r.subject)));
+        const requires = cond.requires.filter((r) => resolve(r.subject) === subject || (owns && r.subject.startsWith(".") && subject.endsWith(r.subject)));
         // A route that already names the record (/orders/{order}/hold) does not create it, even if it creates other rows
         const creates = Boolean(model && p?.creates.includes(model)) && !n.uri.includes("{");
         const explicitActors = cond.actors.filter((a) => a.via !== "name");
-        if (!writes.length && !requires.length && !creates && !explicitActors.length) continue;
+        if (!writes.length && !requires.length && !creates && !(owns && explicitActors.length)) continue;
+        featureOf.set(n.id, part.feature);
 
         // Writes in sequence (a status history: "submitted", then "waiting for review") end at the last one;
         // writes in different if/else branches are alternatives.
@@ -226,13 +258,31 @@ export function buildProcesses(input: {
       // Values the code knows about but no step reaches stay listed (they may be set elsewhere).
       for (const v of known?.values ?? []) stateId(v);
 
+      // The process belongs to the feature where the record is created, else where most of its steps are
+      const counts = new Map<string, number>();
+      for (const s of steps) {
+        const f = featureOf.get(s.node);
+        if (f) counts.set(f.id, (counts.get(f.id) ?? 0) + 1);
+      }
+      const creator = steps.find((s) => s.creates);
+      const ownerId = (creator && featureOf.get(creator.node)?.id) ?? [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? home.id;
+      const owner = parts.find((x) => x.feature.id === ownerId)?.feature ?? home;
+      const features = [ownerId, ...[...counts.keys()].filter((f) => f !== ownerId)];
+      const ownerPart = parts.find((x) => x.feature.id === ownerId) ?? parts[0];
+      const siblings = ownerPart.subjects;
+      const spread = features.length > 1;
+      const modelName = humanizeModel(model);
       processes.push({
-        id: `${feature.id}:${subject}`,
-        feature: feature.id,
-        // Two tables with the same status column in one feature: name both by table
-        name: subjects.filter((s) => s.split(".").slice(1).join(".") === column).length > 1
-          ? `${feature.name} · ${subject}`
-          : subjects.length > 1 || !/^(m_)?status(_id)?$/.test(column) ? `${feature.name} · ${column}` : feature.name,
+        id: `${owner.id}:${subject}`,
+        feature: owner.id,
+        ...(spread ? { features } : {}),
+        // Steps in several features: named by the record ("Temp access request"); in one feature: by the feature.
+        // Two tables with the same status column in one feature: name both by table.
+        name: spread && model
+          ? /^(m_)?status(_id)?$/.test(column) ? modelName : `${modelName} · ${column}`
+          : siblings.filter((s) => s.split(".").slice(1).join(".") === column).length > 1
+            ? `${owner.name} · ${subject}`
+            : siblings.length > 1 || !/^(m_)?status(_id)?$/.test(column) ? `${owner.name} · ${column}` : owner.name,
         subject,
         states: [...states.values()],
         initial,
@@ -242,6 +292,13 @@ export function buildProcesses(input: {
     }
   }
   return processes;
+}
+
+/** TempAccessRequest -> "Temp access request"; TMtdiH -> "TMtdiH" (codes stay as written). */
+function humanizeModel(model: string): string {
+  if (!/^[A-Z][a-z]+([A-Z][a-z]+)*$/.test(model)) return model;
+  const words = model.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
+  return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
 /**
@@ -265,9 +322,12 @@ function pickLane(actors: ActorRef[], entry: EntryFact | undefined): ProcessLane
     };
   }
   const signedIn = (entry?.middleware ?? []).some((m) => /^auth(:|$)|^auth\.|sanctum/i.test(m));
-  return signedIn
-    ? { id: "signed-in-user", name: "Signed-in user", evidence: ["only requires login (auth middleware)"], provenance: "extracted" }
-    : { id: "anyone", name: "Anyone", evidence: ["no login or role check found"], provenance: "extracted" };
+  if (signedIn) return { id: "signed-in-user", name: "Signed-in user", evidence: ["only requires login (auth middleware)"], provenance: "extracted" };
+  // Called by other systems with a key: if (!$request->header('X-Api-Key') …) return 401
+  if (entry?.process?.client) return { id: "api-client", name: "API client", evidence: [`requires an API key (${entry.process.client})`], provenance: "extracted" };
+  // A login check in code or in a custom middleware (if (!Session::get('nik')) abort(...), isLogin)
+  if (entry?.process?.login) return { id: "signed-in-user", name: "Signed-in user", evidence: [`only requires login (${entry.process.login})`], provenance: "extracted" };
+  return { id: "anyone", name: "Anyone", evidence: ["no login or role check found"], provenance: "extracted" };
 }
 
 function describe(a: ActorRef): string {

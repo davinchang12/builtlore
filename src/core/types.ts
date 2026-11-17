@@ -38,6 +38,16 @@ export interface EntryFact {
   responds?: ResponseKind[];
   /** Methods of the app's own classes the handler reaches (services, helpers), to link what they do to this step. */
   calls?: Reach[];
+  /** Abilities a page handler checks and hands to its view (to show or hide buttons), not enforced. */
+  pageAbilities?: string[];
+}
+
+/** An action the server does not check permissions for, while the page that calls it does. */
+export interface PageOnlyCheck {
+  /** Abilities the calling pages check before showing their buttons. */
+  abilities: string[];
+  /** Node ids of those pages. */
+  pages: string[];
 }
 
 export type ResponseKind = "view" | "redirect" | "json" | "file";
@@ -261,7 +271,7 @@ export interface ProcessInfo {
   /** Models this step creates (Model::create, new Model). */
   creates: string[];
   /** Status writes whose value builtlore could not read (reported, never guessed). */
-  unresolved?: Array<{ column: string; code: string; source: SourceRef }>;
+  unresolved?: Array<{ column: string; code: string; source: SourceRef; why?: string }>;
   /** Stored procedures called (their status changes are not visible in the code). */
   procedures?: string[];
   /** Variables holding a record's current status ($latestStatus = TStatusX::where(…)->latest()->value('status_id')), for the view. */
@@ -270,6 +280,12 @@ export interface ProcessInfo {
   calls?: Reach[];
   /** Lines of this body in branches that cannot run with the values passed in. */
   deadLines?: number[];
+  /** Things found on the way that are reported instead of placed (e.g. a status set in an updated() observer). */
+  skipped?: Array<{ reason: string; source: SourceRef }>;
+  /** The step requires login, and where that check is ("Helper::canUseAPI(): Session::get('nik_real')", "middleware isLogin"). */
+  login?: string;
+  /** The step is for other systems: it requires an API key or token ("header X-Api-Key in Controller::authenticate()"). */
+  client?: string;
 }
 
 export interface Reach {
@@ -390,6 +406,8 @@ export interface MapNode {
   review?: string;
   /** Who does this step (same rule as the Process view lanes); actions only. */
   who?: ProcessLane;
+  /** No permission check on the server, but the page that calls it checks these before showing its buttons. */
+  pageOnly?: PageOnlyCheck;
   validation?: Validation[];
   inputs?: string[];
   responds?: ResponseKind[];
@@ -501,7 +519,10 @@ export interface ProcessStep {
 
 export interface Process {
   id: string;
+  /** The feature the process belongs to: where the record is created, else where most steps are. */
   feature: string;
+  /** Every feature with a step in this process (owner first), when there is more than one. */
+  features?: string[];
   name: string;
   subject: Subject;
   states: ProcessState[];

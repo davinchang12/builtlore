@@ -60,6 +60,8 @@ export interface DocFeature {
   slug: string;
   nodes: MapNode[];
   processes: DocProcess[];
+  /** Processes owned by another feature that have steps here (approved here, created there). */
+  shared: Array<{ process: Process; owner: Feature }>;
 }
 
 export interface RoleColumn {
@@ -131,7 +133,11 @@ export function buildDocModel(map: BuiltMap): DocModel {
       while (usedSlugs.has(slug)) slug += "-2";
       usedSlugs.add(slug);
       const processes = (map.processes ?? []).filter((p) => p.feature === f.id).map((p) => docProcess(p, nodeById, automation));
-      return { feature: f, slug, nodes, processes };
+      const shared = (map.processes ?? [])
+        .filter((p) => p.feature !== f.id && p.features?.includes(f.id))
+        .map((p) => ({ process: p, owner: featureById.get(p.feature)! }))
+        .filter((x) => x.owner);
+      return { feature: f, slug, nodes, processes, shared };
     })
     .filter((f) => f.nodes.length);
 
@@ -289,8 +295,31 @@ function findings(m: DocModel, featureById: Map<string, Feature>): Finding[] {
     });
   }
 
+  // Permission checked only where the button is shown: anyone who calls the endpoint directly gets through
+  const pageOnly = map.nodes.filter((n) => !n.hidden && n.pageOnly);
+  if (pageOnly.length) {
+    out.push({
+      title: "Permission checked only in the page",
+      why: "The page hides the button without the permission, but the endpoint itself does not check it, so a direct request still works. Add the check on the server (middleware can:…, $this->authorize(), Gate::authorize()).",
+      items: pageOnly.map((n) => ({
+        text: `${nodeLabel(n)}: the page checks ${n.pageOnly!.abilities.join(", ")}`,
+        source: n.handler?.file ? { file: n.handler.file, line: n.handler.line } : n.source,
+      })),
+    });
+  }
+
+  // Writes with no login, key or permission check at all
+  const open = map.nodes.filter((n) => !n.hidden && n.who?.id === "anyone" && !n.methods.every((x) => x === "GET"));
+  if (open.length) {
+    out.push({
+      title: "Open to anyone",
+      why: "No login, API key or permission check found, so anyone who can reach the server can call these. Some are meant to be public (login, OTP, webhooks); check the rest.",
+      items: open.map((n) => ({ text: nodeLabel(n), source: n.handler?.file ? { file: n.handler.file, line: n.handler.line } : n.source })),
+    });
+  }
+
   const unvalidated = map.nodes.filter(
-    (n) => !n.hidden && n.who && n.type === "action" && !n.methods.every((x) => x === "GET") && !n.validation?.length && (n.inputs?.length ?? 0) > 0,
+    (n) => !n.hidden && n.who && (n.type === "action" || n.type === "api") && !n.methods.every((x) => x === "GET") && !n.validation?.length && (n.inputs?.length ?? 0) > 0,
   );
   if (unvalidated.length) {
     out.push({

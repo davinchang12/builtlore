@@ -11,7 +11,7 @@
  *
  * Anything that cannot be resolved is left out, never guessed.
  */
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ActorRef, ProcessInfo, Reach, StatesFact, StatusCondition, StatusValue, StatusWrite, Subject } from "../../core/types.js";
 import { ClassLocator } from "./controllers.js";
@@ -28,6 +28,18 @@ const STATUS_MODEL = /(Status|State)(?!.*(History|Histories|Log|Logs|Audit))/;
 /** How deep builtlore follows calls into services (controller → service → service). */
 const MAX_CALL_DEPTH = 3;
 
+/** Observer methods Laravel runs for each kind of model change, in order. */
+const OBSERVER_EVENTS: Record<"create" | "update" | "delete", string[]> = {
+  create: ["saving", "creating", "created", "saved"],
+  update: ["saving", "updating", "updated", "saved"],
+  delete: ["deleting", "deleted"],
+};
+
+function paramName(p: PhpNode): string | null {
+  const n = p?.name?.name ?? p?.name;
+  return typeof n === "string" ? n : null;
+}
+
 interface AnalyzeOptions {
   /** Types of parameters passed in by the caller (service methods are often untyped). */
   seedTypes?: Map<string, string>;
@@ -36,7 +48,14 @@ interface AnalyzeOptions {
   depth?: number;
   stack?: Set<string>;
 }
-export const STATUS_COLUMN = { test: (c: string): boolean => STATUS_COLUMN_RE.test(snake(c)) };
+/** Columns about a status change rather than the status itself: status_by, status_at, status_note, approved_date. */
+const STATUS_AUDIT_RE = /_(by|at|on|date|time|datetime|timestamp|note|notes|remark|remarks|reason|comment|comments|desc|description|user|nik|message|log)$/i;
+export const STATUS_COLUMN = {
+  test: (c: string): boolean => {
+    const s = snake(c);
+    return STATUS_COLUMN_RE.test(s) && !STATUS_AUDIT_RE.test(s);
+  },
+};
 
 function snake(s: string): string {
   return s.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2").toLowerCase();
@@ -375,11 +394,21 @@ export class ProcessReader {
       if (t && v) {
         const fq = resolveName(t, p.type.resolution, names);
         if (this.classInfo(fq)?.isModel) types.set(v, fq.split("\\").pop()!);
+        // An event (or other app object) carrying models: handle(OrderApproved $event) -> $event->order
+        else if (this.isService(fq)) {
+          walk(body, (x) => {
+            if ((x.kind !== "propertylookup" && x.kind !== "nullsafepropertylookup") || x.what?.kind !== "variable" || x.what.name !== v) return;
+            const prop = x.offset?.name;
+            const cls = typeof prop === "string" ? this.propertyClass(fq, prop) : null;
+            if (cls && this.classInfo(cls)?.isModel && !types.has(`${v}->${prop}`)) types.set(`${v}->${prop}`, cls.split("\\").pop()!);
+          });
+        }
       }
     }
 
-    const locals: Locals = { values: new Map(), arrays: new Map(), seeded: opts.seedValues };
+    const locals: Locals = { values: new Map(), arrays: new Map(), seeded: opts.seedValues, allowed: new Map(), validatedVars: new Set() };
     const statusVars = new Map<string, Subject>(); // $latestStatus -> Request.status_id
+    this.readAllowed(body, names, locals);
     walk(body, (n) => {
       // $x = Model::find(...) / new Model / auth()->user()
       if (n.kind === "assign" && n.left?.kind === "variable" && typeof n.left.name === "string") {
@@ -432,15 +461,30 @@ export class ProcessReader {
     });
     if (statusVars.size) info.statusVars = Object.fromEntries(statusVars);
 
+    // Login checks in code: if (!Session::get('nik')) abort(…), abort_unless(Auth::check(), 401)
+    const login = loginCheck(body, file, selfClass);
+    if (login) info.login = login;
+    const client = apiKeyCheck(body, selfClass);
+    if (client) info.client = client;
+
     // Ability checks: $this->authorize('approve-manager'), Gate::authorize('x')
     walk(body, (n) => {
       if (n.kind !== "call") return;
       const name = n.what?.offset?.name ?? n.what?.name;
-      if (/^(authorize|allows|denies|authorizeForUser)$/.test(name ?? "") && n.arguments?.[0]) {
-        const ability = stringValue(n.arguments[0]);
-        if (ability && !/^(view|viewAny|create|update|delete|restore|forceDelete|approve|reject)$/.test(ability)) {
-          pushActor(info.actors, this.ability(ability, "code", `authorize('${ability}')`));
-        }
+      if (!/^(authorize|allows|denies|authorizeForUser)$/.test(name ?? "")) return;
+      const at = name === "authorizeForUser" ? 1 : 0;
+      const ability = stringValue(n.arguments?.[at]);
+      if (!ability) return;
+      // $this->authorize('approve', $order) -> OrderPolicy::approve(); Gate::define('x', …) -> its body
+      const target = n.arguments?.[at + 1];
+      const model =
+        target?.kind === "variable" && types.has(target.name) ? this.modelFor(types.get(target.name)!)
+        : target?.kind === "staticlookup" && target.what?.kind === "name" ? resolveName(target.what.name, target.what.resolution, names)
+        : null;
+      const viaPolicy = this.policyActors(ability, model);
+      if (viaPolicy.length) for (const a of viaPolicy) pushActor(info.actors, a);
+      else if (!/^(view|viewAny|create|update|delete|restore|forceDelete|approve|reject)$/.test(ability)) {
+        pushActor(info.actors, this.ability(ability, "code", `authorize('${ability}')`));
       }
     });
 
@@ -469,6 +513,68 @@ export class ProcessReader {
     // Status changes made in services the handler calls ($this->approval->hold($request))
     this.followCalls(body, names, selfClass, types, locals, info, opts.depth ?? 0, opts.stack ?? new Set(), branches);
     return info;
+  }
+
+  /**
+   * Values input fields and variables are limited to before they are used:
+   *   $request->validate(['status' => 'required|in:approved,rejected']), FormRequest rules(),
+   *   if (!in_array($status, ['a', 'b'])) abort(400), abort_unless(in_array(...), 400).
+   */
+  private readAllowed(body: PhpNode, names: NameContext, locals: Locals): void {
+    const allowed = locals.allowed!;
+    const takeRules = (arr: PhpNode) => {
+      if (arr?.kind !== "array") return;
+      for (const it of arr.items ?? []) {
+        const key = it?.kind === "entry" ? stringValue(it.key) : null;
+        const vals = key ? ruleInValues(it.value) : null;
+        if (key && vals) allowed.set(`input:${key}`, vals);
+        // exists:general_codes,code / Rule::exists('general_codes', 'code'): values live in a table
+        const table = key ? ruleExistsTable(it.value) : null;
+        if (key && table) (locals.lookups ??= new Map()).set(key, table);
+      }
+    };
+    const isValidate = (n: PhpNode): PhpNode | null => {
+      if (n?.kind !== "call") return null;
+      const m = n.what?.offset?.name;
+      if (m === "validate" && n.what?.what?.kind === "variable" && n.what.what.name === "request") return n.arguments?.[0];
+      if (m === "validate" && n.what?.what?.kind === "variable" && n.what.what.name === "this") return n.arguments?.[1];
+      if (m === "validate" && n.what?.what?.kind === "call") return isValidate(n.what.what); // Validator::make(...)->validate()
+      if (m === "make" && /(^|\\)Validator$/.test(n.what?.what?.name ?? "")) return n.arguments?.[1];
+      if (n.what?.kind === "name" && /^\\?validator$/.test(n.what.name)) return n.arguments?.[1];
+      if (m === "validated" && n.what?.what?.kind === "variable" && n.what.what.name === "request") return { kind: "array", items: [] };
+      return null;
+    };
+    // FormRequest parameter: its rules()
+    for (const p of body.arguments ?? []) {
+      const t = p.type?.name;
+      if (!t) continue;
+      const fq = resolveName(t, p.type.resolution, names);
+      if (!/\\Http\\Requests\\/.test(fq)) continue;
+      const rules = this.methodOf(fq, "rules");
+      walk(rules?.node, (x) => { if (x.kind === "return") takeRules(x.expr); });
+    }
+    const limit = (c: Comparison) => {
+      if (!c.inArray) return;
+      const field = inputKey(c.left, locals.validatedVars);
+      const key = field ? `input:${field}` : c.left?.kind === "variable" ? `$${c.left.name}` : null;
+      if (key) allowed.set(key, c.inArray);
+    };
+    walk(body, (n) => {
+      const rules = isValidate(n);
+      if (rules) takeRules(rules);
+      if (n.kind === "assign" && n.left?.kind === "variable" && isValidate(n.right)) locals.validatedVars!.add(n.left.name);
+      if (n.kind === "if" && n.test && exits(n.body)) for (const c of comparisons(n.test)) if (c.negated) limit(c);
+      if (n.kind === "call" && n.what?.kind === "name" && /^(abort_unless|throw_unless)$/.test(n.what.name)) for (const c of comparisons(n.arguments?.[0])) if (!c.negated) limit(c);
+    });
+  }
+
+  /** $status = $request->status; … -> "status" */
+  private inputOfVar(name: string, locals: Locals): string | null {
+    for (const a of locals.values.get(name) ?? []) {
+      const k = inputKey(a, locals.validatedVars);
+      if (k) return k;
+    }
+    return null;
   }
 
   /** The AST node of each write recorded in this scan, to place it in order and in its branch. */
@@ -665,31 +771,342 @@ export class ProcessReader {
         const v = this.value(p.value, found.names, found.cls);
         if (v) seedValues.set(pname, [v]);
       });
-      const cacheKey = `${key}|${[...seed].map(([k, v]) => `${k}:${v}`).join(",")}|${[...seedValues].map(([k, v]) => `${k}=${v.map((x) => x.value).join("/")}`).join(",")}`;
-      let sub = this.callCache.get(cacheKey);
-      if (!sub) {
-        sub = this.analyzeHandler(found.node, found.names, found.file, found.cls, { seedTypes: seed, seedValues, depth: depth + 1, stack: new Set([...stack, key]) });
-        this.callCache.set(cacheKey, sub);
-      }
-      // Remember what this step reaches, and which lines there cannot run with these arguments
-      const reached: Reach[] = [{ method: key, ...(sub.deadLines?.length ? { dead: sub.deadLines } : {}) }, ...(sub.calls ?? [])];
-      for (const r of reached) {
-        const sig = `${r.method}|${(r.dead ?? []).join(",")}`;
-        if (!(info.calls ?? []).some((x) => `${x.method}|${(x.dead ?? []).join(",")}` === sig)) (info.calls ??= []).push(r);
-      }
-      // The callee's writes happen at the call: in its place in the sequence and in its branch
-      const callOrder = offsetOf(n);
-      const callBranch = branches.get(n) ?? [];
-      for (const w of sub.writes) {
-        const placed: StatusWrite = { ...w, order: [callOrder, ...(w.order ?? [])], branch: [...callBranch, ...(w.branch ?? [])] };
-        const key = (x: StatusWrite) => `${x.subject}|${x.to.value}|${(x.order ?? []).join(".")}`;
-        if (!info.writes.some((x) => key(x) === key(placed))) info.writes.push(placed);
-      }
-      for (const r of sub.requires) info.requires.push(r);
-      for (const c of sub.creates) if (!info.creates.includes(c)) info.creates.push(c);
-      for (const u of sub.unresolved ?? []) if (!(info.unresolved ?? []).some((x) => x.source.file === u.source.file && x.source.line === u.source.line)) (info.unresolved ??= []).push(u);
-      for (const sp of sub.procedures ?? []) if (!(info.procedures ?? []).includes(sp)) (info.procedures ??= []).push(sp);
+      const sub = this.analyzeCached(key, found, seed, seedValues, depth, stack);
+      this.mergeCall(n, key, sub, info, branches, true);
     });
+
+    // Events the step fires: event(new X(...)), X::dispatch(...), Event::dispatch(new X)
+    // -> the listeners registered for X run as part of the step.
+    walk(body, (n) => {
+      if (n.kind !== "call" || branches.get(n)?.includes("dead:1")) return;
+      const fired = this.firedEvent(n, names);
+      if (!fired) return;
+      const carried = this.carriedModels(fired.event, fired.args, types);
+      for (const l of this.listenersOf(fired.event)) {
+        const key = `${l.cls}@${l.method}`;
+        if (stack.has(key)) continue;
+        const found = this.methodOf(l.cls, l.method);
+        if (!found) continue;
+        const param = paramName(found.node.arguments?.[0]);
+        const seed = new Map<string, string>();
+        if (param) for (const [prop, model] of carried) seed.set(`${param}->${prop}`, model);
+        const sub = this.analyzeCached(key, found, seed, new Map(), depth, stack);
+        this.mergeCall(n, key, sub, info, branches, true);
+      }
+    });
+
+    // Model observers: saving a model runs its observer (creating/created, updating/updated, …).
+    // Only creating/created changes are placed in the flow; an updated() observer runs after
+    // every save, so a status it sets is reported, not placed.
+    const fresh = new Set<string>(); // $x = new Model
+    walk(body, (n) => {
+      if (n.kind === "assign" && n.left?.kind === "variable" && n.right?.kind === "new" && this.modelName(n.right.what, names)) fresh.add(n.left.name);
+    });
+    walk(body, (n) => {
+      if (n.kind !== "call" || branches.get(n)?.includes("dead:1")) return;
+      const trig = this.modelEvent(n, names, types, fresh);
+      if (!trig) return;
+      const fq = this.modelFor(trig.model);
+      if (!fq) return;
+      for (const obs of this.observersOf(fq)) {
+        for (const ev of OBSERVER_EVENTS[trig.event]) {
+          const key = `${obs}@${ev}`;
+          if (stack.has(key)) continue;
+          const found = this.methodOf(obs, ev);
+          if (!found) continue;
+          const param = paramName(found.node.arguments?.[0]);
+          const seed = new Map<string, string>(param ? [[param, trig.model]] : []);
+          const sub = this.analyzeCached(key, found, seed, new Map(), depth, stack);
+          const place = ev === "creating" || ev === "created";
+          this.mergeCall(n, key, sub, info, branches, place);
+          if (!place) {
+            for (const w of sub.writes) {
+              (info.skipped ??= []).push({
+                reason: `Status change in observer ${obs.split("\\").pop()}::${ev}() not placed in the flow (it runs after every ${trig.event === "delete" ? "delete" : "save"} of ${trig.model}): ${w.subject} = ${w.to.code}`,
+                source: w.source,
+              });
+            }
+          }
+        }
+      }
+    });
+  }
+
+  private analyzeCached(
+    key: string,
+    found: { node: PhpNode; names: NameContext; file: string; cls: string },
+    seed: Map<string, string>,
+    seedValues: Map<string, StatusValue[]>,
+    depth: number,
+    stack: Set<string>,
+  ): ProcessInfo {
+    const cacheKey = `${key}|${[...seed].map(([k, v]) => `${k}:${v}`).join(",")}|${[...seedValues].map(([k, v]) => `${k}=${v.map((x) => x.value).join("/")}`).join(",")}`;
+    let sub = this.callCache.get(cacheKey);
+    if (!sub) {
+      sub = this.analyzeHandler(found.node, found.names, found.file, found.cls, { seedTypes: seed, seedValues, depth: depth + 1, stack: new Set([...stack, key]) });
+      this.callCache.set(cacheKey, sub);
+    }
+    return sub;
+  }
+
+  /** Take what a called method does into the step, at the call's place in the sequence and in its branch. */
+  private mergeCall(n: PhpNode, key: string, sub: ProcessInfo, info: ProcessInfo, branches: WeakMap<object, string[]>, withWrites: boolean): void {
+    // Remember what this step reaches, and which lines there cannot run with these arguments
+    const reached: Reach[] = [{ method: key, ...(sub.deadLines?.length ? { dead: sub.deadLines } : {}) }, ...(sub.calls ?? [])];
+    for (const r of reached) {
+      const sig = `${r.method}|${(r.dead ?? []).join(",")}`;
+      if (!(info.calls ?? []).some((x) => `${x.method}|${(x.dead ?? []).join(",")}` === sig)) (info.calls ??= []).push(r);
+    }
+    for (const s of sub.skipped ?? []) if (!(info.skipped ?? []).some((x) => x.reason === s.reason)) (info.skipped ??= []).push(s);
+    if (sub.login && !info.login) info.login = sub.login;
+    if (sub.client && !info.client) info.client = sub.client;
+    if (!withWrites) return;
+    const callOrder = offsetOf(n);
+    const callBranch = branches.get(n) ?? [];
+    for (const w of sub.writes) {
+      const placed: StatusWrite = { ...w, order: [callOrder, ...(w.order ?? [])], branch: [...callBranch, ...(w.branch ?? [])] };
+      const key = (x: StatusWrite) => `${x.subject}|${x.to.value}|${(x.order ?? []).join(".")}`;
+      if (!info.writes.some((x) => key(x) === key(placed))) info.writes.push(placed);
+    }
+    for (const r of sub.requires) info.requires.push(r);
+    for (const c of sub.creates) if (!info.creates.includes(c)) info.creates.push(c);
+    for (const u of sub.unresolved ?? []) if (!(info.unresolved ?? []).some((x) => x.source.file === u.source.file && x.source.line === u.source.line)) (info.unresolved ??= []).push(u);
+    for (const sp of sub.procedures ?? []) if (!(info.procedures ?? []).includes(sp)) (info.procedures ??= []).push(sp);
+  }
+
+  // ----- events and observers ---------------------------------------------
+
+  /** event(new X(...)), broadcast(new X), Event::dispatch(new X), X::dispatch(...) for an event class with listeners. */
+  private firedEvent(n: PhpNode, names: NameContext): { event: string; args: PhpNode[] } | null {
+    const fromNew = (a: PhpNode) => (a?.kind === "new" && a.what?.kind === "name" ? { event: resolveName(a.what.name, a.what.resolution, names), args: a.arguments ?? [] } : null);
+    if (n.what?.kind === "name" && /^\\?(event|broadcast)$/.test(n.what.name)) return fromNew(n.arguments?.[0]);
+    if (n.what?.kind !== "staticlookup" || n.what.what?.kind !== "name") return null;
+    const cls = resolveName(n.what.what.name, n.what.what.resolution, names);
+    const method = n.what.offset?.name;
+    if (/(^|\\)Event$/.test(cls) && /^(dispatch|until)$/.test(method ?? "")) return fromNew(n.arguments?.[0]);
+    if (/^(dispatch|dispatchIf|dispatchUnless|broadcast)$/.test(method ?? "") && this.listenersOf(cls).length) {
+      return { event: cls, args: (n.arguments ?? []).slice(/If|Unless/.test(method) ? 1 : 0) };
+    }
+    return null;
+  }
+
+  /** Event properties that hold a model passed at the dispatch: new OrderApproved($order) -> order: Order. */
+  private carriedModels(event: string, args: PhpNode[], types: Map<string, string>): Map<string, string> {
+    const out = new Map<string, string>();
+    const ctor = this.methodOf(event, "__construct");
+    if (!ctor) return out;
+    (ctor.node.arguments ?? []).forEach((p: PhpNode, i: number) => {
+      const a = args[i];
+      const pname = paramName(p);
+      if (!pname || a?.kind !== "variable" || !types.has(a.name)) return;
+      // Promoted (public Order $order) or assigned ($this->order = $order)
+      if (p.flags || p.visibility || p.readonly) out.set(pname, types.get(a.name)!);
+      walk(ctor.node.body, (x) => {
+        if (x.kind === "assign" && x.left?.kind === "propertylookup" && x.left.what?.name === "this" && x.right?.kind === "variable" && x.right.name === pname && typeof x.left.offset?.name === "string") {
+          out.set(x.left.offset.name, types.get(a.name)!);
+        }
+      });
+    });
+    return out;
+  }
+
+  private listenerIndex: Map<string, Array<{ cls: string; method: string }>> | null = null;
+
+  /**
+   * Listeners of an event class, from what Laravel reads:
+   *   EventServiceProvider $listen, Event::listen(X::class, L::class | [L::class, 'm'] | 'L@m'),
+   *   subscribers (subscribe() returning [X::class => 'method']), and discovery in app/Listeners
+   *   (Laravel 11+, or shouldDiscoverEvents() returning true): handle*(X $event) / __invoke(X $event).
+   */
+  listenersOf(event: string): Array<{ cls: string; method: string }> {
+    if (!this.listenerIndex) this.listenerIndex = this.readListeners();
+    return this.listenerIndex.get(event) ?? [];
+  }
+
+  private readListeners(): Map<string, Array<{ cls: string; method: string }>> {
+    const index = new Map<string, Array<{ cls: string; method: string }>>();
+    const add = (event: string | null, cls: string | null, method = "handle") => {
+      if (!event || !cls) return;
+      const list = index.get(event) ?? [];
+      if (!list.some((l) => l.cls === cls && l.method === method)) list.push({ cls, method });
+      index.set(event, list);
+    };
+    const classOf = (n: PhpNode, names: NameContext): string | null =>
+      n?.kind === "staticlookup" && (n.offset?.name ?? "") === "class" && n.what?.kind === "name" ? resolveName(n.what.name, n.what.resolution, names) : null;
+    /** L::class | [L::class, 'm'] | 'App\Listeners\L@m' */
+    const listenerOf = (n: PhpNode, names: NameContext, self?: string): { cls: string; method: string } | null => {
+      const c = classOf(n, names);
+      if (c) return { cls: c, method: "handle" };
+      if (n?.kind === "array" && n.items?.length === 2) {
+        const c2 = classOf(n.items[0]?.value ?? n.items[0], names);
+        const m = stringValue(n.items[1]?.value ?? n.items[1]);
+        if (c2 && m) return { cls: c2, method: m };
+      }
+      const s = stringValue(n);
+      if (s && self && !s.includes("\\") && !s.includes("@")) return { cls: self, method: s };
+      if (s) {
+        const [c3, m3] = s.split("@");
+        return { cls: c3.replace(/^\\/, ""), method: m3 || "handle" };
+      }
+      return null;
+    };
+    this.findShort("__index__");
+    const all = [...(this.shortIndex?.values() ?? [])].flat();
+    let discover = false;
+    const subscribers: string[] = [];
+    for (const fq of all.filter((c) => /^App\\Providers\\/.test(c))) {
+      const loaded = this.locator.load(fq);
+      if (!loaded) continue;
+      const { names } = loaded;
+      walk(loaded.ast, (n) => {
+        if (n.kind === "propertystatement") {
+          for (const p of n.properties ?? []) {
+            const pn = p.name?.name ?? p.name;
+            if (p.value?.kind !== "array") continue;
+            if (pn === "listen") {
+              for (const it of p.value.items ?? []) {
+                const ev = classOf(it.key, names) ?? stringValue(it.key);
+                const ls = it.value?.kind === "array" ? it.value.items ?? [] : [it.value];
+                for (const l of ls) {
+                  const r = listenerOf(l?.value ?? l, names);
+                  if (r) add(ev, r.cls, r.method);
+                }
+              }
+            }
+            if (pn === "subscribe") for (const it of p.value.items ?? []) { const c = classOf(it.value ?? it, names); if (c) subscribers.push(c); }
+          }
+        }
+        if (n.kind === "method" && (n.name?.name ?? n.name) === "shouldDiscoverEvents") {
+          walk(n.body, (x) => { if (x.kind === "return" && x.expr?.kind === "boolean" && x.expr.value) discover = true; });
+        }
+        if (n.kind === "call" && n.what?.kind === "staticlookup" && /(^|\\)Event$/.test(n.what.what?.name ?? "")) {
+          const m = n.what.offset?.name;
+          if (m === "listen" && n.arguments?.length === 2) {
+            const r = listenerOf(n.arguments[1], names);
+            if (r) add(classOf(n.arguments[0], names), r.cls, r.method);
+          }
+          if (m === "subscribe") { const c = classOf(n.arguments?.[0], names); if (c) subscribers.push(c); }
+        }
+      });
+    }
+    // Subscribers: subscribe($events) returns [X::class => 'method'] or calls $events->listen(...)
+    for (const s of subscribers) {
+      const found = this.methodOf(s, "subscribe");
+      if (!found) continue;
+      walk(found.node, (n) => {
+        if (n.kind === "return" && n.expr?.kind === "array") {
+          for (const it of n.expr.items ?? []) {
+            const r = listenerOf(it.value, found.names, s);
+            if (r) add(classOf(it.key, found.names), r.cls, r.method);
+          }
+        }
+        if (n.kind === "call" && n.what?.offset?.name === "listen" && n.arguments?.length === 2) {
+          const r = listenerOf(n.arguments[1], found.names, s);
+          if (r) add(classOf(n.arguments[0], found.names), r.cls, r.method);
+        }
+      });
+    }
+    // Discovery: on by default since Laravel 11 (bootstrap/app.php uses Application::configure)
+    const boot = join(this.root, "bootstrap", "app.php");
+    if (existsSync(boot)) {
+      const text = readFileSync(boot, "utf8");
+      if (/Application::configure\s*\(/.test(text) && !/withEvents\s*\(\s*discover\s*:\s*false/.test(text)) discover = true;
+    }
+    if (discover) {
+      for (const fq of all.filter((c) => /^App\\Listeners\\/.test(c))) {
+        const loaded = this.locator.load(fq);
+        if (!loaded) continue;
+        walk(loaded.ast, (n) => {
+          if (n.kind !== "method") return;
+          const name: string = n.name?.name ?? n.name;
+          if (!/^(handle|__invoke)/.test(name) || (n.visibility && n.visibility !== "public")) return;
+          const t = n.arguments?.[0]?.type;
+          const typeNames: PhpNode[] = t?.kind === "uniontype" ? t.types ?? [] : t ? [t] : [];
+          for (const tn of typeNames) if (tn?.name) add(resolveName(tn.name, tn.resolution, loaded.names), fq, name);
+          return false;
+        });
+      }
+    }
+    return index;
+  }
+
+  private observerIndex: Map<string, string[]> | null = null;
+
+  /** Observers of a model: Model::observe(O::class) in a provider, #[ObservedBy(O::class)], $observers. */
+  observersOf(model: string): string[] {
+    if (!this.observerIndex) {
+      const index = new Map<string, string[]>();
+      const add = (m: string | null, o: string | null) => {
+        if (!m || !o) return;
+        const list = index.get(m) ?? [];
+        if (!list.includes(o)) list.push(o);
+        index.set(m, list);
+      };
+      const classesIn = (n: PhpNode, names: NameContext): string[] => {
+        if (n?.kind === "array") return (n.items ?? []).flatMap((it: PhpNode) => classesIn(it?.value ?? it, names));
+        if (n?.kind === "staticlookup" && (n.offset?.name ?? "") === "class" && n.what?.kind === "name") return [resolveName(n.what.name, n.what.resolution, names)];
+        if (n?.kind === "new" && n.what?.kind === "name") return [resolveName(n.what.name, n.what.resolution, names)];
+        const s = stringValue(n);
+        return s ? [s.replace(/^\\/, "")] : [];
+      };
+      this.findShort("__index__");
+      const all = [...(this.shortIndex?.values() ?? [])].flat();
+      for (const fq of all.filter((c) => /^App\\Providers\\/.test(c))) {
+        const loaded = this.locator.load(fq);
+        if (!loaded) continue;
+        walk(loaded.ast, (n) => {
+          if (n.kind === "call" && n.what?.kind === "staticlookup" && n.what.offset?.name === "observe" && n.what.what?.kind === "name") {
+            const m = resolveName(n.what.what.name, n.what.what.resolution, loaded.names);
+            for (const o of classesIn(n.arguments?.[0], loaded.names)) add(m, o);
+          }
+          if (n.kind === "propertystatement") {
+            for (const p of n.properties ?? []) {
+              if ((p.name?.name ?? p.name) !== "observers" || p.value?.kind !== "array") continue;
+              for (const it of p.value.items ?? []) for (const m of classesIn(it.key, loaded.names)) for (const o of classesIn(it.value, loaded.names)) add(m, o);
+            }
+          }
+        });
+      }
+      for (const fq of all) {
+        if (!this.classInfo(fq)?.isModel) continue;
+        const loaded = this.locator.load(fq);
+        if (!loaded) continue;
+        walk(loaded.ast, (n) => {
+          if (n.kind !== "class") return;
+          for (const g of n.attrGroups ?? []) {
+            for (const a of g.attrs ?? []) {
+              if (!/(^|\\)ObservedBy$/.test(a.name ?? "")) continue;
+              for (const arg of a.args ?? []) for (const o of classesIn(arg, loaded.names)) add(fq, o);
+            }
+          }
+          return false;
+        });
+      }
+      this.observerIndex = index;
+    }
+    return this.observerIndex.get(model) ?? [];
+  }
+
+  /**
+   * A call that fires model events: Model::create(...) / $new->save() -> create;
+   * $x->save() / $x->update([...]) -> update; $x->delete() -> delete.
+   * Query-builder updates (Model::where(...)->update()) fire no model events.
+   */
+  private modelEvent(n: PhpNode, names: NameContext, types: Map<string, string>, fresh: Set<string>): { model: string; event: "create" | "update" | "delete" } | null {
+    const method = n.what?.offset?.name;
+    if (typeof method !== "string") return null;
+    if (n.what.kind === "staticlookup" && /^(create|forceCreate)$/.test(method)) {
+      const m = this.modelName(n.what.what, names);
+      return m ? { model: m, event: "create" } : null;
+    }
+    if (n.what.kind !== "propertylookup" && n.what.kind !== "nullsafepropertylookup") return null;
+    const recv = n.what.what;
+    const model = recv?.kind === "variable" ? types.get(recv.name) : (() => { const k = propKey(recv); return k ? types.get(k) : undefined; })();
+    if (!model) return null;
+    if (method === "save") return { model, event: recv.kind === "variable" && fresh.has(recv.name) ? "create" : "update" };
+    if (method === "update") return { model, event: "update" };
+    if (method === "delete") return { model, event: "delete" };
+    return null;
   }
 
   /** new X / (new X) / app(X::class) / resolve(X::class) -> FQCN */
@@ -806,9 +1223,31 @@ export class ProcessReader {
       }
       return out;
     }
+    // 'status_' . $id / "status_{$id}": every combination, when each part resolves
+    if ((node.kind === "bin" && node.type === ".") || node.kind === "encapsed") {
+      const parts: PhpNode[] = node.kind === "bin" ? [node.left, node.right] : (node.value ?? []).map((p: PhpNode) => (p?.kind === "encapsedpart" ? p.expression : p));
+      let combos: string[] = [""];
+      for (const part of parts) {
+        const raw = part?.kind === "string" ? [part.value as string] : this.values(part, names, selfClass, locals, depth + 1)?.map((v) => v.value);
+        if (!raw?.length) return null;
+        combos = combos.flatMap((c) => raw.map((r) => c + r));
+        if (combos.length > 20) return null;
+      }
+      return combos.map((v) => ({ value: v, code: `'${v}'`, label: literalLabel(v), labelFrom: "literal" as const }));
+    }
+    // A request field limited by validation (in:a,b) or by a guard
+    const field = inputKey(node, locals.validatedVars);
+    const limited = field ? locals.allowed?.get(`input:${field}`) : node.kind === "variable" ? locals.allowed?.get(`$${node.name}`) : undefined;
+    if (limited) {
+      const out = limited.map((v) => this.value(v, names, selfClass)).filter((v): v is StatusValue => Boolean(v));
+      return out.length === limited.length ? out : null;
+    }
     if (node.kind === "variable" && typeof node.name === "string") {
-      const assigned = locals.values.get(node.name);
-      if (!assigned?.length) return locals.seeded?.get(node.name) ?? null;
+      // $status = null; … $status = $x ? 'a' : 'b': the null only means "not set yet"
+      const isNull = (a: PhpNode) => a?.kind === "nullkeyword" || (a?.kind === "name" && /^null$/i.test(a.name ?? ""));
+      const all = locals.values.get(node.name) ?? [];
+      const assigned = all.some((a) => !isNull(a)) ? all.filter((a) => !isNull(a)) : all;
+      if (!assigned.length) return locals.seeded?.get(node.name) ?? null;
       const out: StatusValue[] = [];
       for (const a of assigned) {
         const v = this.values(a, names, selfClass, locals, depth + 1);
@@ -841,7 +1280,11 @@ export class ProcessReader {
         if (at) this.writeAt.set(w, { node: at, alt: vs.length > 1 ? i : undefined });
       });
     } else {
-      (info.unresolved ??= []).push({ column: `${subject.split(".")[0] ? subject.split(".")[0] + "." : ""}${column}`, code: exprText(valueNode), source });
+      // Say where the value comes from when the code shows it
+      const field = inputKey(valueNode, locals.validatedVars) ?? (valueNode?.kind === "variable" ? this.inputOfVar(valueNode.name, locals) : null);
+      const table = field ? locals.lookups?.get(field) : undefined;
+      const why = table ? `values come from table ${table} (data, not code)` : field ? `from form field '${field}'; nothing in the code limits its values` : undefined;
+      (info.unresolved ??= []).push({ column: `${subject.split(".")[0] ? subject.split(".")[0] + "." : ""}${column}`, code: exprText(valueNode), source, ...(why ? { why } : {}) });
     }
   }
 
@@ -882,6 +1325,9 @@ export class ProcessReader {
     else if (n.what.what?.kind === "variable") subjectModel = types.get(n.what.what.name) ?? null;
     else subjectModel = this.modelOfChain(n.what.what, names, types);
     const table = this.tableOfChain(n.what?.what);
+    // new X([...]) / X::make([...]) on a class that is not a model (Validator::make, a Mailable,
+    // a DTO) writes nothing to the database
+    if ((n.kind === "new" || n.what?.kind === "staticlookup") && !subjectModel) return;
     const tableSubject = table ? this.modelForTable(table) ?? table : null;
     let subjectBase = subjectModel ?? tableSubject;
 
@@ -894,10 +1340,35 @@ export class ProcessReader {
     if (subjectModel && !rel && /^(create|firstOrCreate|updateOrCreate|forceCreate|new|make)$/.test(method)) {
       if (!info.creates.includes(subjectModel)) info.creates.push(subjectModel);
     }
+    // Model::where('status', 'pending')->update(['status' => 'approved']): only rows in that status change
+    if (method === "update" && n.what?.what?.kind === "call" && subjectBase) {
+      const chain = flattenChain(n.what.what);
+      for (const s of chain?.steps ?? []) {
+        if (!/^(where|whereIn)$/.test(s.name)) continue;
+        const col = stringValue(s.args[0]);
+        if (!col || !STATUS_COLUMN.test(col)) continue;
+        const raw = s.name === "whereIn" && s.args[1]?.kind === "array" ? s.args[1].items.map((i: PhpNode) => (i?.kind === "entry" ? i.value : i)) : s.args.length === 2 ? [s.args[1]] : s.args.length === 3 && stringValue(s.args[1]) === "=" ? [s.args[2]] : [];
+        const values = raw.map((v: PhpNode) => this.value(v, names, selfClass)).filter((v: StatusValue | null): v is StatusValue => Boolean(v));
+        if (values.length && values.length === raw.length) info.requires.push({ subject: `${subjectBase}.${col}`, values, via: "guard", source: { file, line: lineOf(n) } });
+      }
+    }
     for (const arg of n.arguments ?? []) {
-      for (const entry of entriesOf(arg, locals)) {
+      const entries = entriesOf(arg, locals);
+      // ['m_status_id' => $id, 'stage' => 'status_' . $id]: stage is a text form of the
+      // other status column written in the same row, not a flow of its own
+      const plainVars = new Set(
+        entries.filter((e) => STATUS_COLUMN.test(stringValue(e.key) ?? "") && e.value?.kind === "variable").map((e) => e.value.name as string),
+      );
+      const mirrors = (v: PhpNode) => {
+        if (!(v?.kind === "bin" && v.type === ".") && v?.kind !== "encapsed") return false;
+        let found = false;
+        walk(v, (x) => { if (x.kind === "variable" && plainVars.has(x.name)) found = true; });
+        return found;
+      };
+      for (const entry of entries) {
         const k = stringValue(entry.key);
         if (!k || !STATUS_COLUMN.test(k)) continue;
+        if (mirrors(entry.value)) continue;
         this.recordWrite(info, `${subjectBase ?? ""}.${k}`, k, entry.value, names, selfClass, locals, { file, line: lineOf(n) }, n);
       }
     }
@@ -970,6 +1441,8 @@ export class ProcessReader {
     if (!node) return null;
     if (node.kind === "new") return this.modelName(node.what, names);
     if (node.kind === "call") return this.modelOfChain(node, names, types);
+    const carried = propKey(node);
+    if (carried) return types.get(carried) ?? null;
     return null;
   }
 
@@ -978,8 +1451,11 @@ export class ProcessReader {
     let cur = node;
     while (cur) {
       if (cur.kind === "call") cur = cur.what;
-      else if (cur.kind === "propertylookup" || cur.kind === "nullsafepropertylookup") cur = cur.what;
-      else if (cur.kind === "staticlookup") return this.modelName(cur.what, names);
+      else if (cur.kind === "propertylookup" || cur.kind === "nullsafepropertylookup") {
+        const carried = propKey(cur);
+        if (carried && types.has(carried)) return types.get(carried)!;
+        cur = cur.what;
+      } else if (cur.kind === "staticlookup") return this.modelName(cur.what, names);
       else if (cur.kind === "variable") return types.get(cur.name) ?? null;
       else return null;
     }
@@ -1034,27 +1510,202 @@ export class ProcessReader {
     return out;
   }
 
-  actorsFromMiddleware(middleware: string[]): ActorRef[] {
+  /**
+   * Abilities a page handler checks and hands to its view instead of enforcing:
+   *   $canInsert = Gate::allows('Application List Insert');  return view(..., compact('canInsert'))
+   *   ['canEdit' => auth()->user()->can('X Edit')]
+   * The page shows or hides buttons with them; the server does not stop the action.
+   */
+  pageAbilities(handler: PhpNode): string[] {
+    const out: string[] = [];
+    const abilityOf = (n: PhpNode): string | null => {
+      if (n?.kind === "parenthesis") return abilityOf(n.inner);
+      if (n?.kind === "unary" && n.type === "!") return abilityOf(n.what);
+      if (n?.kind !== "call") return null;
+      const method = n.what?.offset?.name;
+      const isGate = n.what?.kind === "staticlookup" && /(^|\\)Gate$/.test(n.what.what?.name ?? "");
+      if ((isGate && /^(allows|check|any|denies)$/.test(method ?? "")) || (!isGate && /^(can|cannot)$/.test(method ?? ""))) {
+        const a = n.arguments?.[0];
+        if (a?.kind === "array") return (a.items ?? []).map((i: PhpNode) => stringValue(i?.value ?? i)).filter(Boolean).join(", ") || null;
+        return stringValue(a);
+      }
+      return null;
+    };
+    walk(handler?.body, (n) => {
+      if (n.kind === "assign") {
+        const a = abilityOf(n.right);
+        if (a && !out.includes(a)) out.push(a);
+      }
+      if (n.kind === "entry" && n.key) {
+        const a = abilityOf(n.value);
+        if (a && !out.includes(a)) out.push(a);
+      }
+    });
+    return out;
+  }
+
+  /** Route parameters bound to models by the handler's type hints: (Order $order) -> order: App\Models\Order. */
+  paramModels(handler: PhpNode, names: NameContext): Map<string, string> {
+    const out = new Map<string, string>();
+    for (const p of handler?.arguments ?? []) {
+      const t = p.type?.name;
+      const v = paramName(p);
+      if (!t || !v) continue;
+      const fq = resolveName(t, p.type.resolution, names);
+      if (this.classInfo(fq)?.isModel) out.set(v, fq);
+    }
+    return out;
+  }
+
+  actorsFromMiddleware(middleware: string[], params: Map<string, string> = new Map()): ActorRef[] {
     const out: ActorRef[] = [];
     for (const mw of middleware) {
-      const [name, params = ""] = mw.split(":");
+      const [name, args = ""] = mw.split(":");
       const lname = name.toLowerCase();
       if (lname === "role" || lname === "role_or_permission") {
-        for (const r of params.split(/[|,]/).map((x) => x.trim()).filter(Boolean)) out.push(this.actor(r, "middleware", mw));
+        for (const r of args.split(/[|,]/).map((x) => x.trim()).filter(Boolean)) out.push(this.actor(r, "middleware", mw));
       } else if (lname === "can" || lname === "permission" || lname === "ability" || lname === "abilities") {
-        const ability = params.split(",")[0]?.trim();
+        const [ability, arg] = args.split(",").map((x) => x.trim());
         if (!ability) continue;
+        // can:approve,order -> the policy of the model bound to {order}; can:create,App\Models\Post -> PostPolicy
+        if (lname === "can") {
+          const model = arg ? params.get(arg) ?? (arg.includes("\\") ? arg.replace(/^\\/, "") : null) : null;
+          const viaPolicy = this.policyActors(ability, model);
+          if (viaPolicy.length) {
+            out.push(...viaPolicy);
+            continue;
+          }
+        }
         out.push(this.ability(ability, "middleware", mw));
       } else if (!STANDARD_MIDDLEWARE.test(lname) && !lname.includes("\\") && !AUTH_LIKE.test(name)) {
         const stripped = name.replace(/middleware$/i, "").replace(/^(is|check|ensure|only|must|has|role)[-_.]?/i, "").replace(/^(user)?(is)?/i, "");
         const hadPrefix = stripped.length < name.replace(/middleware$/i, "").length;
         const words = splitWords(stripped);
-        const candidate = params && /^(check)?role$/i.test(name) ? params : words.join(" ");
+        const candidate = args && /^(check)?role$/i.test(name) ? args : words.join(" ");
         if (!candidate) continue;
         if (hadPrefix || words.some((w) => ROLE_WORDS.has(w) || this.knownRoles.has(w))) out.push(this.actor(candidate, "middleware", mw));
       }
     }
     return out;
+  }
+
+  // ----- policies and gates -------------------------------------------------
+
+  private gates: { abilities: Map<string, { node: PhpNode; names: NameContext; label: string }>; policies: Map<string, string>; before: Array<{ node: PhpNode; names: NameContext; label: string }> } | null = null;
+
+  /**
+   * Gate::define('x', fn (User $u) => …) / [C::class, 'm'] / 'C@m', Gate::before(…),
+   * Gate::policy(M::class, P::class), $policies in AuthServiceProvider, #[UsePolicy(P::class)].
+   */
+  private readGates(): NonNullable<ProcessReader["gates"]> {
+    if (this.gates) return this.gates;
+    const g: NonNullable<ProcessReader["gates"]> = { abilities: new Map(), policies: new Map(), before: [] };
+    const classOf = (n: PhpNode, names: NameContext): string | null =>
+      n?.kind === "staticlookup" && (n.offset?.name ?? "") === "class" && n.what?.kind === "name" ? resolveName(n.what.name, n.what.resolution, names) : null;
+    const callable = (n: PhpNode, names: NameContext): { node: PhpNode; names: NameContext; label: string } | null => {
+      if (n?.kind === "closure" || n?.kind === "arrowfunc") return { node: n, names, label: "Gate::define" };
+      let cls: string | null = null;
+      let m: string | null = null;
+      if (n?.kind === "array" && n.items?.length === 2) {
+        cls = classOf(n.items[0]?.value ?? n.items[0], names);
+        m = stringValue(n.items[1]?.value ?? n.items[1]);
+      } else if (stringValue(n)?.includes("@")) [cls, m] = stringValue(n)!.split("@");
+      const found = cls && m ? this.methodOf(cls.replace(/^\\/, ""), m) : null;
+      return found ? { node: found.node, names: found.names, label: `${cls!.split("\\").pop()}::${m}()` } : null;
+    };
+    this.findShort("__index__");
+    const all = [...(this.shortIndex?.values() ?? [])].flat();
+    for (const fq of all.filter((c) => /^App\\Providers\\/.test(c))) {
+      const loaded = this.locator.load(fq);
+      if (!loaded) continue;
+      const { names } = loaded;
+      walk(loaded.ast, (n) => {
+        if (n.kind === "propertystatement") {
+          for (const p of n.properties ?? []) {
+            if ((p.name?.name ?? p.name) !== "policies" || p.value?.kind !== "array") continue;
+            for (const it of p.value.items ?? []) {
+              const m = classOf(it.key, names) ?? stringValue(it.key);
+              const pol = classOf(it.value, names) ?? stringValue(it.value);
+              if (m && pol) g.policies.set(m.replace(/^\\/, ""), pol.replace(/^\\/, ""));
+            }
+          }
+        }
+        if (n.kind !== "call" || n.what?.kind !== "staticlookup" || !/(^|\\)Gate$/.test(n.what.what?.name ?? "")) return;
+        const method = n.what.offset?.name;
+        if (method === "define") {
+          const ability = stringValue(n.arguments?.[0]);
+          const c = callable(n.arguments?.[1], names);
+          if (ability && c) g.abilities.set(ability, c);
+        } else if (method === "policy") {
+          const m = classOf(n.arguments?.[0], names);
+          const pol = classOf(n.arguments?.[1], names);
+          if (m && pol) g.policies.set(m, pol);
+        } else if (method === "before") {
+          const c = callable(n.arguments?.[0], names);
+          if (c) g.before.push({ ...c, label: "Gate::before" });
+        }
+      });
+    }
+    for (const fq of all) {
+      if (!this.classInfo(fq)?.isModel) continue;
+      const loaded = this.locator.load(fq);
+      walk(loaded?.ast, (n) => {
+        if (n.kind !== "class") return;
+        for (const grp of n.attrGroups ?? []) for (const a of grp.attrs ?? []) {
+          if (!/(^|\\)UsePolicy$/.test(a.name ?? "")) continue;
+          const pol = classOf(a.args?.[0], loaded!.names);
+          if (pol) g.policies.set(fq, pol);
+        }
+        return false;
+      });
+    }
+    this.gates = g;
+    return g;
+  }
+
+  /** Policy of a model: registered, or Laravel's naming convention (App\Policies\OrderPolicy). */
+  private policyFor(model: string): string | null {
+    const registered = this.readGates().policies.get(model);
+    if (registered) return registered;
+    const short = model.split("\\").pop();
+    const ns = model.split("\\").slice(0, -1).join("\\");
+    for (const cand of [`App\\Policies\\${short}Policy`, `${ns}\\Policies\\${short}Policy`]) if (this.locator.load(cand)) return cand;
+    return null;
+  }
+
+  /**
+   * Who an ability lets through, read from its policy method or Gate::define body
+   * ($user->hasRole('manager'), $user->role == 'finance'), plus the policy's before().
+   * Empty when nothing there names a role: the caller then keeps the ability name.
+   */
+  policyActors(ability: string, model: string | null): ActorRef[] {
+    const bodies: Array<{ node: PhpNode; names: NameContext; label: string }> = [];
+    const policy = model ? this.policyFor(model) : null;
+    if (policy) {
+      const method = ability.includes("-") || ability.includes("_") ? ability.replace(/[-_](\w)/g, (_, c: string) => c.toUpperCase()) : ability;
+      const short = policy.split("\\").pop();
+      const m = this.methodOf(policy, method);
+      if (m) bodies.push({ node: m.node, names: m.names, label: `${short}::${method}()` });
+      const b = this.methodOf(policy, "before");
+      if (m && b) bodies.push({ node: b.node, names: b.names, label: `${short}::before()` });
+    } else {
+      const def = this.readGates().abilities.get(ability);
+      if (def) bodies.push(def);
+    }
+    if (!bodies.length) return [];
+    const primary = bodies[0].label;
+    bodies.push(...this.readGates().before);
+    const out: ActorRef[] = [];
+    for (const b of bodies) {
+      const userVars = new Set<string>(["user", "authUser", "currentUser", "me"]);
+      const first = paramName(b.node.arguments?.[0]);
+      if (first) userVars.add(first);
+      for (const a of this.actorsInExpr(b.node.body ?? b.node, userVars, b.names, new Map())) {
+        if (!out.some((x) => x.name === a.name)) out.push({ ...a, detail: `${b.label}: ${a.detail}` });
+      }
+    }
+    // before() alone (a super admin that passes everything) says nothing about this ability
+    return out.some((a) => a.detail.startsWith(`${primary}:`)) ? out : [];
   }
 
   /** A role word inside a route or ability name: approve-manager -> Manager. */
@@ -1209,6 +1860,67 @@ interface Locals {
   arrays: Map<string, Array<{ key: PhpNode; value: PhpNode }>>;
   /** Parameter values passed in by the caller: tambahStatus($x, Constant::STATUS_HOLD). */
   seeded?: Map<string, StatusValue[]>;
+  /**
+   * Values a variable or request field is limited to: if (!in_array($s, [...])) abort(),
+   * $request->validate(['status' => 'in:a,b' | Rule::in([...])]). Keys: "$name" or "input:name".
+   */
+  allowed?: Map<string, PhpNode[]>;
+  /** Variables holding validated input: $validated = $request->validate([...]). */
+  validatedVars?: Set<string>;
+  /** Input fields whose values must exist in a table (exists:general_codes,code). */
+  lookups?: Map<string, string>;
+}
+
+/** 'exists:general_codes,code' / ['required', Rule::exists('general_codes', 'code')] -> "general_codes". */
+function ruleExistsTable(rule: PhpNode): string | null {
+  const fromText = (s: string) => /(?:^|\|)exists:([^,|]+)/.exec(s)?.[1]?.trim() ?? null;
+  const text = stringValue(rule);
+  if (text) return fromText(text);
+  if (rule?.kind === "array") {
+    for (const it of rule.items ?? []) {
+      const v = it?.kind === "entry" ? it.value : it;
+      const s = stringValue(v);
+      if (s && fromText(s)) return fromText(s);
+      if (v?.kind === "call" && v.what?.kind === "staticlookup" && v.what.offset?.name === "exists" && /(^|\\)Rule$/.test(v.what.what?.name ?? "")) {
+        return stringValue(v.arguments?.[0]);
+      }
+    }
+  }
+  return null;
+}
+
+/** $request->status / $request->input('status') / request('status') / $validated['status'] -> "status". */
+function inputKey(n: PhpNode, validatedVars: Set<string> = new Set()): string | null {
+  if (!n) return null;
+  if ((n.kind === "propertylookup" || n.kind === "nullsafepropertylookup") && n.what?.kind === "variable" && n.what.name === "request" && typeof n.offset?.name === "string") return n.offset.name;
+  if (n.kind === "call" && n.what?.kind === "propertylookup" && n.what.what?.kind === "variable" && n.what.what.name === "request" && /^(input|get|post|query|string|integer|enum)$/.test(n.what.offset?.name ?? "")) {
+    return stringValue(n.arguments?.[0]);
+  }
+  if (n.kind === "call" && n.what?.kind === "name" && /^\\?request$/.test(n.what.name) && n.arguments?.length) return stringValue(n.arguments[0]);
+  if (n.kind === "offsetlookup" && n.what?.kind === "variable" && validatedVars.has(n.what.name)) return stringValue(n.offset);
+  return null;
+}
+
+/** 'in:a,b' / 'required|in:a,b' / ['required', 'in:a,b', Rule::in([...])] -> the listed values. */
+function ruleInValues(rule: PhpNode): PhpNode[] | null {
+  const fromText = (s: string): PhpNode[] | null => {
+    const m = /(?:^|\|)in:([^|]+)/.exec(s);
+    return m ? m[1].split(",").map((v) => ({ kind: "string", value: v.trim() })) : null;
+  };
+  const text = stringValue(rule);
+  if (text) return fromText(text);
+  if (rule?.kind === "array") {
+    for (const it of rule.items ?? []) {
+      const v = it?.kind === "entry" ? it.value : it;
+      const s = stringValue(v);
+      if (s && fromText(s)) return fromText(s);
+      // Rule::in([...])
+      if (v?.kind === "call" && v.what?.kind === "staticlookup" && v.what.offset?.name === "in" && /(^|\\)Rule$/.test(v.what.what?.name ?? "") && v.arguments?.[0]?.kind === "array") {
+        return v.arguments[0].items.map((i: PhpNode) => (i?.kind === "entry" ? i.value : i));
+      }
+    }
+  }
+  return null;
 }
 
 /** Key/value entries of array literals in an argument, including arrays built in local variables. */
@@ -1411,7 +2123,18 @@ function subjectOf(record: PhpNode, types: Map<string, string>, column: string):
     if (record.name === "this" || record.name === "request") return null;
     return `${types.get(record.name) ?? ""}.${column}`;
   }
+  // $event->order->status: a model carried by an event
+  const carried = propKey(record);
+  if (carried && types.has(carried)) return `${types.get(carried)}.${column}`;
   return `.${column}`;
+}
+
+/** "$event->order" as a key into the variable types map. */
+function propKey(n: PhpNode): string | null {
+  if ((n?.kind === "propertylookup" || n?.kind === "nullsafepropertylookup") && n.what?.kind === "variable" && typeof n.what.name === "string" && typeof n.offset?.name === "string") {
+    return `${n.what.name}->${n.offset.name}`;
+  }
+  return null;
 }
 
 function exits(body: PhpNode): boolean {
@@ -1420,8 +2143,134 @@ function exits(body: PhpNode): boolean {
     if (!s) return false;
     if (s.kind === "return" || s.kind === "throw") return true;
     const e = s.kind === "expressionstatement" ? s.expression : s;
-    return e?.kind === "call" && e.what?.kind === "name" && /^(abort|abort_if|abort_unless|redirect|back|throw_if)$/.test(e.what.name);
+    return e?.kind === "call" && e.what?.kind === "name" && /^\\?(abort|abort_if|abort_unless|redirect|back|throw_if)$/.test(e.what.name);
   });
+}
+
+/**
+ * A key or token other systems must send, checked before anything else:
+ *   $key = $request->header('X-Api-Key'); if (!$key || …) return response()->json(…, 401) / abort(401)
+ *   if ($request->bearerToken() !== config('services.x.token')) abort(403)
+ */
+function apiKeyCheck(body: PhpNode, selfClass: string | undefined): string | null {
+  const readsKey = (n: PhpNode): string | null => {
+    if (n?.kind !== "call") return null;
+    const m = n.what?.offset?.name;
+    if (m === "bearerToken") return "bearer token";
+    if (m === "header" && stringValue(n.arguments?.[0]) && /key|token|secret|signature|auth/i.test(stringValue(n.arguments?.[0])!)) return `header ${stringValue(n.arguments?.[0])}`;
+    return null;
+  };
+  const vars = new Map<string, string>();
+  walk(body, (n) => {
+    if (n.kind === "assign" && n.left?.kind === "variable" && typeof n.left.name === "string") {
+      const k = readsKey(n.right);
+      if (k) vars.set(n.left.name, k);
+    }
+  });
+  /** Returns 401/403: return response()->json(…, 401) / return $unauthorized / abort(401) */
+  const denies = (block: PhpNode): boolean => {
+    let found = false;
+    walk(block, (x) => {
+      if (x.kind === "number" && /^40[13]$/.test(String(x.value))) found = true;
+      if (x.kind === "variable" && /unauth|forbidden|denied|invalid/i.test(x.name ?? "")) found = true;
+    });
+    return found && exits(block);
+  };
+  let found: string | null = null;
+  walk(body, (n) => {
+    if (found || n.kind !== "if" || !n.test || !denies(n.body)) return;
+    walk(n.test, (x) => {
+      if (found) return false;
+      found = readsKey(x) ?? (x.kind === "variable" ? vars.get(x.name) ?? null : null);
+    });
+  });
+  if (!found) {
+    // abort_unless($request->header('X-Api-Key') === …, 401)
+    walk(body, (n) => {
+      if (found || n.kind !== "call" || n.what?.kind !== "name" || !/^\\?(abort_unless|abort_if)$/.test(n.what.name)) return;
+      walk(n.arguments?.[0], (x) => {
+        if (!found) found = readsKey(x) ?? (x.kind === "variable" ? vars.get(x.name) ?? null : null);
+      });
+    });
+  }
+  if (!found) return null;
+  const mname = body?.name?.name ?? body?.name;
+  return `${found}, ${selfClass ? `${selfClass.split("\\").pop()}${typeof mname === "string" ? `::${mname}()` : ""}` : "handler"}`;
+}
+
+/** Session keys that identify the signed-in user (session('nik_real'), Session::get('user_id')). */
+const LOGIN_SESSION_KEY = /nik|user|login|logged|auth|employee|karyawan|email|username|token|account|member|staff|pegawai/i;
+
+/**
+ * Where the code requires login, as "Class::method(): <check>":
+ *   if (!Session::get('nik_real')) abort(...) / $x = session('nik'); if (!$x) return redirect(...)
+ *   if (!Auth::check()) … / if (auth()->guest()) … / abort_unless(auth()->check(), 401)
+ */
+function loginCheck(body: PhpNode, file: string, selfClass: string | undefined): string | null {
+  const isIdentity = (n: PhpNode): string | null => {
+    if (n?.kind === "parenthesis") return isIdentity(n.inner);
+    if (n?.kind !== "call") return null;
+    const fn = n.what?.kind === "name" ? n.what.name.replace(/^\\/, "") : null;
+    const method = n.what?.offset?.name;
+    const cls = n.what?.kind === "staticlookup" ? (n.what.what?.name ?? "").replace(/^\\/, "") : null;
+    // session('nik') / Session::get('nik') / session()->get('nik') / Session::has('nik')
+    const key = (args: PhpNode[]) => stringValue(args?.[0]);
+    if (fn === "session" && n.arguments?.length && LOGIN_SESSION_KEY.test(key(n.arguments) ?? "")) return `session('${key(n.arguments)}')`;
+    if (cls && /(^|\\)Session$/.test(cls) && /^(get|has|exists)$/.test(method ?? "") && LOGIN_SESSION_KEY.test(key(n.arguments) ?? "")) return `Session::${method}('${key(n.arguments)}')`;
+    if (n.what?.kind === "propertylookup" && n.what.what?.kind === "call" && n.what.what.what?.name === "session" && /^(get|has|exists)$/.test(method ?? "") && LOGIN_SESSION_KEY.test(key(n.arguments) ?? "")) return `session()->${method}('${key(n.arguments)}')`;
+    // Auth::check() / auth()->check() / Auth::user() / auth()->id()
+    if (cls && /(^|\\)Auth$/.test(cls) && /^(check|user|id)$/.test(method ?? "")) return `Auth::${method}()`;
+    if (n.what?.kind === "propertylookup" && n.what.what?.kind === "call" && n.what.what.what?.name === "auth" && /^(check|user|id)$/.test(method ?? "")) return `auth()->${method}()`;
+    return null;
+  };
+  const isGuest = (n: PhpNode): string | null => {
+    if (n?.kind !== "call") return null;
+    const method = n.what?.offset?.name;
+    if (method !== "guest") return null;
+    if (n.what?.kind === "staticlookup" && /(^|\\)Auth$/.test(n.what.what?.name ?? "")) return "Auth::guest()";
+    if (n.what?.kind === "propertylookup" && n.what.what?.kind === "call" && n.what.what.what?.name === "auth") return "auth()->guest()";
+    return null;
+  };
+  const vars = new Map<string, string>(); // $isLogin = Session::get('nik_real')
+  walk(body, (n) => {
+    if (n.kind === "assign" && n.left?.kind === "variable" && typeof n.left.name === "string") {
+      const id = isIdentity(n.right);
+      if (id) vars.set(n.left.name, id);
+    }
+  });
+  /** The test is true when nobody is signed in. */
+  const notSignedIn = (t: PhpNode): string | null => {
+    if (t?.kind === "parenthesis") return notSignedIn(t.inner);
+    if (t?.kind === "unary" && t.type === "!") {
+      const x = t.what?.kind === "parenthesis" ? t.what.inner : t.what;
+      return isIdentity(x) ?? (x?.kind === "variable" ? vars.get(x.name) ?? null : null);
+    }
+    if (t?.kind === "call" && t.what?.kind === "name" && /^\\?(empty|is_null)$/.test(t.what.name)) {
+      const x = t.arguments?.[0];
+      return isIdentity(x) ?? (x?.kind === "variable" ? vars.get(x.name) ?? null : null);
+    }
+    if (t?.kind === "bin" && /^(==|===)$/.test(t.type) && (t.right?.kind === "nullkeyword" || t.left?.kind === "nullkeyword")) {
+      const x = t.right?.kind === "nullkeyword" ? t.left : t.right;
+      return isIdentity(x) ?? (x?.kind === "variable" ? vars.get(x.name) ?? null : null);
+    }
+    if (t?.kind === "bin" && /^(\|\||or)$/i.test(t.type)) return notSignedIn(t.left) ?? notSignedIn(t.right);
+    return isGuest(t);
+  };
+  let found: string | null = null;
+  walk(body, (n) => {
+    if (found) return false;
+    if (n.kind === "if" && n.test && exits(n.body)) found = notSignedIn(n.test);
+    if (n.kind === "call" && n.what?.kind === "name") {
+      const fn = n.what.name.replace(/^\\/, "");
+      const a = n.arguments?.[0];
+      if (fn === "abort_unless") found = isIdentity(a) ?? (a?.kind === "variable" ? vars.get(a.name) ?? null : null);
+      if (fn === "abort_if") found = notSignedIn(a);
+    }
+  });
+  if (!found) return null;
+  const mname = body?.name?.name ?? body?.name;
+  const where = selfClass ? `${selfClass.split("\\").pop()}${typeof mname === "string" ? `::${mname}()` : ""}` : file.split("/").pop();
+  return `${where}: ${found}`;
 }
 
 function arrays(n: PhpNode): PhpNode[] {

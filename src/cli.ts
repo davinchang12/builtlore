@@ -6,6 +6,8 @@ import { parseArgs } from "node:util";
 import { adapters } from "./adapters/index.js";
 import { detectStacks, scanProject, writeHtml, DEFAULT_CONFIG, loadConfig, type ScanResult } from "./core/scan.js";
 import { serveProject } from "./core/serve.js";
+import { diffMaps, diffMarkdown, diffText, loadSide } from "./core/diff.js";
+import { missingText } from "./docs/content.js";
 import { DEFAULT_DOCS_DIR, writeDocs } from "./docs/index.js";
 import type { BuiltMap } from "./core/types.js";
 import { VERSION } from "./core/version.js";
@@ -23,6 +25,10 @@ Usage
                                         Edits save to builtlore.edits.yaml and survive rescans.
   builtlore docs [path] [--out <dir>]   Scan and write the project documentation: Markdown
                                         (default docs/builtlore/) plus one printable index.html
+  builtlore diff [base] [head]          What changed in behaviour: steps, statuses, roles, rules,
+                                        integrations, data, automation, configuration.
+                                        base/head: a git ref (scanned in a temporary worktree) or a
+                                        builtlore.json file. Defaults: base HEAD, head = working folder.
 
 Scan options
   --mode <auto|static|artisan>         Laravel: artisan (exact, needs PHP + vendor/), static (no PHP), auto (default)
@@ -35,11 +41,17 @@ Docs options
   --open                               Open index.html after writing
   (--mode and --php work as for scan)
 
+Diff options
+  --project <dir>                      Project folder (default: current folder)
+  --md <file>                          Also write the report as Markdown (for a pull request)
+  (both sides are scanned in static mode unless --mode is given)
+
 Examples
   builtlore scan
   builtlore scan ~/work/project-1 ~/work/project-2
   builtlore view ~/work/project-1
   builtlore docs --open
+  builtlore diff main --md builtlore-diff.md
 
 Supported stacks: ${adapters.map((a) => a.name).join(", ")} (Go, Next.js and Flutter are planned)
 `;
@@ -53,6 +65,8 @@ async function main(argv: string[]): Promise<number> {
       out: { type: "string" },
       php: { type: "string" },
       port: { type: "string" },
+      md: { type: "string" },
+      project: { type: "string" },
       open: { type: "boolean", default: false },
       "no-open": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -89,6 +103,8 @@ async function main(argv: string[]): Promise<number> {
         php: values.php,
         open: values.open,
       });
+    case "diff":
+      return diff(values.project ?? ".", paths[0], paths[1], { mode: values.mode as "auto" | "static" | "artisan" | undefined, md: values.md });
     case "serve":
       return serve(paths[0] ?? ".", {
         mode: values.mode as "auto" | "static" | "artisan" | undefined,
@@ -190,7 +206,8 @@ async function docs(pathArg: string, opts: { mode?: "auto" | "static" | "artisan
     console.log(`\n✔ Docs  ${rel(written.dir)}`);
     console.log(`  ${written.files.length} Markdown pages · index.html (print to PDF) · canvas.html`);
     if (written.removed.length) console.log(`  · removed ${written.removed.length} page${written.removed.length === 1 ? "" : "s"} of features no longer in the code`);
-    if (!m.project.summary) console.log("  · No project summary yet: builtlore serve → Project");
+    const missing = missingText(m);
+    if (missing.total) console.log(`  · To write (only people know it): ${missing.total} item${missing.total === 1 ? "" : "s"}, ready to paste: ${rel(join(written.dir, "to-write.md"))}`);
     console.log(`  html:   ${rel(written.html)}`);
     console.log(`  start:  ${rel(join(written.dir, "README.md"))}`);
     if (opts.open) openFile(written.html);
@@ -217,6 +234,24 @@ async function serve(pathArg: string, opts: { mode?: "auto" | "static" | "artisa
     const e = err as NodeJS.ErrnoException;
     if (e.code === "EADDRINUSE") console.error(`Port ${opts.port ?? 4321} is in use. Try: builtlore serve --port 4322`);
     else console.error(`✖ ${e.message}`);
+    return 1;
+  }
+}
+
+async function diff(project: string, base: string | undefined, head: string | undefined, opts: { mode?: "auto" | "static" | "artisan"; md?: string }): Promise<number> {
+  try {
+    const mode = opts.mode ?? "static";
+    const b = await loadSide(project, base ?? "HEAD", mode);
+    const h = await loadSide(project, head, mode);
+    const sections = diffMaps(b.map, h.map);
+    console.log(diffText(sections, b.label, h.label));
+    if (opts.md) {
+      writeFileSync(resolve(opts.md), diffMarkdown(sections, b.label, h.label));
+      console.log(`\nMarkdown: ${rel(resolve(opts.md))}`);
+    }
+    return 0;
+  } catch (err) {
+    console.error(`✖ ${(err as Error).message}`);
     return 1;
   }
 }

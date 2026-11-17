@@ -157,7 +157,9 @@ export function applyEdits(raw: BuiltMap, edits: Edits): BuiltMap {
     const name = edits.roles[n.who.id];
     if (name) n.who = { ...n.who, name, provenance: "human" };
   }
-  const edited = Object.keys(edits.steps).length + Object.keys(edits.features).length;
+  // Placeholders pasted from the docs' "To write" page (empty values) are not edits yet
+  const filled = (e: object) => Object.values(e).some((v) => v !== "" && v !== undefined && v !== null);
+  const edited = Object.values(edits.steps).filter(filled).length + Object.values(edits.features).filter(filled).length;
   if (edited) {
     map.notes.push(`Applied ${edited - orphans.length} edit${edited - orphans.length === 1 ? "" : "s"} from ${EDITS_FILE}.`);
   }

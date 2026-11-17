@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
 import { join } from "node:path";
-import { after, before, describe, it } from "node:test";
+import { before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { scanProject } from "../src/core/scan.js";
 import type { BuiltMap } from "../src/core/types.js";
@@ -15,9 +14,8 @@ describe("internal approval-workflow app", () => {
   const edge = (from: string, to: string) => map.edges.find((e) => e.from === `route:${from}` && e.to === `route:${to}`);
 
   before(async () => {
-    map = (await scanProject(fixture, { mode: "static", output: "builtlore.test.json" })).map;
+    map = (await scanProject(fixture, { mode: "static" }, { write: false })).map;
   });
-  after(() => rmSync(join(fixture, "builtlore.test.json"), { force: true }));
 
   it("warns about duplicate routes and keeps only one", () => {
     assert.ok(map.notes.some((n) => n.startsWith("Warning: duplicate route GET /logon/{nik}")), map.notes.join("\n"));

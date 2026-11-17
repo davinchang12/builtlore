@@ -8,7 +8,7 @@
  *   - every page opens with one line saying when to read it
  *   - processes are told as numbered steps; tables and code details are folded away
  */
-import type { DataColumn, DataTable, Integration, MapNode, ProcessState, SourceRef, Validation } from "../core/types.js";
+import type { BuiltMap, DataColumn, DataTable, Integration, MapNode, ProcessState, SourceRef, Validation } from "../core/types.js";
 import { mermaid, stateGraph, type StateGraph } from "./diagram.js";
 import { byLabel, endpoint, finalStates, NEGATIVE, processEdges, short, type DocFeature, type DocModel, type DocProcess, type DocTransition } from "./model.js";
 
@@ -31,6 +31,8 @@ export type Block =
   | { t: "table"; head: string[]; rows: Inline[][][]; compact?: boolean }
   | { t: "diagram"; graph: StateGraph; title: string; id: string; mermaid: string }
   | { t: "mermaid"; code: string }
+  /** A block of text to copy, e.g. YAML to paste into builtlore.edits.yaml. */
+  | { t: "code"; lang: string; text: string }
   /** The interactive canvas: embedded in the HTML, a link in Markdown. */
   | { t: "canvas"; href: string }
   /** Folded detail: open it when you need it. */
@@ -78,6 +80,7 @@ export function buildPages(m: DocModel, opts: PageOptions = {}): Page[] {
     api(m),
     configuration(m),
     findingsPage(m),
+    toWritePage(m),
   ];
 }
 
@@ -86,8 +89,8 @@ export const tableAnchor = (name: string) => `table-${name.toLowerCase().replace
 export const roleAnchor = (id: string) => `role-${id}`;
 const anchor = (prefix: string, s: string) => `${prefix}-${s.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
 
-/** "add it in `builtlore serve`" */
-const addIn = (): Inline[] => ["add it in ", { code: "builtlore serve" }];
+/** "write it in builtlore.edits.yaml (To write)" */
+const addIn = (): Inline[] => ["write it in ", { code: "builtlore.edits.yaml" }, " (", { link: "To write", to: "to-write" }, ")"];
 
 // ---------------------------------------------------------------- overview
 
@@ -95,7 +98,7 @@ function overview(m: DocModel, opts: PageOptions): Page {
   const map = m.map;
   const blocks: Block[] = [];
   if (m.summary) blocks.push({ t: "p", c: [m.summary] });
-  else blocks.push({ t: "note", kind: "missing", c: [{ b: "No summary yet" }, " (what the system is for, who uses it): ", ...addIn(), " → Project."] });
+  else blocks.push({ t: "note", kind: "missing", c: [{ b: "No summary yet" }, " (what the system is for, who uses it): ", ...addIn(), "."] });
 
   const c = m.counts;
   const counts = ([["feature", c.features], ["page", c.pages], ["action", c.actions], ["process", c.processes], ["table", c.tables], ["scheduled task", c.tasks], ["integration", c.integrations]] as Array<[string, number]>)
@@ -191,7 +194,7 @@ function overview(m: DocModel, opts: PageOptions): Page {
         t: "list",
         items: [
           ["Read from the code by builtlore, with file:line for every fact."],
-          [{ badge: "person", kind: "human" }, " written by a person in ", { code: "builtlore.edits.yaml" }, " (", { code: "builtlore serve" }, ")."],
+          [{ badge: "person", kind: "human" }, " written by a person in ", { code: "builtlore.edits.yaml" }, " (", { link: "To write", to: "to-write" }, ")."],
           [{ badge: "check", kind: "warn" }, " code changed after it was described."],
           ["builtlore does not guess: what it could not read is in ", { link: "Findings", to: "findings" }, "."],
           [{ i: meta }],
@@ -279,12 +282,35 @@ function featurePage(m: DocModel, f: DocFeature): Page {
   const byWho = new Map<string, string[]>();
   for (const n of actions) byWho.set(n.who!.name, [...(byWho.get(n.who!.name) ?? []), n.label]);
   for (const [who, list] of byWho) can.push([{ b: who }, `: ${list.join(", ")}`]);
+  // Buttons the page shows only with a permission the server does not check
+  const pageOnly = actions.filter((n) => n.pageOnly);
+  if (pageOnly.length) {
+    const abilities = [...new Set(pageOnly.flatMap((n) => n.pageOnly!.abilities))];
+    can.push([
+      { badge: "page only", kind: "warn" },
+      ` The page shows ${pageOnly.length === actions.length ? "these actions" : pageOnly.map((n) => n.label).join(", ")} only with ${abilities.join(", ")}; the server does not check it (`,
+      { link: "Findings", to: "findings" },
+      ").",
+    ]);
+  }
   if (can.length) {
     blocks.push({ t: "h", level: 2, text: "What you can do here", id: `${featureAnchor(f)}-can` });
     blocks.push({ t: "list", items: can });
   }
 
-  for (const p of f.processes) blocks.push(...processBlocks(f, p));
+  for (const p of f.processes) blocks.push(...processBlocks(m, f, p));
+  // Processes owned by another feature that this one takes part in (created there, approved here)
+  if (f.shared.length) {
+    blocks.push({ t: "h", level: 2, text: "Also part of", id: `${featureAnchor(f)}-shared` });
+    blocks.push({
+      t: "list",
+      items: f.shared.map(({ process, owner }): Inline[] => {
+        const here = process.steps.filter((s) => f.nodes.some((n) => n.id === s.node)).map((s) => m.map.nodes.find((n) => n.id === s.node)?.label ?? s.node);
+        const ownerDoc = m.features.find((x) => x.feature.id === owner.id);
+        return [{ b: process.name }, `: ${here.join(", ")} happen here; the whole flow is in `, ownerDoc ? { link: owner.name, to: featureAnchor(ownerDoc) } : owner.name, "."];
+      }),
+    });
+  }
 
   // Developer details, folded
   const dev: Block[] = [];
@@ -401,7 +427,7 @@ function pathsText(t: DocTransition): Inline[] {
   return out;
 }
 
-function processBlocks(f: DocFeature, p: DocProcess): Block[] {
+function processBlocks(m: DocModel, f: DocFeature, p: DocProcess): Block[] {
   const blocks: Block[] = [];
   const id = `process-${f.slug}-${p.process.subject.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
   blocks.push({ t: "h", level: 2, text: f.processes.length > 1 ? `How it works: ${p.process.subject}` : "How it works", id });
@@ -412,7 +438,7 @@ function processBlocks(f: DocFeature, p: DocProcess): Block[] {
   const usual = main.length ? main : order;
   const rest = order.filter((t) => !usual.includes(t));
   const line = (t: DocTransition, withFrom: boolean): Inline[] => {
-    const out: Inline[] = [{ b: t.lane.name }, `: ${t.node.label}`];
+    const out: Inline[] = [{ b: t.lane.name }, `: ${t.node.feature === f.feature.id ? t.node.label : byLabel(m, t.node.id)}`];
     const branchFrom = t.pathFrom.some((x) => x.length);
     if (withFrom && !t.step.creates && (t.from.length || !branchFrom)) out.push(" when ", ...(t.from.length ? states(t.from) : [{ i: "any status" } as Inline]));
     out.push(...pathsText(t));
@@ -432,7 +458,7 @@ function processBlocks(f: DocFeature, p: DocProcess): Block[] {
   }
   const finals = finalStates(p);
   if (finals.length) blocks.push({ t: "p", c: ["Can end as ", ...states(finals), "."] });
-  if (p.other.length) blocks.push({ t: "p", c: [{ i: `Also: ${p.other.map((t) => `${t.node.label} (${t.lane.name})`).join(", ")}. Status unchanged.` }] });
+  if (p.other.length) blocks.push({ t: "p", c: [{ i: `Also: ${p.other.map((t) => `${t.node.feature === f.feature.id ? t.node.label : byLabel(m, t.node.id)} (${t.lane.name})`).join(", ")}. Status unchanged.` }] });
   const graph = stateGraph(p);
   if (graph.edges.length) blocks.push({ t: "diagram", graph, title: `${f.feature.name}: status flow`, id, mermaid: mermaid(graph) });
 
@@ -463,7 +489,7 @@ function kindLabel(n: MapNode): string {
 
 function glossary(m: DocModel): Page {
   const blocks: Block[] = [];
-  if (!m.glossary.length) blocks.push({ t: "note", kind: "missing", c: [{ b: "No terms yet" }, ": ", ...addIn(), " → Project."] });
+  if (!m.glossary.length) blocks.push({ t: "note", kind: "missing", c: [{ b: "No terms yet" }, ": ", ...addIn(), "."] });
   else blocks.push({ t: "table", head: ["Term", "Meaning"], rows: m.glossary.map(([k, v]) => [[{ b: k }], [v]]) });
   return { file: "glossary.md", id: "glossary", title: "Glossary", part: "understand", lead: "Words and abbreviations used in this project.", blocks };
 }
@@ -768,4 +794,91 @@ function findingsPage(m: DocModel): Page {
     else blocks.push(...list);
   }
   return { file: "findings.md", id: "findings", title: "Findings", part: "health", lead: "Things to check or fix, with file:line.", blocks };
+}
+
+// ---------------------------------------------------------------- to write
+
+export interface MissingText {
+  summary: boolean;
+  glossary: boolean;
+  features: Array<{ id: string; name: string; hint: string }>;
+  statuses: Array<{ subject: string; value: string; process: string }>;
+  steps: Array<{ id: string; label: string; hint: string }>;
+  total: number;
+}
+
+/**
+ * What only people can write and nobody has yet: the project summary, the glossary,
+ * what each feature is for, names for statuses the code only knows by value, and
+ * what the status-changing steps mean. Never filled in by builtlore.
+ */
+export function missingText(map: BuiltMap): MissingText {
+  const features = map.features
+    .filter((f) => !f.description)
+    .map((f) => {
+      const ns = f.nodes.map((id) => map.nodes.find((n) => n.id === id)).filter((n): n is MapNode => Boolean(n && !n.hidden));
+      const pages = ns.filter((n) => n.type === "page").length;
+      return { id: f.id, name: f.name, hint: `${f.name}: ${ns.length} step${ns.length === 1 ? "" : "s"}${pages ? `, ${pages} page${pages === 1 ? "" : "s"}` : ""}` };
+    });
+  const statuses = (map.processes ?? []).flatMap((p) =>
+    p.states
+      .filter((s) => s.named === "raw")
+      .map((s) => ({ subject: p.subject, value: s.value, process: p.name }))
+      .sort((a, b) => a.value.localeCompare(b.value, undefined, { numeric: true })),
+  );
+  const changing = new Set((map.processes ?? []).flatMap((p) => p.steps.filter((s) => s.to.length || s.creates).map((s) => s.node)));
+  const steps = map.nodes
+    .filter((n) => changing.has(n.id) && !n.description && !n.hidden)
+    .map((n) => ({ id: n.id, label: n.label, hint: `${n.label}: ${endpoint(n)}` }));
+  const summary = !map.project.summary;
+  const glossary = !Object.keys(map.glossary ?? {}).length;
+  return { summary, glossary, features, statuses, steps, total: Number(summary) + Number(glossary) + features.length + statuses.length + steps.length };
+}
+
+function toWriteYaml(t: MissingText): string {
+  const key = (s: string) => (/^[A-Za-z0-9_.-]+$/.test(s) && !/^\d+$/.test(s) ? s : JSON.stringify(s));
+  const lines = [
+    "# Paste into builtlore.edits.yaml (merge with what is there), write the text, run builtlore docs.",
+    "# Empty values are ignored, so fill in a few at a time.",
+  ];
+  if (t.summary) lines.push("project:", '  summary: ""  # What is the system for, and who uses it?');
+  if (t.features.length) {
+    lines.push("features:");
+    for (const f of t.features) lines.push(`  ${key(f.id)}:`, `    description: ""  # ${f.hint}`);
+  }
+  if (t.statuses.length) {
+    lines.push("statuses:");
+    const bySubject = new Map<string, MissingText["statuses"]>();
+    for (const s of t.statuses) bySubject.set(s.subject, [...(bySubject.get(s.subject) ?? []), s]);
+    for (const [subject, list] of bySubject) {
+      lines.push(`  ${key(subject)}:  # ${list[0].process}`);
+      for (const s of list) lines.push(`    ${JSON.stringify(s.value)}: ""  # shown as ${s.value}`);
+    }
+  }
+  if (t.steps.length) {
+    lines.push("steps:");
+    for (const s of t.steps) lines.push(`  ${key(s.id)}:`, `    description: ""  # ${s.hint}`);
+  }
+  if (t.glossary) lines.push("glossary:", "  # Term: what it means in this business");
+  return lines.join("\n");
+}
+
+function toWritePage(m: DocModel): Page {
+  const t = missingText(m.map);
+  const blocks: Block[] = [];
+  if (!t.total) {
+    blocks.push({ t: "note", kind: "info", c: ["Everything that only people can write is written."] });
+  } else {
+    const parts = [
+      t.summary ? "the project summary" : "",
+      t.glossary ? "the glossary" : "",
+      t.features.length ? `${t.features.length} feature description${t.features.length === 1 ? "" : "s"}` : "",
+      t.statuses.length ? `${t.statuses.length} status name${t.statuses.length === 1 ? "" : "s"} (the code only has the value)` : "",
+      t.steps.length ? `${t.steps.length} description${t.steps.length === 1 ? "" : "s"} of steps that change a status` : "",
+    ].filter(Boolean);
+    blocks.push({ t: "p", c: ["Missing: ", parts.join(", "), "."] });
+    blocks.push({ t: "p", c: ["Copy this into ", { code: "builtlore.edits.yaml" }, " at the project root, write the text between the quotes, and run ", { code: "builtlore docs" }, " again. Commit the file: every scan applies it, and a step whose code changes later is marked to check."] });
+    blocks.push({ t: "code", lang: "yaml", text: toWriteYaml(t) });
+  }
+  return { file: "to-write.md", id: "to-write", title: "To write", part: "health", lead: "Text only people can write, ready to fill in.", blocks };
 }

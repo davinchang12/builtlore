@@ -592,6 +592,539 @@ describe("links and labels for readers", () => {
   });
 });
 
+describe("events, listeners and model observers", () => {
+  let map: BuiltMap;
+  before(async () => {
+    map = await scan({
+      "bootstrap/app.php": "<?php\nuse Illuminate\\Foundation\\Application;\nreturn Application::configure(basePath: dirname(__DIR__))->create();\n",
+      "routes/web.php": `<?php
+use App\\Http\\Controllers\\InvoiceController;
+use Illuminate\\Support\\Facades\\Route;
+Route::post('/invoices', [InvoiceController::class, 'store'])->name('invoices.store');
+Route::post('/invoices/{invoice}/send', [InvoiceController::class, 'send'])->name('invoices.send');
+Route::post('/invoices/{invoice}/pay', [InvoiceController::class, 'pay'])->name('invoices.pay');
+Route::post('/invoices/{invoice}/archive', [InvoiceController::class, 'archive'])->name('invoices.archive');
+`,
+      "app/Models/Invoice.php": `<?php
+namespace App\\Models;
+use App\\Observers\\InvoiceObserver;
+use Illuminate\\Database\\Eloquent\\Attributes\\ObservedBy;
+use Illuminate\\Database\\Eloquent\\Model;
+#[ObservedBy([InvoiceObserver::class])]
+class Invoice extends Model {}
+`,
+      "app/Models/Payment.php": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass Payment extends Model {}\n",
+      "app/Mail/InvoiceMail.php": "<?php\nnamespace App\\Mail;\nclass InvoiceMail {}\n",
+      "app/Mail/AuditMail.php": "<?php\nnamespace App\\Mail;\nclass AuditMail {}\n",
+      "app/Mail/PaymentReceived.php": "<?php\nnamespace App\\Mail;\nclass PaymentReceived {}\n",
+      "app/Observers/InvoiceObserver.php": `<?php
+namespace App\\Observers;
+use App\\Mail\\AuditMail;
+use App\\Models\\Invoice;
+use Illuminate\\Support\\Facades\\Mail;
+class InvoiceObserver {
+    public function creating(Invoice $invoice) { $invoice->status = 'draft'; }
+    public function updated(Invoice $invoice) {
+        Mail::to('audit@example.test')->send(new AuditMail);
+        $invoice->status = 'audited';
+    }
+}
+`,
+      "app/Observers/PaymentObserver.php": `<?php
+namespace App\\Observers;
+use App\\Mail\\PaymentReceived;
+use Illuminate\\Support\\Facades\\Mail;
+class PaymentObserver {
+    public function created($payment) { Mail::to('finance@example.test')->send(new PaymentReceived); }
+}
+`,
+      "app/Events/InvoiceSent.php": `<?php
+namespace App\\Events;
+use App\\Models\\Invoice;
+class InvoiceSent { public function __construct(public Invoice $invoice) {} }
+`,
+      "app/Events/InvoicePaid.php": `<?php
+namespace App\\Events;
+use Illuminate\\Foundation\\Events\\Dispatchable;
+class InvoicePaid {
+    use Dispatchable;
+    public $invoice;
+    public function __construct($invoice) { $this->invoice = $invoice; }
+}
+`,
+      "app/Listeners/DeliverInvoice.php": `<?php
+namespace App\\Listeners;
+use App\\Events\\InvoiceSent;
+use App\\Mail\\InvoiceMail;
+use Illuminate\\Support\\Facades\\Mail;
+class DeliverInvoice {
+    public function handle(InvoiceSent $event): void {
+        Mail::to('customer@example.test')->send(new InvoiceMail);
+        $event->invoice->status = 'delivered';
+        $event->invoice->save();
+    }
+}
+`,
+      "app/Billing/MarkPaid.php": `<?php
+namespace App\\Billing;
+class MarkPaid {
+    public function onPaid($event) { $event->invoice->update(['status' => 'paid']); }
+}
+`,
+      "app/Providers/AppServiceProvider.php": `<?php
+namespace App\\Providers;
+use App\\Billing\\MarkPaid;
+use App\\Events\\InvoicePaid;
+use App\\Models\\Payment;
+use App\\Observers\\PaymentObserver;
+use Illuminate\\Support\\Facades\\Event;
+use Illuminate\\Support\\ServiceProvider;
+class AppServiceProvider extends ServiceProvider {
+    public function boot(): void {
+        Event::listen(InvoicePaid::class, [MarkPaid::class, 'onPaid']);
+        Payment::observe(PaymentObserver::class);
+    }
+}
+`,
+      "app/Http/Controllers/InvoiceController.php": `<?php
+namespace App\\Http\\Controllers;
+use App\\Events\\InvoicePaid;
+use App\\Events\\InvoiceSent;
+use App\\Models\\Invoice;
+use App\\Models\\Payment;
+class InvoiceController extends Controller {
+    public function store() {
+        $invoice = new Invoice;
+        $invoice->title = 'x';
+        $invoice->save();
+        return back();
+    }
+    public function send(Invoice $invoice) {
+        $invoice->status = 'sent';
+        $invoice->save();
+        event(new InvoiceSent($invoice));
+        return back();
+    }
+    public function pay(Invoice $invoice) {
+        Payment::create(['invoice_id' => $invoice->id]);
+        InvoicePaid::dispatch($invoice);
+        return back();
+    }
+    public function archive($id) {
+        Invoice::where('id', $id)->update(['status' => 'archived']);
+        return back();
+    }
+}
+`,
+    });
+  });
+  const proc = () => map.processes!.find((p) => p.subject === "Invoice.status")!;
+  const to = (route: string) => proc().steps.find((s) => s.node === `route:${route}`)!.to.map((id) => proc().states.find((s) => s.id === id)!.value).sort();
+  const sentBy = (id: string) => map.integrations!.find((i) => i.id === id)!.usages.flatMap((u) => u.by).sort();
+
+  it("takes the status a creating() observer sets into the step that creates the record", () => {
+    assert.ok(proc(), `processes: ${map.processes?.map((p) => p.subject).join(", ")}`);
+    assert.deepEqual(to("invoices.store"), ["draft"]);
+  });
+
+  it("follows an event to its discovered listener, with the model the event carries", () => {
+    // sent, then the listener runs at event(): the step ends at delivered
+    assert.deepEqual(to("invoices.send"), ["delivered"]);
+    assert.deepEqual(sentBy("mail:App\\Mail\\InvoiceMail"), ["route:invoices.send"]);
+  });
+
+  it("follows X::dispatch() to a listener registered with Event::listen, through an untyped property", () => {
+    assert.deepEqual(to("invoices.pay"), ["paid"]);
+  });
+
+  it("links mail sent by an observer to the steps that save the model, not to query-builder updates", () => {
+    assert.deepEqual(sentBy("mail:App\\Mail\\PaymentReceived"), ["route:invoices.pay"]);
+    assert.ok(!sentBy("mail:App\\Mail\\AuditMail").includes("route:invoices.archive"), "Model::where()->update() fires no model events");
+    assert.ok(sentBy("mail:App\\Mail\\AuditMail").includes("route:invoices.send"));
+  });
+
+  it("reports a status set in an updated() observer instead of placing it", () => {
+    assert.ok(!proc().states.some((s) => s.value === "audited"));
+    assert.ok(map.skipped.some((s) => /observer InvoiceObserver::updated\(\)/.test(s.reason)), map.skipped.map((s) => s.reason).join("\n"));
+  });
+});
+
+describe("who may act, read from policies and gates", () => {
+  let map: BuiltMap;
+  before(async () => {
+    map = await scan({
+      "routes/web.php": `<?php
+use App\\Http\\Controllers\\InvoiceController;
+use Illuminate\\Support\\Facades\\Route;
+Route::post('/invoices/{invoice}/approve', [InvoiceController::class, 'approve'])->name('invoices.approve');
+Route::post('/invoices/{invoice}/void', [InvoiceController::class, 'void'])->name('invoices.void')->middleware('can:void,invoice');
+Route::post('/reports/export', [InvoiceController::class, 'export'])->name('reports.export')->middleware('can:export-reports');
+Route::post('/invoices/{invoice}/cancel', [InvoiceController::class, 'cancel'])->name('invoices.cancel');
+`,
+      "app/Models/User.php": "<?php\nnamespace App\\Models;\nuse Illuminate\\Foundation\\Auth\\User as Authenticatable;\nclass User extends Authenticatable {}\n",
+      "app/Models/Invoice.php": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass Invoice extends Model {}\n",
+      "app/Policies/InvoicePolicy.php": `<?php
+namespace App\\Policies;
+use App\\Models\\Invoice;
+use App\\Models\\User;
+class InvoicePolicy {
+    public function before(User $user) { if ($user->role === 'superadmin') { return true; } }
+    public function approve(User $user, Invoice $invoice) { return $user->hasRole('finance'); }
+    public function void(User $user, Invoice $invoice) { return $user->role == 'auditor'; }
+    public function cancel(User $user, Invoice $invoice) { return $user->id === $invoice->created_by; }
+}
+`,
+      "app/Providers/AppServiceProvider.php": `<?php
+namespace App\\Providers;
+use App\\Models\\User;
+use Illuminate\\Support\\Facades\\Gate;
+use Illuminate\\Support\\ServiceProvider;
+class AppServiceProvider extends ServiceProvider {
+    public function boot(): void {
+        Gate::define('export-reports', fn (User $user) => $user->role === 'analyst');
+    }
+}
+`,
+      "app/Http/Controllers/InvoiceController.php": `<?php
+namespace App\\Http\\Controllers;
+use App\\Models\\Invoice;
+class InvoiceController extends Controller {
+    public function approve(Invoice $invoice) { $this->authorize('approve', $invoice); return back(); }
+    public function void(Invoice $invoice) { return back(); }
+    public function export() { return back(); }
+    public function cancel(Invoice $invoice) { $this->authorize('cancel', $invoice); return back(); }
+}
+`,
+    });
+  });
+  const who = (id: string) => map.nodes.find((n) => n.id === `route:${id}`)?.who;
+
+  it("reads $this->authorize('approve', $invoice) through InvoicePolicy::approve() and before()", () => {
+    const w = who("invoices.approve")!;
+    assert.ok(w, "approve has a who");
+    assert.match(w.name, /finance/i);
+    assert.ok(w.evidence.some((e) => /InvoicePolicy::approve\(\): hasRole\('finance'\)/.test(e)), w.evidence.join("\n"));
+    assert.ok(w.evidence.some((e) => /InvoicePolicy::before\(\)/.test(e)), w.evidence.join("\n"));
+  });
+
+  it("reads can:void,invoice through the policy of the bound model", () => {
+    assert.match(who("invoices.void")!.name, /auditor/i);
+  });
+
+  it("reads can:export-reports through its Gate::define body", () => {
+    assert.match(who("reports.export")!.name, /analyst/i);
+  });
+
+  it("does not turn an ownership check into a role", () => {
+    const w = who("invoices.cancel");
+    assert.ok(!w || !/created|owner/i.test(w.name), w ? w.name : "no who");
+  });
+});
+
+describe("status values built from limited input", () => {
+  let map: BuiltMap;
+  before(async () => {
+    map = await scan({
+      "routes/web.php": `<?php
+use App\\Http\\Controllers\\TicketController;
+use Illuminate\\Support\\Facades\\Route;
+Route::post('/tickets/{ticket}/close', [TicketController::class, 'close'])->name('tickets.close');
+Route::post('/tickets/{ticket}/move', [TicketController::class, 'move'])->name('tickets.move');
+Route::post('/tickets/{ticket}/rate', [TicketController::class, 'rate'])->name('tickets.rate');
+Route::post('/tickets/{ticket}/free', [TicketController::class, 'free'])->name('tickets.free');
+Route::post('/tickets/{ticket}/reopen', [TicketController::class, 'reopen'])->name('tickets.reopen');
+`,
+      "app/Models/Ticket.php": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass Ticket extends Model {}\n",
+      "app/Http/Requests/RateTicketRequest.php": `<?php
+namespace App\\Http\\Requests;
+use Illuminate\\Foundation\\Http\\FormRequest;
+use Illuminate\\Validation\\Rule;
+class RateTicketRequest extends FormRequest {
+    public function rules(): array { return ['level' => ['required', Rule::in(['low', 'high'])]]; }
+}
+`,
+      "app/Http/Controllers/TicketController.php": `<?php
+namespace App\\Http\\Controllers;
+use App\\Http\\Requests\\RateTicketRequest;
+use App\\Models\\Ticket;
+use Illuminate\\Http\\Request;
+class TicketController extends Controller {
+    public function close(Request $request, Ticket $ticket) {
+        $request->validate(['reason' => 'required|in:fixed,duplicate']);
+        $ticket->status = 'closed_' . $request->reason;
+        $ticket->save();
+        return back();
+    }
+    public function move(Request $request, Ticket $ticket) {
+        $stage = $request->input('stage');
+        if (!in_array($stage, ['triage', 'doing'])) { abort(422); }
+        $ticket->update(['status' => $stage]);
+        return back();
+    }
+    public function rate(RateTicketRequest $request, Ticket $ticket) {
+        $ticket->status = "level_{$request->level}";
+        $ticket->save();
+        return back();
+    }
+    public function free(Request $request, Ticket $ticket) {
+        $ticket->status = $request->status;
+        $ticket->save();
+        return back();
+    }
+    public function reopen(Ticket $ticket) {
+        $next = 'open';
+        $ticket->update(['status' => $next, 'stage' => 'stage_' . $next]);
+        return back();
+    }
+}
+`,
+    });
+  });
+  const proc = () => map.processes!.find((p) => p.subject === "Ticket.status")!;
+  const to = (route: string) => proc().steps.find((s) => s.node === `route:${route}`)!.to.map((id) => proc().states.find((s) => s.id === id)!.value).sort();
+
+  it("reads 'closed_' . $request->reason when validation limits reason (in:a,b)", () => {
+    assert.ok(proc(), `processes: ${map.processes?.map((p) => p.subject).join(", ")}`);
+    assert.deepEqual(to("tickets.close"), ["closed_duplicate", "closed_fixed"]);
+  });
+
+  it("reads a variable limited by an in_array guard", () => {
+    assert.deepEqual(to("tickets.move"), ["doing", "triage"]);
+  });
+
+  it("reads \"level_{$request->level}\" limited by Rule::in in a FormRequest", () => {
+    assert.deepEqual(to("tickets.rate"), ["level_high", "level_low"]);
+  });
+
+  it("does not make a second flow of a column that only spells out the status ('stage_' . $next)", () => {
+    assert.deepEqual(to("tickets.reopen"), ["open"]);
+    assert.ok(!map.processes!.some((p) => p.subject === "Ticket.stage"), map.processes!.map((p) => p.subject).join(", "));
+  });
+
+  it("still reports input that nothing limits, instead of guessing", () => {
+    assert.ok(map.skipped.some((s) => /Ticket\.status = \$request->status/.test(s.reason)), map.skipped.map((s) => s.reason).join("\n"));
+  });
+});
+
+describe("text to write", () => {
+  it("lists what only people can write as YAML that can be pasted into builtlore.edits.yaml", async () => {
+    const dir = project({
+      "routes/web.php": `<?php
+use App\\Http\\Controllers\\OrderController;
+use Illuminate\\Support\\Facades\\Route;
+Route::post('/orders/{order}/pay', [OrderController::class, 'pay'])->name('orders.pay');
+`,
+      "app/Models/Order.php": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass Order extends Model {}\n",
+      "app/Http/Controllers/OrderController.php": `<?php
+namespace App\\Http\\Controllers;
+use App\\Models\\Order;
+class OrderController extends Controller {
+    public function pay(Order $order) { if ($order->status != 1) abort(403); $order->status = 2; $order->save(); return back(); }
+}
+`,
+    });
+    const { renderDocs } = await import("../src/docs/index.js");
+    const first = (await scanProject(dir, { mode: "static" }, { write: false })).map;
+    const page = (await renderDocs(first)).markdown.get("to-write.md")!;
+    const yaml = /```yaml\n([\s\S]*?)\n```/.exec(page)![1];
+    assert.match(yaml, /^project:\n  summary: ""/m);
+    assert.match(yaml, /^statuses:\n  Order\.status:.*\n    "1": ""/m);
+    assert.match(yaml, /^steps:\n  "route:orders\.pay":\n    description: ""  # Pay: POST/m);
+
+    // Pasted as is: nothing changes and nothing counts as an edit; filled in: applied
+    writeFileSync(join(dir, "builtlore.edits.yaml"), yaml);
+    const pasted = (await scanProject(dir, { mode: "static" }, { write: false })).map;
+    assert.ok(!pasted.notes.some((n) => /^Applied/.test(n)), pasted.notes.join("\n"));
+    assert.equal(pasted.project.summary, undefined);
+    writeFileSync(join(dir, "builtlore.edits.yaml"), yaml.replace('summary: ""', 'summary: "Orders for the shop"').replace('"2": ""', '"2": "Paid"'));
+    const filled = (await scanProject(dir, { mode: "static" }, { write: false })).map;
+    assert.equal(filled.project.summary, "Orders for the shop");
+    assert.equal(filled.processes![0].states.find((s) => s.value === "2")!.label, "Paid");
+    assert.ok(!(await renderDocs(filled)).markdown.get("to-write.md")!.includes('"2": ""'));
+  });
+});
+
+describe("apps that check access in the page and in helpers, with flows across features", () => {
+  let map: BuiltMap;
+  before(async () => {
+    map = await scan({
+      "routes/web.php": `<?php
+use App\\Http\\Controllers\\AccessPageController;
+use Illuminate\\Support\\Facades\\Route;
+Route::get('/access', [AccessPageController::class, 'index'])->name('access.index')->middleware('can:Access Read');
+`,
+      "routes/api.php": `<?php
+use App\\Http\\Controllers\\API\\AccessController;
+use App\\Http\\Controllers\\API\\InboxController;
+use Illuminate\\Support\\Facades\\Route;
+Route::post('device/access', [AccessController::class, 'store'])->name('device.store');
+Route::post('inbox/access/{id}/approve', [InboxController::class, 'approve'])->name('inbox.approve');
+Route::post('inbox/access/{id}/claim', [InboxController::class, 'claim'])->name('inbox.claim');
+Route::post('inbox/access/{id}/set', [InboxController::class, 'set'])->name('inbox.set');
+Route::post('external/check', [\\App\\Http\\Controllers\\API\\ExternalController::class, 'check'])->name('external.check');
+Route::post('access/import', [AccessController::class, 'import'])->name('access.import');
+Route::post('inbox/access/bulk-reject', [InboxController::class, 'bulkReject'])->name('inbox.bulk-reject');
+`,
+      "app/Http/Controllers/API/ExternalController.php": `<?php
+namespace App\\Http\\Controllers\\API;
+use App\\Http\\Controllers\\Controller;
+use Illuminate\\Http\\Request;
+class ExternalController extends Controller {
+    public function check(Request $request) {
+        $client = $this->authenticate($request);
+        if ($client instanceof \\Illuminate\\Http\\JsonResponse) { return $client; }
+        return response()->json(['ok' => true]);
+    }
+    private function authenticate(Request $request) {
+        $unauthorized = response()->json(['error' => 'unauthorized'], 401);
+        $key = $request->header('X-Partner-Key');
+        if (!is_string($key) || $key === '') { return $unauthorized; }
+        return true;
+    }
+}
+`,
+      "app/Models/AccessRequest.php": "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass AccessRequest extends Model {}\n",
+      "app/Mail/ReviewMail.php": "<?php\nnamespace App\\Mail;\nclass ReviewMail { public function __construct(public array $data) {} }\n",
+      "app/Helpers/Helper.php": `<?php
+namespace App\\Helpers;
+use Illuminate\\Support\\Facades\\Session;
+class Helper {
+    public function canUseAPI() {
+        $isLogin = Session::get('nik_real');
+        if (!$isLogin) { \\abort(response()->json(['message' => 'not logged in'])); }
+    }
+}
+`,
+      "app/Http/Controllers/AccessPageController.php": `<?php
+namespace App\\Http\\Controllers;
+use Illuminate\\Support\\Facades\\Gate;
+class AccessPageController extends Controller {
+    public function index() {
+        $canInsert = Gate::allows('Access Insert');
+        return view('access.index', compact('canInsert'));
+    }
+}
+`,
+      "resources/views/access/index.blade.php": `<div x-data="{ userPermissions: { canInsert: @json($canInsert) } }">
+<script>
+async function save() { await fetch("{{ route('device.store') }}", { method: 'POST' }); }
+</script>
+</div>
+`,
+      "app/Http/Controllers/API/AccessController.php": `<?php
+namespace App\\Http\\Controllers\\API;
+use App\\Helpers\\Helper;
+use App\\Http\\Controllers\\Controller;
+use App\\Models\\AccessRequest;
+use Illuminate\\Http\\Request;
+use Illuminate\\Support\\Facades\\Validator;
+class AccessController extends Controller {
+    public function store(Helper $helper, Request $request) {
+        $helper->canUseAPI();
+        Validator::make($request->all(), ['status' => ['nullable', 'string']]);
+        AccessRequest::create(['name' => $request->name, 'status' => 'waiting']);
+        return response()->json(['message' => 'ok']);
+    }
+    public function import(Request $request) {
+        $request->validate(['file' => 'required|file']);
+        return response()->json(['message' => 'ok']);
+    }
+}
+`,
+      "app/Http/Controllers/API/InboxController.php": `<?php
+namespace App\\Http\\Controllers\\API;
+use App\\Http\\Controllers\\Controller;
+use App\\Mail\\ReviewMail;
+use App\\Models\\AccessRequest;
+use Illuminate\\Http\\Request;
+class InboxController extends Controller {
+    public function approve($id) {
+        $item = AccessRequest::findOrFail($id);
+        if ($item->status != 'waiting') { abort(422); }
+        $item->update(['status' => 'approved', 'status_by' => session('nik'), 'status_at' => now()]);
+        return response()->json(['message' => 'ok']);
+    }
+    public function claim(Request $request, $id) {
+        $next = null;
+        $next = $request->boolean('urgent') ? 'pending_l2' : 'pending_l1';
+        AccessRequest::findOrFail($id)->update(['status' => $next]);
+        new ReviewMail(['final_status' => $next]);
+        return response()->json(['message' => 'ok']);
+    }
+    public function bulkReject(Request $request) {
+        AccessRequest::whereIn('id', $request->ids)->where('status', 'waiting')->update(['status' => 'rejected']);
+        return response()->json(['message' => 'ok']);
+    }
+    public function set(Request $request, $id) {
+        $request->validate(['status' => 'required|exists:general_codes,code']);
+        AccessRequest::findOrFail($id)->update(['status' => $request->status]);
+        return response()->json(['message' => 'ok']);
+    }
+}
+`,
+    });
+  });
+  const procs = () => map.processes!.filter((p) => p.subject.startsWith("AccessRequest."));
+  const node = (id: string) => map.nodes.find((n) => n.id === `route:${id}`)!;
+
+  it("makes one flow of a record created in one feature and approved in another", () => {
+    const ps = procs();
+    assert.deepEqual(ps.map((p) => p.subject), ["AccessRequest.status"], ps.map((p) => `${p.name} ${p.subject}`).join("\n"));
+    const p = ps[0];
+    assert.equal(p.name, "Access request");
+    assert.equal(p.feature, node("device.store").feature, "owned by the feature that creates the record");
+    assert.deepEqual([...(p.features ?? [])].sort(), [node("device.store").feature, node("inbox.approve").feature].sort());
+    const values = p.states.map((s) => s.value).sort();
+    assert.deepEqual(values, ["approved", "pending_l1", "pending_l2", "rejected", "waiting"]);
+  });
+
+  it("reads where('status', X)->update([...]) as starting from X", () => {
+    const p = procs()[0];
+    const s = p.steps.find((x) => x.node === "route:inbox.bulk-reject")!;
+    assert.deepEqual(s.from.map((id) => id.split("=")[1]), ["waiting"]);
+    assert.deepEqual(s.to.map((id) => id.split("=")[1]), ["rejected"]);
+  });
+
+  it("does not read status_by / status_at, Validator::make or a Mailable's data as statuses", () => {
+    assert.ok(!map.processes!.some((p) => /status_(by|at)$|final_status/.test(p.subject)), map.processes!.map((p) => p.subject).join(", "));
+    assert.ok(!map.skipped.some((s) => /status_(by|at)|final_status|= array/.test(s.reason)), map.skipped.map((s) => s.reason).join("\n"));
+  });
+
+  it("says where an unreadable value comes from (a lookup table)", () => {
+    assert.ok(map.skipped.some((s) => /AccessRequest\.status = \$request->status \(values come from table general_codes/.test(s.reason)), map.skipped.map((s) => s.reason).join("\n"));
+  });
+
+  it("reads a login check inside a helper as Signed-in user", () => {
+    const w = node("device.store").who!;
+    assert.equal(w.name, "Signed-in user");
+    assert.ok(w.evidence.some((e) => /Helper::canUseAPI\(\): Session::get\('nik_real'\)/.test(e)), w.evidence.join("\n"));
+  });
+
+  it("reports actions whose permission is checked only by the page that calls them", async () => {
+    const n = node("device.store");
+    assert.deepEqual(n.pageOnly?.abilities, ["Access Insert"]);
+    assert.deepEqual(n.pageOnly?.pages, ["route:access.index"]);
+    const { renderDocs } = await import("../src/docs/index.js");
+    const findings = (await renderDocs(map)).markdown.get("findings.md")!;
+    assert.match(findings, /Permission checked only in the page \(1\)/);
+    assert.match(findings, /the page checks Access Insert/);
+  });
+
+  it("reads an API key checked in a helper method as API client", () => {
+    const w = node("external.check").who!;
+    assert.equal(w.name, "API client");
+    assert.ok(w.evidence.some((e) => /header X-Partner-Key, ExternalController::authenticate\(\)/.test(e)), w.evidence.join("\n"));
+  });
+
+  it("lists writes with no check at all under Open to anyone", async () => {
+    const { renderDocs } = await import("../src/docs/index.js");
+    const findings = (await renderDocs(map)).markdown.get("findings.md")!;
+    const section = findings.slice(findings.indexOf("Open to anyone"));
+    assert.match(section, /access\/import/);
+    assert.doesNotMatch(section.slice(0, section.indexOf("\n## ") > 0 ? section.indexOf("\n## ") : undefined), /external\/check|device\/access/);
+  });
+});
+
 describe("status sequences and branches", () => {
   it("skips a branch that cannot run with the values passed in (review($order, 'pass'))", async () => {
     const map = (await scanProject(dirs.find((d) => existsSync(join(d, "app/Services/OrderWorkflow.php")))!, { mode: "static" })).map;

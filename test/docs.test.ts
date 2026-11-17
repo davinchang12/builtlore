@@ -21,9 +21,8 @@ describe("documentation facts from the approval-workflow app", () => {
   const col = (t: string, c: string) => table(t).columns.find((x) => x.name === c);
 
   before(async () => {
-    map = (await scanProject(fixture, { mode: "static", output: "builtlore.test.json" })).map;
+    map = (await scanProject(fixture, { mode: "static" }, { write: false })).map;
   });
-  after(() => rmSync(join(fixture, "builtlore.test.json"), { force: true }));
 
   describe("business rules (validation)", () => {
     it("reads rules() of a FormRequest, keeping each rule as written with a plain reading", () => {

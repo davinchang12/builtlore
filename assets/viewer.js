@@ -537,7 +537,18 @@
         laneY[l.id] = { y: cy, h: h };
         cy += h;
       });
-      var height = cy - y + 20;
+      // Room under the lanes for the arrows coming back from the "At any status" column
+      var backKeys = {};
+      if (col.__any >= 0) steps.forEach(function (s) {
+        if (col[s.node] !== col.__any) return;
+        s.to.forEach(function (t) {
+          consumers(p, t).forEach(function (c) {
+            if (col[c.node] !== undefined && col[c.node] < col.__any && steps.indexOf(c) >= 0) backKeys[t + "|" + col[c.node]] = true;
+          });
+        });
+      });
+      var backN = Object.keys(backKeys).length;
+      var height = cy - y + 20 + (backN ? 36 + backN * 10 : 0);
       maxW = Math.max(maxW, width);
 
       groupLayer.appendChild(el("rect", { x: 0, y: y, width: width, height: height, rx: 14, "class": "proc-box" }));
@@ -594,7 +605,7 @@
         if (n.review) g.appendChild(el("circle", { cx: CARD_W - 10, cy: 10, r: 4.5, "class": "review-dot" }));
         else if (n.description) g.appendChild(el("circle", { cx: CARD_W - 10, cy: 10, r: 3.5, "class": "note-dot" }));
         var tip = el("title", {});
-        tip.textContent = n.label + "\n" + laneById(p, s.lane).name + (fromsOf(s).length ? "\nwhen: " + fromsOf(s).map(function (f) { return stateOf(p, f).label; }).join(" or ") : anyStatus(s) ? "\nat any status (no check in code)" : "") + (n.description ? "\n\n" + n.description : "");
+        tip.textContent = n.label + (n.feature !== p.feature ? "  (in " + featureById(n.feature).name + ")" : "") + "\n" + laneById(p, s.lane).name + (fromsOf(s).length ? "\nwhen: " + fromsOf(s).map(function (f) { return stateOf(p, f).label; }).join(" or ") : anyStatus(s) ? "\nat any status (no check in code)" : "") + (n.description ? "\n\n" + n.description : "");
         g.appendChild(tip);
         g.addEventListener("click", function (ev) { ev.stopPropagation(); select(s.node); });
         nodeLayer.appendChild(g);
@@ -613,10 +624,13 @@
 
       // Transitions: producer -> consumer, labelled with the status in between
       var endCount = {};
-      var inbound = {}, inboundLabelled = {};
+      var inbound = {}, inboundLabelled = {}, anyBack = {}, sameCol = {};
       steps.forEach(function (s) {
         s.to.forEach(function (t) {
-          consumers(p, t).forEach(function (c) { if (box[c.node]) inbound[c.node + "|" + t] = (inbound[c.node + "|" + t] || 0) + 1; });
+          consumers(p, t).forEach(function (c) {
+            if (!box[c.node] || (col[s.node] === col.__any && box[c.node].x <= box[s.node].x) || box[c.node].x === box[s.node].x) return;
+            inbound[c.node + "|" + t] = (inbound[c.node + "|" + t] || 0) + 1;
+          });
         });
       });
       steps.forEach(function (s) {
@@ -645,9 +659,61 @@
             return;
           }
           var shared = cons.length > 1;
+          var fromAny = col[s.node] === col.__any;
           cons.forEach(function (c, ci) {
             var a = box[s.node], b = box[c.node];
             var d, mid;
+            if (fromAny && b.x <= a.x) {
+              // Back from the "At any status" column: one arrow per status and target,
+              // leaving from the bottom of the column instead of one per step.
+              // Steps stacked in one column that wait for the same status share one arrow,
+              // drawn into the lowest of them.
+              var mk = t + "|" + col[c.node];
+              var idm = "p" + state.procEdges.length;
+              state.procEdges.push({ id: idm, from: s.node, to: c.node });
+              if (anyBack[mk]) { edgeEls[idm] = anyBack[mk]; return; }
+              cons.forEach(function (o) { if (col[o.node] === col[c.node] && box[o.node].y > b.y) b = box[o.node]; });
+              var ax2 = LABEL_W + col.__any * COL_W + CARD_W / 2, ay2 = cy - 4;
+              var cx2 = b.x + b.w / 2, cyb = b.y + b.h;
+              var low2 = Math.max(ay2, cyb) + 26 + Object.keys(anyBack).length * 10;
+              d = "M" + ax2 + " " + ay2 + " C" + ax2 + " " + low2 + " " + cx2 + " " + low2 + " " + cx2 + " " + (cyb + 2);
+              var em = el("g", { "class": "pedge any-back" + (neg ? " negative" : "") });
+              em.appendChild(el("path", { d: d, "marker-end": neg ? "url(#arrow-error)" : "url(#arrow)" }));
+              edgeLayer.appendChild(em);
+              anyBack[mk] = em;
+              edgeEls[idm] = em;
+              var lw2 = Math.min(136, 14 + st.label.length * 5.9);
+              var lg2 = el("g", { "class": "plabel" });
+              var mx = cx2 + lw2 / 2 + 8, my = cyb + 16;
+              lg2.appendChild(el("rect", { x: mx - lw2 / 2, y: my - 9, width: lw2, height: 17, rx: 8.5 }));
+              var tx2 = el("text", { x: mx, y: my + 3.5, "text-anchor": "middle" });
+              tx2.textContent = truncate(st.label, 21);
+              lg2.appendChild(tx2);
+              lg2.addEventListener("click", function (ev) { ev.stopPropagation(); selectState(p.id, t); });
+              em.appendChild(lg2);
+              return;
+            }
+            if (b.x === a.x) {
+              // Back into the same column (hold → waiting again): one short arc on the right
+              // side per step and status, into the top card waiting for it.
+              var sk = s.node + "|" + t;
+              var ids = "p" + state.procEdges.length;
+              state.procEdges.push({ id: ids, from: s.node, to: c.node });
+              if (sameCol[sk]) { edgeEls[ids] = sameCol[sk]; return; }
+              cons.forEach(function (o) { if (box[o.node].x === a.x && box[o.node].y < b.y) b = box[o.node]; });
+              var rx = a.x + a.w, ry1 = a.y + a.h - 10, ry2 = b.y + 10;
+              var bulge = rx + 34 + Math.abs(ry1 - ry2) * 0.08;
+              d = "M" + rx + " " + ry1 + " C" + bulge + " " + ry1 + " " + bulge + " " + ry2 + " " + (rx + 2) + " " + ry2;
+              var es = el("g", { "class": "pedge" + (neg ? " negative" : "") });
+              es.appendChild(el("path", { d: d, "marker-end": neg ? "url(#arrow-error)" : "url(#arrow)" }));
+              edgeLayer.appendChild(es);
+              sameCol[sk] = es;
+              edgeEls[ids] = es;
+              var tip2 = el("title", {});
+              tip2.textContent = "→ " + st.label;
+              es.appendChild(tip2);
+              return;
+            }
             if (b.x > a.x) {
               var x1 = a.x + a.w, y1 = a.y + a.h / 2, x2 = b.x, y2 = b.y + b.h / 2, k = Math.max(40, (x2 - x1) / 2);
               d = "M" + x1 + " " + y1 + " C" + (x1 + k) + " " + y1 + " " + (x2 - k) + " " + y2 + " " + (x2 - 2) + " " + y2;
